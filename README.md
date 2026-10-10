@@ -133,6 +133,11 @@ alone does not enable them.
   SQLite tables are initialized by `src/lib/db/index.ts` on first database use.
 - Redeploy the branch containing this fix, preferably without the old build cache.
 - Set a strong `AUTH_SECRET` in each deployment environment.
+- `vercel.json` pins the settings above for projects that leave their dashboard fields
+  on defaults. **Project-level settings always win**, so a project created while this
+  repository was still a Vite app keeps its stale framework preset and build command —
+  no repository change can override it. See
+  [`docs/vercel-deployment-failure-investigation.md`](docs/vercel-deployment-failure-investigation.md).
 - This fixes compilation, not serverless persistence. Before using the studio on
   Vercel, implement a managed database adapter, persistent object storage, and a
   serverless-compatible job runner. Do not use `/tmp` SQLite as durable storage.
