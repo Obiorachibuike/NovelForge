@@ -17,12 +17,14 @@ NovelForge is a production-quality AI-powered novel-writing and digital publishi
 - **Exports** to DOCX, PDF, TXT, Markdown (EPUB stub extensible).
 - **Queue abstraction** — in-process runner for development; Redis/BullMQ adapter documented for production.
 - **Storage abstraction** — local disk for development; Cloudinary adapter documented for production.
-- **Database** — portable SQL (SQLite for zero-setup dev, PostgreSQL documented for production) via a thin `better-sqlite3` layer with a Prisma-compatible schema.
+- **Database** — portable SQL (SQLite for zero-setup dev, PostgreSQL documented for production) via a thin `better-sqlite3` layer. PostgreSQL support requires an adapter.
 
 ## Quick start (local development)
 
+Requires **Node.js 22.x**.
+
 ```bash
-npm install
+npm ci
 cp .env.example .env          # uses SQLite + demo AI mode by default
 npm run dev
 ```
@@ -39,7 +41,7 @@ Configure the following in `.env` to enable production-grade providers:
 | `AUTH_GOOGLE_ID` / `AUTH_GOOGLE_SECRET` | Google OAuth |
 | `REDIS_URL` | Switches queue from in-process to BullMQ-backed (worker runs via `npm run worker`) |
 | `CLOUDINARY_*` | Cloudinary image storage |
-| `DATABASE_URL` | Set to a PostgreSQL URL for production; schema in `src/lib/db/index.ts` mirrors the Prisma schema documented in the spec |
+| `DATABASE_URL` | SQLite file URL, e.g. `file:./prisma/dev.db`. PostgreSQL requires a new database adapter; it is not currently implemented. |
 
 Run a dedicated worker (for Redis / BullMQ mode):
 
@@ -117,10 +119,28 @@ src/
 
 ## Production deployment notes
 
-- Use a **managed PostgreSQL** service (Neon, Supabase, RDS, …) and swap `DATABASE_URL` to a Postgres connection string. The SQL schema in `src/lib/db/index.ts` uses portable types.
-- Use **Redis** (Upstash, Railway, ElastiCache) and set `QUEUE_PROVIDER=redis` + `REDIS_URL` to enable BullMQ workers. Run `npm run worker` as a separate process.
-- Configure **Cloudinary** (or S3) via `STORAGE_PROVIDER=cloudinary` for persistent image/export storage.
-- **Vercel** is recommended for the Next.js app; deploy the worker as a separate service (Fly.io, Railway, Render, etc).
+The current runtime is designed for a **persistent, single-instance Node.js server**:
+SQLite needs a writable persistent disk, local covers/exports are stored under
+`public/uploads`, and the default queue runs in-process. PostgreSQL, cloud storage,
+and Redis adapters are not yet implemented; setting their environment variables
+alone does not enable them.
+
+### Vercel build configuration
+
+- Select **Next.js** as the framework, repository root as the root directory,
+  **Node.js 22.x**, install command `npm ci`, and build command `npm run build`.
+- The build is `next build` only. There is no Prisma schema/client in this app;
+  SQLite tables are initialized by `src/lib/db/index.ts` on first database use.
+- Redeploy the branch containing this fix, preferably without the old build cache.
+- Set a strong `AUTH_SECRET` in each deployment environment.
+- This fixes compilation, not serverless persistence. Before using the studio on
+  Vercel, implement a managed database adapter, persistent object storage, and a
+  serverless-compatible job runner. Do not use `/tmp` SQLite as durable storage.
+  Local file generation explicitly refuses to run on Vercel.
+
+`npm run build` currently skips TypeScript and lint validation via the existing
+Next.js configuration. Run `npm run typecheck` and `npm run lint` separately when
+working on application correctness.
 
 ## The guiding principle
 

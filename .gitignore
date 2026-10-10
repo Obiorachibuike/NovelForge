@@ -56,6 +56,6 @@ test-results/
 dev.db
 prisma/dev.db
 prisma/dev.db-journal
-storage/
+/storage/
 .next/
 out/

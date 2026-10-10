@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
-import type { NextRequest } from 'next/server';
-import { auth } from '@/lib/auth/config';
+import NextAuth from 'next-auth';
+import { edgeAuthConfig } from '@/lib/auth/edge-config';
+const { auth } = NextAuth(edgeAuthConfig);
 const PUBLIC_ONLY = new Set(['/login','/register']);
 const PROTECTED_PREFIXES = ['/dashboard','/novels','/settings','/api/novels','/api/jobs'];
 export default auth((req) => {
