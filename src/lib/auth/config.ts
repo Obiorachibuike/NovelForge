@@ -4,11 +4,10 @@ import Google from 'next-auth/providers/google';
 import bcrypt from 'bcryptjs';
 import { getDb } from '@/lib/db';
 import { nanoid } from 'nanoid';
+import { edgeAuthConfig } from './edge-config';
 
 export const authConfig: NextAuthConfig = {
-  trustHost: true,
-  session: { strategy: 'jwt' },
-  pages: { signIn: '/login' },
+  ...edgeAuthConfig,
   providers: [
     ...(process.env.AUTH_GOOGLE_ID && process.env.AUTH_GOOGLE_SECRET
       ? [Google({ clientId: process.env.AUTH_GOOGLE_ID, clientSecret: process.env.AUTH_GOOGLE_SECRET })]
@@ -52,6 +51,7 @@ export const authConfig: NextAuthConfig = {
     }),
   ],
   callbacks: {
+    ...edgeAuthConfig.callbacks,
     async jwt({ token, user, account }) {
       if (user) { token.id = (user as any).id; token.name = user.name; token.email = user.email; token.image = (user as any).image; }
       if (account?.provider === 'google' && token.email) {
@@ -60,12 +60,6 @@ export const authConfig: NextAuthConfig = {
         if (u) token.id = u.id;
       }
       return token;
-    },
-    async session({ session, token }) {
-      if (session.user) {
-        (session.user as any).id = token.id as string;
-      }
-      return session;
     },
     async signIn({ user, account, profile }) {
       if (account?.provider === 'google' && user.email) {
