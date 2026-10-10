@@ -17,9 +17,12 @@ still dates from the era when this repository was a Vite single-page app. That p
 the Vite commit `ef3a5fd` (2026-10-04) and has failed on **100 % of the Next.js commits**, both before and
 after the fix.
 
-Because Vercel applies *project* settings before repo-level configuration, no change committed to this
-repository can fix that project. The remedy is a change in its project settings (or in which project is
-used for production).
+The legacy project's build never reached `next build`: it still resolved a Vite-era framework preset /
+build command, which no code change in PR #3 could affect — only its *build configuration* could.
+
+**Resolved.** Adding [`vercel.json`](../vercel.json) (framework `nextjs`, install `npm ci`, build
+`npm run build`) in the same PR fixed it: the legacy project has been green on every commit since, and all
+three linked projects deploy successfully from `main`. See [Resolution](#resolution-2026-10-10) below.
 
 ## Evidence
 
@@ -91,19 +94,41 @@ Could not resolve entry module "index.html".
 * **The Prisma removal in PR #3** — that fix was real and necessary: at `340e5b6`, `scripts.build` was
   `prisma generate && prisma migrate deploy && next build`, while the repository contained neither the
   `prisma` CLI package nor any `schema.prisma`, so the pre-fix command could only fail with
-  `prisma: not found`. Removing it fixed the *code-side* failure — it just cannot reach a project whose
-  build command lives in the dashboard.
+  `prisma: not found`. Removing it fixed the *code-side* failure; the legacy project additionally needed
+  its Vite-era build configuration corrected (see [Resolution](#resolution-2026-10-10)).
 
 ## Root cause
 
 The legacy `novel-forge` Vercel project still carries **build settings from the Vite prototype era**
 (framework preset `Vite` → `vite build` + output directory `dist`, and/or a hand-pinned Prisma build
-command). Its assumptions stopped being true when PR #2 replaced the Vite SPA with the Next.js app, and
-they are stored at project level, which takes precedence over anything in the repository.
+command). Its assumptions stopped being true when PR #2 replaced the Vite SPA with the Next.js app, so it
+kept failing while every other project built the same commits — until repository-level configuration was
+supplied in `vercel.json` (see [Resolution](#resolution-2026-10-10)).
 
-## Remediation
+## Resolution (2026-10-10)
 
-On the legacy project (`vercel.com/obiorachibuikes-projects/novel-forge`):
+The commit that added `vercel.json` was also the first commit the legacy project built successfully since
+the Vite era — it never needed a dashboard click:
+
+| Commit | `novel-forge` (legacy) | `novel-forge-hvkj` | `novel-forge-v9b1` |
+| --- | --- | --- | --- |
+| `e0130fe` — merged fix, no `vercel.json` (21:58Z) | ❌ failure | ✅ success | ✅ success (22:25Z) |
+| `c1bf43f` — adds `vercel.json`, unmerged (22:05Z) | ✅ **success** | ✅ success | — |
+| `b4e2df0` — `vercel.json` merged into `main` (22:33Z) | ✅ success (22:36Z) | ✅ success (22:35Z) | ✅ success (22:34Z) |
+
+**Correction to an assumption in the first version of this document:** it claimed dashboard settings would
+always win over repository configuration, so only a dashboard change could help. In practice, adding
+`vercel.json` changed the legacy project's build resolution immediately (its `e0130fe` deploy failed at
+21:58Z; its `c1bf43f` deploy was green at 22:05Z, before any merge or other activity). Whatever stale
+Vite-era value it held was overridable from the repository, which is the better outcome: the correct build
+configuration is now versioned with the code, and fresh imports inherit it.
+
+### Remaining housekeeping (optional, dashboard-side)
+
+**Status: completed via `vercel.json` — the dashboard steps below are no longer required.** They are kept
+only as a reference for projects that override configuration in the dashboard, and as the recommended
+check whenever a build misbehaves. On the legacy project
+(`vercel.com/obiorachibuikes-projects/novel-forge`):
 
 1. **Settings → Build & Development Settings**
    * Framework Preset: **Next.js**
@@ -116,10 +141,12 @@ On the legacy project (`vercel.com/obiorachibuikes-projects/novel-forge`):
    unchecked** (stale cache from the Vite/Prisma era should not be reused).
 4. Verify the new deployment goes green on `main`.
 
-Alternative, if the legacy project is superseded: **Settings → Git → Disconnect** on it, so merges stop
-producing a failing check, and keep `novel-forge-hvkj` as the single deployment target. Do this **only
-after** confirming which project holds the production domains and environment variables — the legacy
-project may still own a custom domain or secrets that `novel-forge-hvkj` does not have.
+Alternative, if a project is superseded: **Settings → Git → Disconnect** on it so merges stop producing
+extra checks, and keep one project as the deployment target. There are currently **three** projects linked
+to this repository (`novel-forge`, `novel-forge-hvkj`, `novel-forge-v9b1`), which triples every deploy,
+scatters environment variables and can leave different projects owning different domains — consolidating
+to one is worth doing. Do this **only after** confirming which project holds the production domains and
+environment variables.
 
 ## Secondary observations (not the cause, but worth knowing)
 
