@@ -1,0 +1,5 @@
+import { auth } from '@/lib/auth/config';
+import { requireNovel } from '@/lib/db/ownership';
+import { getDb } from '@/lib/db';
+import ConsistencyView from '@/components/consistency/ConsistencyView';
+export default async function ConsistencyPage({params}){const session=await auth();await requireNovel(params.id,session.user.id);const db=getDb();const novel=db.prepare('SELECT * FROM novels WHERE id=?').get(params.id);const total=db.prepare('SELECT COUNT(*) AS total FROM chapters WHERE novelId=?').get(params.id);const approved=db.prepare("SELECT COUNT(*) AS c FROM chapters WHERE novelId=? AND status='approved'").get(params.id);const issues=db.prepare('SELECT i.*,c.chapterNumber,c.title AS chapterTitle FROM consistency_issues i LEFT JOIN chapters c ON c.id=i.chapterId WHERE i.novelId=? ORDER BY i.severity DESC,i.createdAt DESC').all(params.id);const open=issues.filter(i=>i.status==='open').length;const score=Math.max(0,100-open*4);return <ConsistencyView novel={novel} score={score} issues={issues} chapterCount={total.total} approvedCount={approved.c} issueCount={open}/>;}
