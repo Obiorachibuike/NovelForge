@@ -1,0 +1,111 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 240 18% 98%;
+    --foreground: 240 10% 10%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 10%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 10% 10%;
+    --primary: 245 78% 66%;
+    --primary-foreground: 240 10% 10%;
+    --secondary: 250 85% 76%;
+    --secondary-foreground: 240 10% 10%;
+    --accent: 258 90% 82%;
+    --accent-foreground: 240 10% 10%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 98%;
+    --muted: 240 5% 94%;
+    --muted-foreground: 240 4% 45%;
+    --border: 240 6% 88%;
+    --input: 240 6% 90%;
+    --ring: 245 78% 66%;
+    --surface: 0 0% 100%;
+    --surface-secondary: 240 5% 97%;
+    --radius: 0.8rem;
+    --font-sans: 'DM Sans', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --font-serif: 'Playfair Display', Georgia, serif;
+    --font-mono: 'DM Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  }
+  .dark {
+    --background: 229 47% 4%;   /* #05070D */
+    --foreground: 210 40% 98%; /* #F8FAFC */
+    --card: 229 43% 8%;        /* #0A0F1C */
+    --card-foreground: 210 40% 98%;
+    --popover: 229 43% 8%;
+    --popover-foreground: 210 40% 98%;
+    --primary: 239 84% 67%;    /* #6366F1 */
+    --primary-foreground: 210 40% 98%;
+    --secondary: 258 90% 66%;  /* #8B5CF6 */
+    --secondary-foreground: 210 40% 98%;
+    --accent: 258 90% 82%;     /* #A78BFA */
+    --accent-foreground: 229 47% 4%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 210 40% 98%;
+    --muted: 229 26% 14%;
+    --muted-foreground: 215 18% 65%; /* #94A3B8 */
+    --border: 229 26% 18%;
+    --input: 229 26% 16%;
+    --ring: 239 84% 67%;
+    --surface: 229 43% 8%;
+    --surface-secondary: 229 39% 11%; /* #0D1322 */
+  }
+}
+
+@layer base {
+  * { @apply border-border; }
+  html, body { @apply bg-background text-foreground; min-height:100%; }
+  body { font-family: var(--font-sans); -webkit-font-smoothing: antialiased; }
+  h1, h2, h3, h4 { font-family: var(--font-serif); letter-spacing: -0.01em; }
+  .font-serif { font-family: var(--font-serif); }
+  .font-mono { font-family: var(--font-mono); }
+  ::selection { background: hsl(var(--primary) / 0.35); }
+}
+
+/* Utility classes */
+@layer components {
+  .surface { @apply bg-[hsl(var(--surface))] border border-border rounded-xl; }
+  .surface-secondary { @apply bg-[hsl(var(--surface-secondary))] border border-border/70 rounded-xl; }
+  .btn { @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-all disabled:opacity-50 disabled:pointer-events-none; }
+  .btn-primary { @apply btn bg-primary text-primary-foreground hover:bg-primary/90 shadow-[0_6px_24px_-8px_hsl(var(--primary))]; }
+  .btn-secondary { @apply btn bg-[hsl(var(--surface-secondary))] text-foreground hover:bg-[hsl(var(--surface-secondary))]/80 border border-border; }
+  .btn-ghost { @apply btn hover:bg-[hsl(var(--surface-secondary))] text-foreground/80; }
+  .btn-destructive { @apply btn bg-destructive text-destructive-foreground hover:bg-destructive/90; }
+  .btn-outline { @apply btn border border-border hover:bg-[hsl(var(--surface-secondary))]; }
+  .input { @apply w-full rounded-lg border border-input bg-[hsl(var(--surface-secondary))] px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring/60 focus:border-ring; }
+  .label { @apply text-xs uppercase tracking-wider font-semibold text-muted-foreground; }
+  .chip { @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold tracking-wider uppercase; }
+  .chip-primary { @apply chip bg-primary/15 text-primary; }
+  .chip-muted { @apply chip bg-[hsl(var(--surface-secondary))] text-muted-foreground; }
+  .chip-success { @apply chip bg-emerald-500/15 text-emerald-400; }
+  .chip-warning { @apply chip bg-amber-500/15 text-amber-400; }
+  .chip-error { @apply chip bg-destructive/15 text-destructive; }
+  .stage-dot { @apply w-2 h-2 rounded-full bg-emerald-400 ring-4 ring-emerald-400/20 animate-pulse-dot; }
+  .card-hover { @apply transition-all hover:border-primary/40 hover:shadow-[0_8px_30px_-12px_hsl(var(--primary)/0.4)]; }
+  .glass { @apply bg-background/60 backdrop-blur-xl; }
+}
+
+/* Tiptap editor styling */
+.ProseMirror { outline: none; font-family: var(--font-serif); font-size: 1.075rem; line-height: 1.85; color: hsl(var(--foreground)); min-height: 400px; }
+.ProseMirror p { margin-bottom: 1rem; }
+.ProseMirror h1, .ProseMirror h2, .ProseMirror h3 { font-family: var(--font-serif); font-weight: 600; margin-top: 2rem; margin-bottom: 0.75rem; }
+.ProseMirror h2 { font-size: 1.75rem; }
+.ProseMirror blockquote { border-left: 3px solid hsl(var(--primary)); padding-left: 1rem; font-style: italic; color: hsl(var(--muted-foreground)); margin: 1.25rem 0; }
+.ProseMirror p.is-editor-empty:first-child::before { content: attr(data-placeholder); color: hsl(var(--muted-foreground)/0.6); float: left; height: 0; pointer-events: none; font-style: italic; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: hsl(var(--border)); border-radius: 10px; border: 2px solid hsl(var(--background)); }
+::-webkit-scrollbar-thumb:hover { background: hsl(var(--muted-foreground)/0.5); }
+
+/* Shimmer loading */
+.shimmer { background: linear-gradient(90deg, hsl(var(--surface-secondary)) 0%, hsl(var(--muted)) 50%, hsl(var(--surface-secondary)) 100%); background-size: 200% 100%; animation: shimmer 2s linear infinite; }
+
+/* Progress bar inside editor status */
+.typing-indicator span { display:inline-block; width:4px; height:4px; border-radius:50%; background:hsl(var(--muted-foreground)); margin:0 1px; animation: pulse-dot 1.4s infinite; }
+.typing-indicator span:nth-child(2){animation-delay:.2s}
+.typing-indicator span:nth-child(3){animation-delay:.4s}
