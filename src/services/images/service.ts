@@ -1,51 +1,85 @@
 import { getDb } from '@/lib/db';
 import { saveFile } from '@/lib/storage';
-import { getOpenAI, aiConfig } from '@/lib/ai/provider';
+import { getOpenAI, aiConfig, recordImageUsage } from '@/lib/ai/provider';
+import { HttpError } from '@/lib/api/http';
 import { nanoid } from 'nanoid';
 import { coverPrompt } from '@/lib/ai/prompts';
 import 'server-only';
 
-export interface GeneratedCover { imageId: string; url: string; }
+export interface GeneratedCover {
+  imageId: string;
+  url: string;
+  provider: string;
+  /** Where the image really came from, so the UI can label a substitute honestly. */
+  source: 'openai' | 'demo' | 'svg-fallback';
+  fallbackReason?: string;
+}
 
-/** Generate cover concepts. In demo mode (no OpenAI key) we generate stylized SVG covers. */
+/** Hard ceiling per novel so a stuck client cannot run up unbounded image spend. */
+export const MAX_COVERS_PER_NOVEL = 24;
+
+/**
+ * Generates cover concepts.
+ *
+ * - demo mode → stylized SVG concepts, labelled `demo` (no paid calls);
+ * - real mode → OpenAI images, and if that call fails the SVG substitute is
+ *   labelled `svg-fallback` with the provider reason instead of being passed
+ *   off as a generated image.
+ */
 export async function generateCovers(userId: string, novelId: string, promptOverride?: string, variants = 2): Promise<GeneratedCover[]> {
   const db = getDb();
   const novel = db.prepare('SELECT * FROM novels WHERE id = ? AND userId = ?').get(novelId, userId) as any;
-  if (!novel) throw new Error('Novel not found');
+  if (!novel) throw new HttpError(404, 'Novel not found', 'novel_not_found');
+
+  const existing = (db.prepare('SELECT COUNT(*) AS c FROM image_assets WHERE novelId = ? AND kind = ?').get(novelId, 'cover') as any).c;
+  if (existing + variants > MAX_COVERS_PER_NOVEL) {
+    throw new HttpError(
+      429,
+      `Cover limit reached for this novel (${MAX_COVERS_PER_NOVEL} concepts). Delete unused concepts before generating more.`,
+      'cover_limit_reached',
+    );
+  }
+
   const results: GeneratedCover[] = [];
+  const width = 768, height = 1024;
+  const prompt = promptOverride || coverPrompt(novel, 'cinematic hardcover');
 
   for (let i = 0; i < variants; i++) {
-    let buf: Buffer;
-    let provider = 'openai';
-    let width = 768, height = 1024;
     const client = getOpenAI();
-    if (client && aiConfig.imageModel && !aiConfig.demoMode) {
+    if (client) {
+      let buf: Buffer;
       try {
         const resp = await client.images.generate({
           model: aiConfig.imageModel,
-          prompt: promptOverride || coverPrompt(novel, 'cinematic hardcover'),
+          prompt,
           n: 1, size: '1024x1792', quality: 'standard',
         });
         const url = resp.data?.[0]?.url;
         if (url) {
           const img = await fetch(url);
-          const arr = await img.arrayBuffer();
-          buf = Buffer.from(arr);
+          buf = Buffer.from(await img.arrayBuffer());
           const stored = await saveFile({ data: buf, folder: 'covers', ext: 'png' });
-          const id = await saveImageRecord(db, { userId, novelId, url: stored.url, key: stored.key, width: 1024, height: 1792, prompt: promptOverride || coverPrompt(novel), provider });
-          results.push({ imageId: id, url: stored.url });
+          const id = saveImageRecord(db, { userId, novelId, url: stored.url, key: stored.key, width: 1024, height: 1792, prompt, provider: 'openai' });
+          recordImageUsage({ userId, novelId, model: aiConfig.imageModel, images: 1, source: 'openai' });
+          results.push({ imageId: id, url: stored.url, provider: 'openai', source: 'openai' });
           continue;
         }
-      } catch (e) {
-        console.warn('OpenAI image generation failed, falling back to SVG cover', e);
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        console.warn('[images] OpenAI image generation failed, substituting a labelled SVG concept:', reason);
+        recordImageUsage({ userId, novelId, model: aiConfig.imageModel, images: 0, source: 'demo' });
       }
     }
-    // Demo / fallback: stylized SVG cover
-    buf = makeSvgCover(novel, i);
-    provider = 'demo-svg';
-    const stored = await saveFile({ data: buf, folder: 'covers', ext: 'svg' });
-    const id = await saveImageRecord(db, { userId, novelId, url: stored.url, key: stored.key, width, height, prompt: promptOverride || coverPrompt(novel), provider });
-    results.push({ imageId: id, url: stored.url });
+    const fallbackReason = client ? 'OpenAI image generation failed' : undefined;
+    const svg = makeSvgCover(novel, i);
+    const stored = await saveFile({ data: svg, folder: 'covers', ext: 'svg' });
+    const provider = client ? 'svg-fallback' : 'demo-svg';
+    const id = saveImageRecord(db, { userId, novelId, url: stored.url, key: stored.key, width, height, prompt, provider });
+    results.push({
+      imageId: id, url: stored.url, provider,
+      source: client ? 'svg-fallback' : 'demo',
+      ...(fallbackReason ? { fallbackReason } : {}),
+    });
   }
   return results;
 }
@@ -90,7 +124,7 @@ export function makeSvgCover(novel: { title:string; genre?:string; tone?:string 
   <text x="50%" y="160" text-anchor="middle" fill="${p.accent}" font-family="ui-monospace, Menlo, monospace" font-size="24" letter-spacing="8" opacity=".85">THE</text>
   ${titleSvg}
   <text x="50%" y="${340 + titleLines.length*88 + 20}" text-anchor="middle" fill="${p.accent}" font-size="42" opacity=".7">✦</text>
-  <text x="50%" y="860" text-anchor="middle" fill="${p.accent}" font-family="ui-monospace, Menlo, monospace" font-size="20" letter-spacing="6" opacity=".8">A NOVEL OF ASH &amp; OATHS</text>
+  <text x="50%" y="860" text-anchor="middle" fill="${p.accent}" font-family="ui-monospace, Menlo, monospace" font-size="20" letter-spacing="6" opacity=".8">${escapeXml(((novel.genre || 'Fiction') + ' NOVEL').toUpperCase())}</text>
 </svg>`;
   return Buffer.from(svg);
 }
@@ -115,7 +149,7 @@ function escapeXml(s: string) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-export function listCovers(novelId: string) {
+export async function listCovers(novelId: string) {
   const db = getDb();
   return db.prepare('SELECT * FROM image_assets WHERE novelId = ? AND kind = ? ORDER BY isPrimary DESC, createdAt DESC').all(novelId, 'cover') as any[];
 }

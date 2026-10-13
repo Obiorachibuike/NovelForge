@@ -1,5 +1,17 @@
 import LoginClient from './LoginClient';
+import { googleSignInEnabled } from '@/lib/auth/providers';
+
+/**
+ * Rendered per request: whether Google sign-in is offered depends on runtime
+ * environment variables, and a page prerendered at build time would bake in
+ * whatever the build machine had (i.e. always "no button").
+ */
+export const dynamic = 'force-dynamic';
+
 export default function LoginPage() {
+  // Resolved on the server so the Google button is only rendered when the
+  // provider is actually configured (see src/lib/auth/providers.ts).
+  const googleEnabled = googleSignInEnabled();
   return (
     <div className="min-h-screen bg-[#05070D] grid lg:grid-cols-2">
       <div className="hidden lg:flex flex-col justify-between p-12 bg-gradient-to-br from-indigo-950/40 to-violet-950/30 border-r border-white/5 relative overflow-hidden">
@@ -14,7 +26,7 @@ export default function LoginPage() {
         </div>
         <div className="relative z-10 text-xs text-slate-500">One chapter at a time. Always under your control.</div>
       </div>
-      <div className="flex items-center justify-center p-8"><LoginClient/></div>
+      <div className="flex items-center justify-center p-8"><LoginClient googleEnabled={googleEnabled}/></div>
     </div>
   );
 }

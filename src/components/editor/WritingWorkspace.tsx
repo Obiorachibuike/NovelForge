@@ -18,6 +18,7 @@ import {
   Save, Loader2, Sparkles, Wand2, Lock, ChevronRight, ChevronLeft, CheckCircle2, RefreshCw, MessageSquare, Zap
 } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
+import { useJobWatcher } from '@/lib/hooks/useJobWatcher';
 
 export default function WritingWorkspace({ novel, chapter, outline, navigation, previousSummary, memories }: any) {
   const router = useRouter();
@@ -31,6 +32,11 @@ export default function WritingWorkspace({ novel, chapter, outline, navigation, 
   const targetPages = outline?.estimatedPages || Math.round(targetWords/320);
   const status = chapter?.status || (outline ? 'next' : 'locked');
   const isLocked = status === 'locked';
+  // Approved chapters are final until a future "reopen" action exists, so the
+  // editor must not pretend they are editable: autosave would fail server-side
+  // and the author's typing would be lost.
+  const isApproved = chapter?.status === 'approved';
+  const isDemoContent = chapter?.generationSource === 'demo';
   const initialContent = chapter?.contentJson ? JSON.parse(chapter.contentJson) : {
     type:'doc', content:[
       chapter ? undefined : { type:'paragraph', content:[{ type:'text', text:'' }] },
@@ -48,7 +54,7 @@ export default function WritingWorkspace({ novel, chapter, outline, navigation, 
       CharacterCount,
     ],
     content: initialContent,
-    editable: !isLocked && !!chapter,
+    editable: !isLocked && !!chapter && !isApproved,
     onSelectionUpdate: ({editor}) => {
       const text = editor.state.doc.textBetween(editor.state.selection.from, editor.state.selection.to, ' ');
       setSelection(text.slice(0, 2000));
@@ -68,11 +74,20 @@ export default function WritingWorkspace({ novel, chapter, outline, navigation, 
         method:'PATCH', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ contentJson: editor.getJSON() }),
       });
-      if (!res.ok) throw new Error('Save failed');
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.code || 'Save failed');
+      }
       return res.json();
     },
     onSuccess: () => { setSaveState('saved'); qc.invalidateQueries({queryKey:['novel',novel.id]}); },
-    onError: () => toast.error('Could not save — will retry'),
+    onError: async (err: any) => {
+      setSaveState('idle');
+      const message = err?.message === 'chapter_approved'
+        ? 'This chapter is approved and read-only.'
+        : 'Could not save your changes. Copy anything you need and reload the page.';
+      toast.error(message);
+    },
   });
   const debouncedSave = useCallback(() => {
     if (saveTimer.current) clearTimeout(saveTimer.current);
@@ -83,12 +98,26 @@ export default function WritingWorkspace({ novel, chapter, outline, navigation, 
 
   const generateChapter = useMutation({
     mutationFn: async () => {
-      const res = await fetch(`/api/novels/${novel.id}/chapters`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ chapterNumber: chapterNum }) });
-      if (!res.ok) throw new Error((await res.json()).error || 'Generation failed');
+      // Regenerating a chapter that contains the author's own edits replaces
+      // their prose, so it requires an explicit confirmation.
+      const needsConfirmation = chapter?.status === 'edited';
+      if (needsConfirmation && !window.confirm('This chapter contains your edits. Regenerating will replace them. Continue?')) {
+        throw new Error('cancelled');
+      }
+      const res = await fetch(`/api/novels/${novel.id}/chapters`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ chapterNumber: chapterNum, confirmOverwrite: needsConfirmation }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const err: any = new Error(data.error || 'Generation failed');
+        err.code = data.code;
+        throw err;
+      }
       return res.json();
     },
-    onSuccess: () => { toast.success('Chapter generation queued'); pollForChapter(); },
-    onError: (e:any) => toast.error(e.message),
+    onSuccess: (data:any) => { toast.success('Chapter generation queued'); if (data?.jobId) watch(data.jobId); else pollForChapter(); },
+    onError: (e:any) => { if (e?.message !== 'cancelled') toast.error(e.message); },
   });
 
   const approve = useMutation({
@@ -128,6 +157,14 @@ export default function WritingWorkspace({ novel, chapter, outline, navigation, 
     },
     onError: (e:any) => { setAiState('idle'); toast.error(e.message); },
   });
+
+  const { job: generationJob, watch } = useJobWatcher({
+    onComplete: () => { toast.success('Chapter ready'); router.refresh(); },
+    onFail: (job) => toast.error(`Generation failed: ${job.error || 'unknown error'}`),
+  });
+  // The durable job row is the truth: the button stays busy while it runs, even
+  // across a page refresh.
+  const isWritingJob = generationJob?.status === 'queued' || generationJob?.status === 'processing';
 
   function pollForChapter() {
     let tries = 0;
@@ -209,8 +246,8 @@ export default function WritingWorkspace({ novel, chapter, outline, navigation, 
                 <Wand2 className="w-10 h-10 text-primary/60 mx-auto mb-4"/>
                 <h3 className="font-serif text-2xl mb-2">Ready to write</h3>
                 <p className="text-sm text-muted-foreground max-w-md mx-auto mb-6">NovelForge will generate the first draft of this chapter, drawing on the Story Bible, outline, and previous chapter summary. You'll be able to edit every word.</p>
-                <button className="btn-primary" onClick={()=>generateChapter.mutate()} disabled={generateChapter.isPending || isLocked}>
-                  {generateChapter.isPending ? <><Loader2 className="w-4 h-4 animate-spin"/> Generating…</> : <><Sparkles className="w-4 h-4"/> Generate Chapter {chapterNum}</>}
+                <button className="btn-primary" onClick={()=>generateChapter.mutate()} disabled={generateChapter.isPending || isWritingJob || isLocked}>
+                  {(generateChapter.isPending || isWritingJob) ? <><Loader2 className="w-4 h-4 animate-spin"/> {isWritingJob ? 'Writing…' : 'Generating…'}</> : <><Sparkles className="w-4 h-4"/> Generate Chapter {chapterNum}</>}
                 </button>
                 {isLocked && <p className="text-xs text-amber-400 mt-4"><Lock className="w-3 h-3 inline mr-1"/>Previous chapter must be approved first.</p>}
               </div>
@@ -226,7 +263,19 @@ export default function WritingWorkspace({ novel, chapter, outline, navigation, 
               </div>
             )}
 
-            {chapter && !isLocked && (
+            {isDemoContent && (
+              <p className="text-xs text-amber-400 mb-4">
+                This chapter was produced in demo mode (no AI provider configured). Configure OPENAI_API_KEY for real prose.
+              </p>
+            )}
+
+            {chapter && isApproved && (
+              <div className="surface-secondary p-4 rounded-lg mb-6 text-sm text-muted-foreground">
+                Approved — this chapter is read-only and its summary has been added to story memory.
+              </div>
+            )}
+
+            {chapter && !isLocked && !isApproved && (
               <div className="mt-10 pt-6 border-t border-border flex items-center justify-between flex-wrap gap-3">
                 <div className="flex items-center gap-4 text-sm text-muted-foreground">
                   <span>{Math.round(wordCount).toLocaleString()} words</span>
@@ -237,7 +286,7 @@ export default function WritingWorkspace({ novel, chapter, outline, navigation, 
                 </div>
                 <div className="flex items-center gap-2">
                   <button className="btn-outline" onClick={()=>generateChapter.mutate()} disabled={generateChapter.isPending}>
-                    <RefreshCw className={cn('w-4 h-4',generateChapter.isPending && 'animate-spin')}/> Regenerate
+                    <RefreshCw className={cn('w-4 h-4',generateChapter.isPending && 'animate-spin')}/> {chapter?.status === 'edited' ? 'Regenerate (replaces edits)' : 'Regenerate'}
                   </button>
                   <button className="btn-primary" onClick={()=>approve.mutate()} disabled={approve.isPending || wordCount < 100}>
                     {approve.isPending ? <Loader2 className="w-4 h-4 animate-spin"/> : <CheckCircle2 className="w-4 h-4"/>} Approve & continue

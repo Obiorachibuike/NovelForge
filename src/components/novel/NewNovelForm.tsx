@@ -3,7 +3,7 @@ import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
-import { createNovelSchema } from '@/types';
+import { createNovelSchema, type CreateNovelInput } from '@/types';
 import { toast } from 'sonner';
 import { useMutation } from '@tanstack/react-query';
 import { BookOpen, Loader2, Sparkles, ArrowRight } from 'lucide-react';
@@ -15,8 +15,8 @@ const TARGET_WORDS=[50000,80000,100000,120000];
 export default function NewNovelForm(){
   const router=useRouter();
   const [step,setStep]=useState(1);
-  const form=useForm({resolver:zodResolver(createNovelSchema),defaultValues:{title:'',premise:'',genre:'Fantasy',tone:'Dark, emotional, suspenseful',style:'',pov:'Third Person Limited',audience:'Adult',targetWords:80000,targetPages:250,targetChapters:30,writingMode:'chapter'}});
-  const mut=useMutation({mutationFn:async v=>{const r=await fetch('/api/novels',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(v)});if(!r.ok)throw new Error((await r.json()).error||'Failed');return r.json();},onSuccess:d=>{toast.success('Novel created');router.push(`/novels/${d.id}/cover`);},onError:e=>toast.error(e.message)});
+  const form=useForm<CreateNovelInput>({resolver:zodResolver(createNovelSchema),defaultValues:{title:'',premise:'',genre:'Fantasy',tone:'Dark, emotional, suspenseful',style:'',pov:'Third Person Limited',audience:'Adult',targetWords:80000,targetPages:250,targetChapters:30,writingMode:'chapter'}});
+  const mut=useMutation<any,Error,CreateNovelInput>({mutationFn:async v=>{const r=await fetch('/api/novels',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(v)});if(!r.ok){const body=await r.json().catch(()=>({}));if(r.status===402){toast.error('Novel creation requires an active plan.');router.push('/pricing');throw new Error(body.error||'Payment required');}throw new Error(body.error||'Failed');}return r.json();},onSuccess:d=>{toast.success('Novel created');router.push(`/novels/${d.id}/cover`);},onError:e=>{if(e.message!=='Payment required'&&!/requires an active plan/i.test(e.message))toast.error(e.message)}});
   return <div className="flex-1 overflow-y-auto"><div className="max-w-3xl mx-auto px-8 py-12">
     <div className="mb-10"><div className="label text-primary mb-2">STAGE 1 · CREATE</div><h1 className="font-serif text-4xl font-semibold mb-2">Begin with a spark.</h1><p className="text-muted-foreground max-w-xl">Tell us the shape of the story you want to build. You can change every setting later.</p></div>
     <div className="surface p-8">
@@ -54,6 +54,6 @@ export default function NewNovelForm(){
     </div>
   </div></div>;
 }
-function Field({label,hint,children}){return <label className="block space-y-2"><div><div className="label">{label}</div>{hint&&<div className="text-xs text-muted-foreground">{hint}</div>}</div>{children}</label>;}
+function Field({label,hint,children}:{label:string;hint?:string;children:React.ReactNode}){return <label className="block space-y-2"><div><div className="label">{label}</div>{hint&&<div className="text-xs text-muted-foreground">{hint}</div>}</div>{children}</label>;}
 function Err({children}){return <div className="text-xs text-destructive mt-1">{children}</div>;}
 function ModeCard({active,onClick,title,desc}){return <button type="button" onClick={onClick} className={`text-left p-4 rounded-lg border transition ${active?'border-primary bg-primary/10':'border-border bg-[hsl(var(--surface-secondary))] hover:border-primary/40'}`}><div className="font-semibold text-sm mb-1">{title}</div><div className="text-xs text-muted-foreground">{desc}</div></button>;}

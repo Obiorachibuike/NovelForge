@@ -1,15 +1,17 @@
 /**
- * Standalone worker process entrypoint. Running `npm run worker` imports all
- * service modules (which register their job handlers against the in-process
- * queue) and then drains any queued jobs from the database.
+ * Standalone worker.
  *
- * When QUEUE_PROVIDER=redis this module can be extended to boot BullMQ workers;
- * by default it uses the SQLite-backed in-process queue for simplicity.
+ *   npm run worker        # database mode (default) or BullMQ when Redis is configured
+ *
+ * In both modes the job *state* lives in the `generation_jobs` table; Redis only
+ * carries wake-ups. The claim in `runJob` is a compare-and-set UPDATE, so the
+ * BullMQ consumer, the database poller and a stray in-process dispatch can all
+ * race safely without executing the same job twice.
  */
 import { getDb } from '@/lib/db';
-import { initQueue, runJob } from '@/lib/queue';
+import { drainQueue, queueDriver, runJob, recoverStaleJobs } from '@/lib/queue';
 
-// Import all services so their registerHandler calls execute
+// Importing the services registers their job handlers.
 import '@/services/images/service';
 import '@/services/preparation/service';
 import '@/services/outlines/service';
@@ -17,18 +19,43 @@ import '@/services/chapters/service';
 import '@/services/consistency/service';
 import '@/services/exports/service';
 
+const POLL_MS = Number(process.env.WORKER_POLL_MS || 3000);
+const CONCURRENCY = Math.max(1, Number(process.env.WORKER_CONCURRENCY || 2));
+
 async function main() {
   const db = getDb();
-  console.log('[worker] connected to db');
-  initQueue();
+  const driver = queueDriver();
+  const workerId = `worker-${process.pid}`;
 
-  // Simple polling loop for any queued jobs (in-process mode is immediate; this handles restarts)
-  setInterval(() => {
-    const jobs = db.prepare(`SELECT id FROM generation_jobs WHERE status='queued' ORDER BY createdAt ASC LIMIT 5`).all() as any[];
-    for (const j of jobs) runJob(j.id).catch(err => console.error('[worker] job error', j.id, err));
-  }, 3000);
+  if (driver === 'redis') {
+    const { startBullWorker } = await import('@/lib/queue/bullmq');
+    await startBullWorker((jobId, id) => runJob(jobId, id), { concurrency: CONCURRENCY, workerId });
+    console.log('[worker] BullMQ consumer listening on the Redis queue');
+  }
 
-  console.log('[worker] listening for jobs');
+  // Database safety net in both modes: recovers jobs abandoned by a crashed
+  // worker and drains anything Redis missed (e.g. publish failed).
+  const tick = async () => {
+    try {
+      const recovered = await recoverStaleJobs({ limit: 20 });
+      if (recovered.recovered) console.warn(`[worker] recovered ${recovered.recovered} stale job(s)`);
+      await drainQueue({ limit: CONCURRENCY, workerId });
+    } catch (err) {
+      console.error('[worker] poll failed:', err);
+    }
+  };
+
+  await tick();
+  const timer = setInterval(tick, POLL_MS);
+  console.log(`[worker] ready (driver=${driver}, concurrency=${CONCURRENCY}, poll=${POLL_MS}ms)`);
+
+  const shutdown = (signal: string) => {
+    console.log(`[worker] ${signal} received — finishing current jobs`);
+    clearInterval(timer);
+    setTimeout(() => process.exit(0), 500);
+  };
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 main().catch(err => { console.error('[worker] fatal', err); process.exit(1); });

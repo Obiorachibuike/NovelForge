@@ -1,26 +1,25 @@
-import { NextResponse } from 'next/server';
 import { requireUser, jsonError } from '@/lib/db/ownership';
 import { createNovel, listNovels } from '@/services/novels/service';
+import { assertCanCreateNovel } from '@/services/billing/service';
 import { createNovelSchema } from '@/types';
-import { z } from 'zod';
+import { apiHandler, readJsonBody } from '@/lib/api/http';
+import { checkRateLimit } from '@/lib/security/rate-limit';
+import { HttpError } from '@/lib/api/http';
 
-export async function GET() {
-  try {
-    const user = await requireUser();
-    const novels = await listNovels(user.id);
-    return NextResponse.json(novels);
-  } catch (e) { return jsonError(NextResponse, e); }
-}
+export const GET = apiHandler(async () => {
+  const user = await requireUser();
+  return Response.json(await listNovels(user.id));
+});
 
-export async function POST(req: Request) {
-  try {
-    const user = await requireUser();
-    const body = await req.json();
-    const data = createNovelSchema.parse(body);
-    const novel = await createNovel(user.id, data);
-    return NextResponse.json(novel);
-  } catch (e) {
-    if (e instanceof z.ZodError) return NextResponse.json({ error: e.errors.map(x=>x.message).join('; ') }, { status:400 });
-    return jsonError(NextResponse, e);
-  }
-}
+const CREATE_LIMIT = { limit: 30, windowMs: 60 * 60 * 1000 };
+
+export const POST = apiHandler(async (req: Request) => {
+  const user = await requireUser();
+  // Check the entitlement before the burst limiter: a writer without a plan
+  // should be told to pick one, not throttled by a quota they never spent.
+  assertCanCreateNovel(user.id);
+  const burst = checkRateLimit('aiGeneration', `novel-create:${user.id}`, CREATE_LIMIT);
+  if (!burst.ok) throw new HttpError(429, 'Too many novels created in the last hour.', 'rate_limited');
+  const data = await readJsonBody(req, v => createNovelSchema.parse(v));
+  return Response.json(await createNovel(user.id, data));
+});

@@ -3,7 +3,7 @@ import NextAuth from 'next-auth';
 import { edgeAuthConfig } from '@/lib/auth/edge-config';
 const { auth } = NextAuth(edgeAuthConfig);
 const PUBLIC_ONLY = new Set(['/login','/register']);
-const PROTECTED_PREFIXES = ['/dashboard','/novels','/settings','/api/novels','/api/jobs'];
+const PROTECTED_PREFIXES = ['/dashboard','/novels','/settings','/admin','/api/novels','/api/jobs','/api/ai','/api/usage','/api/files','/api/settings','/api/admin','/api/billing'];
 export default auth((req) => {
   const { nextUrl } = req;
   const session = req.auth;
@@ -12,6 +12,10 @@ export default auth((req) => {
   const isProtected = PROTECTED_PREFIXES.some(p => pathname === p || pathname.startsWith(p + '/'));
   const isPublicOnly = PUBLIC_ONLY.has(pathname);
   if (isProtected && !isLoggedIn) {
+    // API callers get a machine-readable 401; page navigations get a redirect.
+    if (pathname.startsWith('/api/')) {
+      return NextResponse.json({ error: 'Authentication required', code: 'unauthenticated' }, { status: 401 });
+    }
     const url = new URL('/login', nextUrl.origin);
     url.searchParams.set('callbackUrl', pathname + nextUrl.search);
     return NextResponse.redirect(url);

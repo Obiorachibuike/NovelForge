@@ -1,14 +1,30 @@
 import { getDb } from '@/lib/db';
 import { nanoid } from 'nanoid';
-import { generateStructured } from '@/lib/ai/text-generation';
+import { generateStructuredDetailed } from '@/lib/ai/text-generation';
+import { HttpError } from '@/lib/api/http';
 import { consistencyCheckPrompt } from '@/lib/ai/prompts';
 import { registerHandler } from '@/lib/queue';
 import { z } from 'zod';
 import 'server-only';
 
+/**
+ * Queues a consistency check. Concurrency is deduplicated by idempotency key so
+ * repeated clicks cannot spawn parallel paid analyses of the same novel.
+ */
 export async function enqueueConsistencyCheck(userId: string, novelId: string, chapterId?: string) {
+  const db = getDb();
+  const novel = db.prepare('SELECT id FROM novels WHERE id = ? AND userId = ?').get(novelId, userId);
+  if (!novel) throw new HttpError(404, 'Novel not found', 'novel_not_found');
+  if (chapterId) {
+    const chapter = db.prepare('SELECT id FROM chapters WHERE id = ? AND novelId = ?').get(chapterId, novelId);
+    if (!chapter) throw new HttpError(404, 'Chapter not found', 'chapter_not_found');
+  }
   const { enqueue } = await import('@/lib/queue');
-  return enqueue({ type:'consistency', userId, novelId, payload:{ chapterId: chapterId || null } });
+  return enqueue({
+    type: 'consistency', userId, novelId,
+    payload: { chapterId: chapterId || null },
+    idempotencyKey: `consistency:${novelId}`,
+  });
 }
 
 async function runConsistency({ novelId, userId, payload }: any) {
@@ -30,19 +46,25 @@ async function runConsistency({ novelId, userId, payload }: any) {
   }));
 
   const now = new Date().toISOString();
+  let aiUnavailable = 0;
   for (const ch of chapters) {
     if (!ch?.plainText) continue;
     const prompt = consistencyCheckPrompt(novel, { number: ch.chapterNumber, title: ch.title }, ch.plainText, bibleText);
     const fallback: any[] = [];
-    // Heuristic checks regardless of AI
+    // Heuristic checks always run, with or without AI.
     const heuristicIssues = heuristicCheck(novelId, ch);
     let aiIssues: any[] = [];
-    try {
-      aiIssues = await generateStructured(issueShape, {
-        messages: [{ role:'system', content: prompt.system }, { role:'user', content: prompt.user }],
-        temperature: 0.1, userId, novelId, taskType: 'consistency', fallback,
-      });
-    } catch (e) { console.warn('consistency AI failed', e); }
+    const { data: aiResult, meta } = await generateStructuredDetailed(issueShape, {
+      messages: [{ role:'system', content: prompt.system }, { role:'user', content: prompt.user }],
+      temperature: 0.1, userId, novelId, taskType: 'consistency', fallback,
+    });
+    if (meta.usedFallback) {
+      // Report the degraded run instead of presenting an empty result as "clean".
+      aiUnavailable++;
+      console.warn(`[consistency] AI analysis unavailable for chapter ${ch.chapterNumber}: ${meta.fallbackReason}`);
+    } else {
+      aiIssues = aiResult;
+    }
     const issues = [...heuristicIssues, ...aiIssues];
     // Mark previous open issues for this chapter as resolved (refresh)
     db.prepare(`DELETE FROM consistency_issues WHERE novelId=? AND chapterId=?`).run(novelId, ch.id);
@@ -51,6 +73,12 @@ async function runConsistency({ novelId, userId, payload }: any) {
       ins.run(nanoid(), novelId, ch.id, it.kind, it.severity, it.title, it.description, it.evidence || null, it.suggestion || null, 'open', now, now);
     }
   }
+
+  return {
+    chaptersChecked: chapters.length,
+    aiUnavailable,
+    note: 'Consistency findings are advisory. Chapter text is never modified automatically.',
+  };
 }
 
 registerHandler('consistency', runConsistency);
@@ -95,6 +123,23 @@ function heuristicCheck(novelId: string, chapter: any) {
       }
     }
   }
+  // Character present in the chapter text but missing from the Story Bible.
+  const bibleNames = (db.prepare('SELECT name FROM characters WHERE novelId=?').all(novelId) as any[])
+    .map(c => (c.name.split(' ')[0] || '').toLowerCase()).filter(n => n.length > 3);
+  if (bibleNames.length) {
+    const mentioned = bibleNames.filter(n => text.includes(n));
+    const unmentioned = bibleNames.filter(n => !mentioned.includes(n));
+    if (unmentioned.length === bibleNames.length && bibleNames.length > 1 && text.length > 400) {
+      issues.push({
+        kind: 'character', severity: 'info',
+        title: 'No Story Bible characters appear in this chapter',
+        description: `None of the ${bibleNames.length} tracked first names appear in the text. This can be intentional (a new POV), but it often means the chapter drifted from the plan.`,
+        evidence: null,
+        suggestion: 'Check whether this chapter is meant to focus on new or secondary characters.',
+      });
+    }
+  }
+
   // Word count against target
   const outline = db.prepare('SELECT targetWords FROM chapter_outlines WHERE novelId=? AND chapterNumber=?').get(novelId, chapter.chapterNumber) as any;
   if (outline) {

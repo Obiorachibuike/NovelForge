@@ -1,8 +1,9 @@
 import { getDb } from '@/lib/db';
 import { nanoid } from 'nanoid';
-import { generateStructured } from '@/lib/ai/text-generation';
+import { generateStructuredDetailed } from '@/lib/ai/text-generation';
 import { outlinePrompt } from '@/lib/ai/prompts';
 import { registerHandler } from '@/lib/queue';
+import { HttpError } from '@/lib/api/http';
 import { z } from 'zod';
 import 'server-only';
 
@@ -53,10 +54,15 @@ async function runOutline({ novelId, userId, payload }: any) {
 
   const fallback = buildDemoOutline(ctx.novel);
   const prompt = outlinePrompt(ctx as any, structureType);
-  const result = await generateStructured(outlineShape, {
+  const { data: result, meta } = await generateStructuredDetailed(outlineShape, {
     messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: prompt.user }],
     temperature: 0.6, userId, novelId, taskType: 'outline', fallback,
   });
+  // Never persist demo outline content over a real failure: the fallback
+  // outline contains placeholder characters and random word budgets.
+  if (meta.usedFallback) {
+    throw new Error(`Outline generation failed: ${meta.fallbackReason || 'the AI provider did not return usable output'}. No changes were saved.`);
+  }
 
   const now = new Date().toISOString();
   const tx = db.transaction(() => {
@@ -91,6 +97,8 @@ async function runOutline({ novelId, userId, payload }: any) {
     db.prepare(`UPDATE novels SET stage='approve', updatedAt=? WHERE id=?`).run(now, novelId);
   });
   tx();
+
+  return { chapters: result.chapters.length, acts: result.acts.length, source: meta.source };
 }
 
 registerHandler('outline', runOutline);
@@ -108,9 +116,9 @@ export function listActs(novelId: string) {
 export async function approveOutline(userId: string, novelId: string) {
   const db = getDb();
   const novel = db.prepare('SELECT * FROM novels WHERE id = ? AND userId = ?').get(novelId, userId) as any;
-  if (!novel) throw new Error('Novel not found');
+  if (!novel) throw new HttpError(404, 'Novel not found', 'novel_not_found');
   const outlines = listOutlines(novelId);
-  if (!outlines.length) throw new Error('No outline to approve');
+  if (!outlines.length) throw new HttpError(409, 'No outline to approve.', 'no_outline');
   const now = new Date().toISOString();
   db.prepare(`UPDATE novels SET stage='writing', approvedAt=?, status='writing', updatedAt=? WHERE id=?`).run(now, now, novelId);
 }
@@ -123,8 +131,12 @@ export async function updateOutline(outlineId: string, novelId: string, userId: 
     sets.push(`${k}=?`); vals.push(v);
   }
   if (!sets.length) return;
-  vals.push(outlineId, novelId, userId);
-  db.prepare(`UPDATE chapter_outlines SET ${sets.join(',')} WHERE id=? AND novelId=? AND EXISTS(SELECT 1 FROM novels WHERE id=? AND userId=?)`).run(...vals, outlineId, novelId);
+  vals.push(outlineId, novelId, novelId, userId);
+  // Placeholder order: sets…, outline id, novel id, novels.id, novels.userId.
+  db.prepare(
+    `UPDATE chapter_outlines SET ${sets.join(',')}
+      WHERE id=? AND novelId=? AND EXISTS(SELECT 1 FROM novels WHERE id=? AND userId=?)`,
+  ).run(...vals);
 }
 
 function buildDemoOutline(novel: any) {

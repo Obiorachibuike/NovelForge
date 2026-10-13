@@ -1,7 +1,29 @@
-import { NextResponse } from 'next/server';
-import { requireUser, requireNovel, jsonError } from '@/lib/db/ownership';
+import { requireUser, requireNovel } from '@/lib/db/ownership';
 import { saveChapterContent, getChapter, listVersions } from '@/services/chapters/service';
+import { MAX_CHAPTER_CONTENT_BYTES } from '@/types';
 import { z } from 'zod';
-const saveSchema=z.object({contentJson:z.object({type:z.literal('doc'),content:z.array(z.any())})});
-export async function GET(_,{params}){try{const u=await requireUser();await requireNovel(params.id,u.id);const c=await getChapter(params.id,params.chapterId);if(!c)return NextResponse.json({error:'Not found'},{status:404});return NextResponse.json({...c,versions:await listVersions(params.chapterId)});}catch(e){return jsonError(NextResponse,e);}}
-export async function PATCH(req,{params}){try{const u=await requireUser();await requireNovel(params.id,u.id);const b=saveSchema.parse(await req.json());const r=await saveChapterContent(u.id,params.id,params.chapterId,b.contentJson);return NextResponse.json({ok:true,...r});}catch(e){if(e instanceof z.ZodError)return NextResponse.json({error:e.errors[0].message},{status:400});return jsonError(NextResponse,e);}}
+import { apiHandler, readJsonBody, HttpError, MAX_JSON_BYTES } from '@/lib/api/http';
+
+const saveSchema = z.object({
+  contentJson: z.object({ type: z.literal('doc'), content: z.array(z.any()) }),
+});
+
+export const GET = apiHandler(async (_req: Request, ctx: { params: { id: string; chapterId: string } }) => {
+  const user = await requireUser();
+  await requireNovel(ctx.params.id, user.id);
+  const chapter = await getChapter(ctx.params.id, ctx.params.chapterId);
+  if (!chapter) throw new HttpError(404, 'Chapter not found', 'chapter_not_found');
+  return Response.json({ ...chapter, versions: await listVersions(ctx.params.chapterId) });
+});
+
+export const PATCH = apiHandler(async (req: Request, ctx: { params: { id: string; chapterId: string } }) => {
+  const user = await requireUser();
+  await requireNovel(ctx.params.id, user.id);
+  const body = await readJsonBody(req, v => saveSchema.parse(v), MAX_JSON_BYTES.document);
+  const serialized = JSON.stringify(body.contentJson);
+  if (serialized.length > MAX_CHAPTER_CONTENT_BYTES) {
+    throw new HttpError(413, 'Chapter content is too large to save.', 'payload_too_large');
+  }
+  const result = await saveChapterContent(user.id, ctx.params.id, ctx.params.chapterId, body.contentJson);
+  return Response.json({ ok: true, ...result });
+});

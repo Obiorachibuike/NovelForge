@@ -43,17 +43,35 @@ export const novelSettingsSchema = z.object({
 export type NovelSettingsInput = z.infer<typeof novelSettingsSchema>;
 
 export const prepareSchema = z.object({ sections: z.array(z.string()).optional() });
+
+// ---------- Billing & administration ----------
+export const checkoutSchema = z.object({ plan: z.enum(['author', 'studio']) });
+export const adminUserPatchSchema = z.object({
+  role: z.enum(['user', 'admin']).optional(),
+  freeNovelAccess: z.boolean().optional(),
+}).refine(v => v.role !== undefined || v.freeNovelAccess !== undefined, {
+  message: 'Provide role and/or freeNovelAccess.',
+});
 export const outlineSchema = z.object({
   structure: z.enum(['three-act','five-act','heros-journey','custom']).default('three-act'),
 });
-export const coverGenerateSchema = z.object({ prompt: z.string().min(3).max(500), variants: z.coerce.number().int().min(1).max(4).default(2) });
-export const coverSelectSchema = z.object({ imageId: z.string().min(1) });
-export const chapterGenerateSchema = z.object({ chapterId: z.string().optional(), chapterNumber: z.coerce.number().int().min(1).optional() });
+export const coverGenerateSchema = z.object({ prompt: z.string().min(3).max(500).optional(), variants: z.coerce.number().int().min(1).max(4).default(2) });
+export const coverSelectSchema = z.object({ imageId: z.string().min(1).max(64) });
+export const chapterGenerateSchema = z.object({
+  chapterId: z.string().max(64).optional(),
+  chapterNumber: z.coerce.number().int().min(1).max(1000).optional(),
+  /**
+   * Regenerating a chapter that contains the author's own edits overwrites their
+   * prose. That is only allowed when the client explicitly sets this flag, which
+   * the UI sends after a confirmation prompt.
+   */
+  confirmOverwrite: z.boolean().default(false),
+});
 export const chapterApproveSchema = z.object({});
 export const editorActionSchema = z.object({
   action: z.enum(['continue','rewrite','expand','shorten','improve','dialogue','tone','continuity','alt-scene']),
   selection: z.string().max(10000).optional(),
-  chapterId: z.string(),
+  chapterId: z.string().min(1).max(64),
   before: z.string().max(2000).optional(),
   after: z.string().max(2000).optional(),
 });
@@ -61,6 +79,38 @@ export const exportSchema = z.object({
   format: z.enum(['pdf','docx','epub','txt','markdown']),
   options: novelSettingsSchema.partial().optional(),
 });
+
+/** Author edits to generated preparation material (logline, synopsis, setting…). */
+export const premisePatchSchema = z.object({
+  logline: z.string().max(500).optional(),
+  shortSynopsis: z.string().max(5000).optional(),
+  fullSynopsis: z.string().max(20000).optional(),
+  setting: z.string().max(5000).optional(),
+  themes: z.array(z.string().max(200)).max(12).optional(),
+  majorConflicts: z.array(z.string().max(500)).max(12).optional(),
+});
+
+/** Author edits to a planned chapter (title, summary, targets, order). */
+export const outlinePatchSchema = z.object({
+  title: z.string().min(1).max(200).optional(),
+  summary: z.string().max(4000).optional(),
+  targetWords: z.coerce.number().int().min(250).max(20000).optional(),
+  estimatedPages: z.coerce.number().int().min(1).max(200).optional(),
+  orderIndex: z.coerce.number().int().min(0).max(1000).optional(),
+});
+
+/** Registration payload (separate endpoint from login). */
+export const registerSchema = z.object({
+  name: z.string().trim().min(1, 'Name is required').max(80),
+  email: z.string().trim().toLowerCase().email('A valid email address is required').max(254),
+  // bcrypt only uses the first 72 bytes; cap length so long inputs cannot be used
+  // to burn CPU, and require a usable minimum.
+  password: z.string().min(8, 'Password must be at least 8 characters.').max(72, 'Password must be at most 72 characters.'),
+});
+export type RegisterInput = z.infer<typeof registerSchema>;
+
+/** Maximum serialized size of a single chapter document (defence in depth). */
+export const MAX_CHAPTER_CONTENT_BYTES = 1_500_000;
 
 // ---------- Domain types ----------
 export interface UserRow {
@@ -138,8 +188,13 @@ export interface AccountRow { id:string; userId:string; type:string; provider:st
 // ---------- AI Types ----------
 export interface ChatMessage { role: 'system'|'user'|'assistant'; content: string; }
 export interface StreamChunk { type: 'text'|'usage'|'done'; text?: string; usage?: { promptTokens:number; completionTokens:number; model:string; }; }
+/** Task names with built-in handlers; custom names are allowed (`string & {}`). */
+export type GenerationTaskType =
+  | 'cover' | 'premise' | 'bible' | 'outline' | 'chapter'
+  | 'memory' | 'embedding' | 'consistency' | 'export';
+
 export interface GenerationTask {
-  type: 'cover'|'premise'|'bible'|'outline'|'chapter'|'memory'|'embedding'|'consistency'|'export';
+  type: GenerationTaskType | (string & {});
   novelId: string; userId: string; payload: Record<string,unknown>;
   idempotencyKey?: string;
 }

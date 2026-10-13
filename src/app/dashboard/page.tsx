@@ -1,8 +1,9 @@
 import { auth } from '@/lib/auth/config';
 import { listNovels } from '@/services/novels/service';
 import { NovelCard } from '@/components/dashboard/NovelCard';
+import { isAdmin } from '@/services/billing/service';
 import Link from 'next/link';
-import { BookOpen, PlusCircle, Sparkles, BookCheck, PenTool, CheckCircle2 } from 'lucide-react';
+import { BookOpen, PlusCircle, Sparkles, BookCheck, PenTool, CheckCircle2, CreditCard, Crown, Settings } from 'lucide-react';
 export default async function Dashboard() {
   const session = (await auth()) as any;
   if (!session?.user) { const { redirect } = await import('next/navigation'); redirect('/login'); }
@@ -11,13 +12,19 @@ export default async function Dashboard() {
   const completed = novels.filter(n => n.status === 'completed').slice(0,3);
   const totalWords = novels.reduce((s,n)=>s+n.wordsWritten,0);
   const totalApproved = novels.reduce((s,n)=>s+n.chaptersCompleted,0);
+  const admin = isAdmin(session.user.id);
   return <div className="flex-1 overflow-y-auto"><div className="max-w-7xl mx-auto px-8 py-10">
     <header className="mb-10 flex items-end justify-between flex-wrap gap-4">
       <div><div className="label text-primary mb-2">GOOD TO SEE YOU</div>
         <h1 className="font-serif text-4xl font-semibold">Welcome back, {session.user.name?.split(' ')[0] || 'Writer'}.</h1>
         <p className="text-muted-foreground mt-2 max-w-xl">Your studio is ready. Every word you approve becomes part of something that remembers.</p>
       </div>
-      <Link href="/novels/new" className="btn-primary"><PlusCircle className="w-4 h-4"/> New novel</Link>
+      <div className="flex items-center gap-2">
+        <Link href="/pricing" className="btn-outline"><CreditCard className="w-4 h-4"/> Plans</Link>
+        {admin && <Link href="/admin" className="btn-outline"><Crown className="w-4 h-4"/> Admin</Link>}
+        <Link href="/settings" className="btn-outline"><Settings className="w-4 h-4"/> Settings</Link>
+        <Link href="/novels/new" className="btn-primary"><PlusCircle className="w-4 h-4"/> New novel</Link>
+      </div>
     </header>
     <section className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-10">
       <Stat label="Novels" value={novels.length} Icon={BookOpen}/>
