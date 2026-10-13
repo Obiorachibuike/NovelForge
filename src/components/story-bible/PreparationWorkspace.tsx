@@ -5,6 +5,7 @@ import { toast } from 'sonner';
 import { useRouter } from 'next/navigation';
 import { Loader2, Sparkles, ArrowRight, Wand2, RefreshCw, User, MapPin, Scroll } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
+import { useJobWatcher } from '@/lib/hooks/useJobWatcher';
 
 export default function PreparationWorkspace({ novel, premise, characters, worldRules }: any) {
   const router = useRouter();
@@ -12,13 +13,31 @@ export default function PreparationWorkspace({ novel, premise, characters, world
   const [activeSection, setActiveSection] = useState('logline');
   const hasContent = premise?.logline || characters.length;
 
+  // Preparation runs as a durable background job: follow the job row instead of
+  // assuming the work finished when the POST returns.
+  const { job: prepJob, watch } = useJobWatcher({
+    onComplete: () => {
+      toast.success('Premise, characters, and Story Bible ready.');
+      qc.invalidateQueries();
+      router.refresh();
+    },
+    onFail: (job) => toast.error(`Preparation failed: ${job.error || 'unknown error'}`),
+  });
+  const prepRunning = prepJob?.status === 'queued' || prepJob?.status === 'processing';
+
   const prep = useMutation({
     mutationFn: async () => {
       const res = await fetch(`/api/novels/${novel.id}/prepare`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({}) });
-      if (!res.ok) throw new Error((await res.json()).error || 'Preparation failed');
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || 'Preparation failed');
+      }
       return res.json();
     },
-    onSuccess: () => { toast.success('Premise, characters, and Story Bible generated.'); qc.invalidateQueries(); router.refresh(); },
+    onSuccess: (data:any) => {
+      if (data?.jobId) { toast.message('Working on your Story Bible…'); watch(data.jobId); }
+      else { qc.invalidateQueries(); router.refresh(); }
+    },
     onError: (e:any) => toast.error(e.message),
   });
 
@@ -51,10 +70,10 @@ export default function PreparationWorkspace({ novel, premise, characters, world
               <Sparkles className="w-8 h-8 text-primary mx-auto mb-3" />
               <h3 className="font-serif text-lg font-semibold mb-2">Generate your foundation</h3>
               <p className="text-sm text-muted-foreground mb-4">The AI will produce a logline, synopsis, cast of characters, and world rules based on your title and premise.</p>
-              <button onClick={()=>prep.mutate()} className="btn-primary w-full" disabled={prep.isPending}>
-                {prep.isPending ? <><Loader2 className="w-4 h-4 animate-spin" /> Preparing...</> : <><Wand2 className="w-4 h-4" /> Generate Story Bible</>}
+              <button onClick={()=>prep.mutate()} className="btn-primary w-full" disabled={prep.isPending || prepRunning}>
+                {(prep.isPending || prepRunning) ? <><Loader2 className="w-4 h-4 animate-spin" /> Preparing…</> : <><Wand2 className="w-4 h-4" /> Generate Story Bible</>}
               </button>
-              <p className="text-[11px] text-muted-foreground mt-3">You'll be able to edit and regenerate every section.</p>
+                      <p className="text-[11px] text-muted-foreground mt-3">You&apos;ll be able to edit and regenerate every section.</p>
             </div>
           ) : (
             <>

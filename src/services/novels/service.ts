@@ -2,6 +2,8 @@ import { getDb } from '@/lib/db';
 import { nanoid } from 'nanoid';
 import { wordsToPages } from '@/lib/utils/cn';
 import type { CreateNovelInput, NovelRow, NovelSettingsInput, NovelSettingsRow } from '@/types';
+import { HttpError } from '@/lib/api/http';
+import { assertCanCreateNovel } from '@/services/billing/service';
 import 'server-only';
 
 export interface NovelWithProgress extends NovelRow {
@@ -14,6 +16,10 @@ export interface NovelWithProgress extends NovelRow {
 }
 
 export async function createNovel(userId: string, input: CreateNovelInput): Promise<NovelRow> {
+  // Entitlement gate: an admin, a comped account, or an active subscription with
+  // room left. Throws 402 `payment_required` otherwise (see billing/service.ts).
+  assertCanCreateNovel(userId);
+
   const db = getDb();
   const now = new Date().toISOString();
   const id = nanoid();
@@ -90,31 +96,51 @@ export async function getNovel(novelId: string, userId: string): Promise<NovelWi
   };
 }
 
+/** Columns a caller is allowed to patch through this helper (no arbitrary keys → no SQL injection). */
+const NOVEL_PATCHABLE_COLUMNS = new Set([
+  'title', 'premise', 'genre', 'tone', 'style', 'pov', 'audience',
+  'targetWords', 'targetPages', 'targetChapters', 'writingMode', 'status', 'coverImageId',
+]);
+
 export async function updateNovelStage(novelId: string, userId: string, stage: string, extra: Partial<NovelRow> = {}) {
   const db = getDb();
+  const now = new Date().toISOString();
   db.prepare(`UPDATE novels SET stage = ?, updatedAt = ? WHERE id = ? AND userId = ?`)
-    .run(stage, new Date().toISOString(), novelId, userId);
-  if (Object.keys(extra).length) {
+    .run(stage, now, novelId, userId);
+  const entries = Object.entries(extra).filter(([k]) => NOVEL_PATCHABLE_COLUMNS.has(k));
+  if (entries.length) {
     const sets: string[] = []; const vals: any[] = [];
-    for (const [k,v] of Object.entries(extra)) { sets.push(`${k} = ?`); vals.push(v); }
-    vals.push(new Date().toISOString(), novelId, userId);
+    for (const [k, v] of entries) { sets.push(`${k} = ?`); vals.push(v); }
+    vals.push(now, novelId, userId);
     db.prepare(`UPDATE novels SET ${sets.join(', ')}, updatedAt = ? WHERE id = ? AND userId = ?`).run(...vals);
   }
 }
 
+const SETTINGS_COLUMNS = new Set([
+  'fontFamily', 'fontSize', 'lineSpacing', 'margin', 'pageSize', 'chapterHeadingStyle',
+  'pageNumbering', 'includeFrontMatter', 'includeToc', 'coverPlacement', 'wordsPerPage',
+]);
+
+/**
+ * Updates manuscript/formatting settings for a novel the caller owns.
+ *
+ * Returns 404 via HttpError when the novel is not theirs, and the row count is
+ * checked so a failed ownership match can never be mistaken for a success.
+ */
 export async function updateNovelSettings(novelId: string, userId: string, patch: Partial<NovelSettingsInput>) {
   const db = getDb();
+  const novel = db.prepare('SELECT id FROM novels WHERE id = ? AND userId = ?').get(novelId, userId) as any;
+  if (!novel) throw new HttpError(404, 'Novel not found', 'novel_not_found');
+
   const sets: string[] = []; const vals: any[] = [];
-  for (const [k,v] of Object.entries(patch)) {
-    if (v === undefined) continue;
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === undefined || !SETTINGS_COLUMNS.has(k)) continue;
     sets.push(`${k} = ?`);
     vals.push(typeof v === 'boolean' ? (v ? 1 : 0) : v);
   }
   if (!sets.length) return getSettings(novelId);
-  vals.push(novelId, userId);
-  db.prepare(
-    `UPDATE novel_settings SET ${sets.join(',')} WHERE novelId = ? AND EXISTS(SELECT 1 FROM novels WHERE id=? AND userId=?)`
-  ).run(...vals, novelId);
+  vals.push(novelId);
+  db.prepare(`UPDATE novel_settings SET ${sets.join(', ')} WHERE novelId = ?`).run(...vals);
   return getSettings(novelId);
 }
 
@@ -126,12 +152,18 @@ export function getSettings(novelId: string): NovelSettingsRow | null {
 export async function setCover(novelId: string, userId: string, imageId: string) {
   const db = getDb();
   const now = new Date().toISOString();
+  // The image must exist, belong to this novel and belong to this user;
+  // otherwise a caller could attach (and later export) someone else's artwork.
+  const image = db.prepare('SELECT id FROM image_assets WHERE id = ? AND novelId = ? AND userId = ?')
+    .get(imageId, novelId, userId) as any;
+  if (!image) throw new HttpError(404, 'Cover image not found for this novel.', 'cover_not_found');
+
   const tx = db.transaction(() => {
     db.prepare(`UPDATE image_assets SET isPrimary = 0 WHERE novelId = ?`).run(novelId);
-    db.prepare(`UPDATE image_assets SET isPrimary = 1 WHERE id = ? AND novelId = ? AND userId = ?`)
-      .run(imageId, novelId, userId);
-    db.prepare(`UPDATE novels SET coverImageId = ?, stage = CASE WHEN stage='cover' THEN 'prepare' ELSE stage END, updatedAt = ? WHERE id=? AND userId=?`)
+    db.prepare(`UPDATE image_assets SET isPrimary = 1 WHERE id = ?`).run(imageId);
+    const updated = db.prepare(`UPDATE novels SET coverImageId = ?, stage = CASE WHEN stage='cover' THEN 'prepare' ELSE stage END, updatedAt = ? WHERE id=? AND userId=?`)
       .run(imageId, now, novelId, userId);
+    if (updated.changes === 0) throw new HttpError(404, 'Novel not found', 'novel_not_found');
   });
   tx();
 }

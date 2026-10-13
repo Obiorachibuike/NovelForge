@@ -1,4 +1,10 @@
-import { NextResponse } from 'next/server';
-import { requireUser, requireNovel, jsonError } from '@/lib/db/ownership';
+import { requireUser, requireNovel } from '@/lib/db/ownership';
 import { approveChapter } from '@/services/chapters/service';
-export async function POST(_,{params}){try{const u=await requireUser();await requireNovel(params.id,u.id);await approveChapter(u.id,params.id,params.chapterId);return NextResponse.json({ok:true});}catch(e){return jsonError(NextResponse,e);}}
+import { apiHandler } from '@/lib/api/http';
+
+export const POST = apiHandler(async (_req: Request, ctx: { params: { id: string; chapterId: string } }) => {
+  const user = await requireUser();
+  await requireNovel(ctx.params.id, user.id);
+  await approveChapter(user.id, ctx.params.id, ctx.params.chapterId);
+  return Response.json({ ok: true });
+});

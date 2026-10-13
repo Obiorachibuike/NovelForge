@@ -1,6 +1,6 @@
 import { getDb } from '@/lib/db';
 import { nanoid } from 'nanoid';
-import { generateStructured } from '@/lib/ai/text-generation';
+import { generateStructuredDetailed } from '@/lib/ai/text-generation';
 import { premisePrompt } from '@/lib/ai/prompts';
 import { embed } from '@/lib/ai/embeddings';
 import { serialize } from '@/lib/ai/embeddings';
@@ -50,12 +50,17 @@ async function runPremise({ novelId, userId }: { novelId:string; userId:string }
 
   const prompt = premisePrompt(novel);
   const fallback = makeDemoPremise(novel);
-  const p = await generateStructured(premiseShape, {
+  const { data: p, meta } = await generateStructuredDetailed(premiseShape, {
     messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: prompt.user }],
     temperature: 0.7,
     userId, novelId, taskType: 'premise',
     fallback,
   });
+  // In real (non-demo) mode a provider failure must not be written into the
+  // author's Story Bible as if it were generated content.
+  if (meta.usedFallback) {
+    throw new Error(`Premise generation failed: ${meta.fallbackReason || 'the AI provider did not return usable output'}. No changes were saved.`);
+  }
 
   const now = new Date().toISOString();
   const tx = db.transaction(() => {
@@ -113,9 +118,11 @@ async function runPremise({ novelId, userId }: { novelId:string; userId:string }
   });
   tx();
 
-  // Kick embeddings async (fire and forget, failure ok)
+  // Embed the premise so story-memory retrieval has vectors to score against.
   Promise.all([embed(p.logline, userId, novelId), embed(p.shortSynopsis, userId, novelId)])
-    .catch(err => console.warn('embed failed', err));
+    .catch(err => console.warn('premise embedding failed', err));
+
+  return { source: meta.source };
 }
 
 registerHandler('premise', runPremise);
@@ -170,7 +177,12 @@ export async function updatePremiseField(novelId: string, userId: string, patch:
   for (const [k,v] of Object.entries(patch)) {
     sets.push(`${k} = ?`); vals.push(typeof v === 'object' ? JSON.stringify(v) : v);
   }
-  vals.push(new Date().toISOString(), novelId);
-  db.prepare(`UPDATE premises SET ${sets.join(', ')}, updatedAt=? WHERE novelId=?`).run(...vals);
+  vals.push(new Date().toISOString(), novelId, userId);
+  // novelId is bound twice (SET ... WHERE novelId=? AND EXISTS(… novels.id=? AND userId=?))
+  // in placeholder order: sets, updatedAt, novelId, novelId, userId.
+  db.prepare(
+    `UPDATE premises SET ${sets.join(', ')}, updatedAt=?
+      WHERE novelId=? AND EXISTS(SELECT 1 FROM novels WHERE id=? AND userId=?)`,
+  ).run(...vals);
   return getPremise(novelId);
 }

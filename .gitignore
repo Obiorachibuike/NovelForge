@@ -59,3 +59,8 @@ prisma/dev.db-journal
 /storage/
 .next/
 out/
+
+# Local generated data (uploads, smoke-test databases)
+.data/
+prisma/*.db-wal
+prisma/*.db-shm

@@ -9,11 +9,14 @@
     "start": "next start --hostname 0.0.0.0 --port 3000",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "worker": "tsx src/worker/index.ts",
-    "worker:dev": "tsx watch src/worker/index.ts",
+    "worker": "tsx --tsconfig tsconfig.worker.json src/worker/index.ts",
+    "worker:dev": "tsx watch --tsconfig tsconfig.worker.json src/worker/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "db:migrate": "tsx --tsconfig tsconfig.worker.json scripts/db-migrate.ts",
+    "db:status": "tsx --tsconfig tsconfig.worker.json scripts/db-migrate.ts --status",
+    "admin:grant": "tsx --tsconfig tsconfig.worker.json scripts/grant-admin.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",
@@ -43,7 +46,6 @@
     "@tiptap/pm": "^2.8.0",
     "@tiptap/react": "^2.8.0",
     "@tiptap/starter-kit": "^2.8.0",
-    "ai": "^3.4.33",
     "bcryptjs": "^2.4.3",
     "better-sqlite3": "^13.0.3",
     "bullmq": "^5.12.0",
@@ -56,7 +58,7 @@
     "lucide-react": "^0.454.0",
     "nanoid": "^5.0.7",
     "next": "14.2.35",
-    "next-auth": "5.0.0-beta.25",
+    "next-auth": "^5.0.0-beta.32",
     "next-themes": "^0.4.4",
     "openai": "^4.68.0",
     "pdf-lib": "^1.17.1",
@@ -67,6 +69,7 @@
     "react-markdown": "^9.0.1",
     "server-only": "^0.0.1",
     "sonner": "^1.5.0",
+    "stripe": "^23.0.0",
     "tailwind-merge": "^2.5.3",
     "tailwindcss-animate": "^1.0.7",
     "zod": "^3.23.8"

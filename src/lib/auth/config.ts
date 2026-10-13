@@ -1,78 +1,130 @@
 import NextAuth, { type NextAuthConfig } from 'next-auth';
 import Credentials from 'next-auth/providers/credentials';
 import Google from 'next-auth/providers/google';
-import bcrypt from 'bcryptjs';
-import { getDb } from '@/lib/db';
-import { nanoid } from 'nanoid';
 import { edgeAuthConfig } from './edge-config';
+import { googleAuthStatus } from './providers';
+import {
+  verifyCredentials, resolveGoogleSignIn, recordOAuthAccount, assertAuthConfiguration,
+} from '@/services/auth/service';
+
+const google = googleAuthStatus();
+const googleEnabled = google.enabled;
+if (google.problem) {
+  // Half-configured OAuth is a deployment mistake, not a silent downgrade.
+  console.warn(`[auth] Google sign-in disabled: ${google.problem}`);
+}
 
 export const authConfig: NextAuthConfig = {
   ...edgeAuthConfig,
   providers: [
-    ...(process.env.AUTH_GOOGLE_ID && process.env.AUTH_GOOGLE_SECRET
-      ? [Google({ clientId: process.env.AUTH_GOOGLE_ID, clientSecret: process.env.AUTH_GOOGLE_SECRET })]
+    ...(googleEnabled
+      ? [Google({
+          clientId: process.env.AUTH_GOOGLE_ID!,
+          clientSecret: process.env.AUTH_GOOGLE_SECRET!,
+          // Let the user pick which Google account to use, and never trust a
+          // stale consent screen for account linking.
+          authorization: {
+            params: { prompt: 'select_account', access_type: 'online' },
+          },
+          // A Google identity is linked only through resolveGoogleSignIn, never
+          // automatically by an adapter's own account matching.
+          allowDangerousEmailAccountLinking: false,
+        })]
       : []),
     Credentials({
       name: 'Credentials',
       credentials: {
         email: { label: 'Email', type: 'email' },
         password: { label: 'Password', type: 'password' },
-        name: { label: 'Name', type: 'text' },
       },
+      /**
+       * Login only. Account creation lives in POST /api/auth/register so that
+       * an unknown e-mail can never create an account (or reveal that it does
+       * not exist) from the sign-in form.
+       */
       async authorize(creds) {
-        const rawEmail = creds?.email as string|undefined;
-        const rawPassword = creds?.password as string|undefined;
-        const rawName = (creds?.name as string|undefined) || '';
-        const email = String(rawEmail || '').trim().toLowerCase();
-        const password = String(rawPassword || '');
-        if (!email || !password) throw new Error('Email and password are required.');
-
-        const db = getDb();
-        const existing = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as any;
-
-        if (!existing) {
-          // Attempt registration when email doesn't exist
-          if (password.length < 8) throw new Error('Password must be at least 8 characters.');
-          const id = nanoid();
-          const hash = await bcrypt.hash(password, 10);
-          const now = new Date().toISOString();
-          const name = rawName.trim() || email.split('@')[0];
-          db.prepare(
-            'INSERT INTO users (id,name,email,passwordHash,emailVerified,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?)'
-          ).run(id, name, email, hash, null, now, now);
-          return { id, email, name } as any;
-        }
-
-        if (!existing.passwordHash) throw new Error('Account exists but uses a different sign-in method.');
-        const ok = await bcrypt.compare(password, existing.passwordHash);
-        if (!ok) throw new Error('Invalid email or password.');
-        return { id: existing.id, email: existing.email, name: existing.name, image: existing.image } as any;
+        assertAuthConfiguration();
+        const user = await verifyCredentials(
+          String(creds?.email || ''),
+          String(creds?.password || ''),
+        );
+        return user ? ({ ...user } as any) : null;
       },
     }),
   ],
   callbacks: {
     ...edgeAuthConfig.callbacks,
-    async jwt({ token, user, account }) {
-      if (user) { token.id = (user as any).id; token.name = user.name; token.email = user.email; token.image = (user as any).image; }
-      if (account?.provider === 'google' && token.email) {
-        const db = getDb();
-        const u = db.prepare('SELECT id FROM users WHERE email = ?').get(token.email) as any;
-        if (u) token.id = u.id;
+    async jwt({ token, user, account, profile }) {
+      if (user && (user as any).id) {
+        token.id = (user as any).id;
+        token.name = user.name;
+        token.email = user.email;
+        token.picture = (user as any).image ?? token.picture;
+      }
+      // OAuth sign-ins have no database id yet: resolve it (creating the row if
+      // necessary) through the safe-linking policy, then persist the link.
+      if (account?.provider === 'google' && (profile as any)?.email) {
+        const decision = await resolveGoogleSignIn({
+          email: (profile as any).email,
+          name: user?.name ?? null,
+          image: user?.image ?? null,
+          providerAccountId: account.providerAccountId,
+        });
+        if (!decision.allow) {
+          console.warn(`[auth] refused Google sign-in in the jwt callback: ${decision.reason}`);
+          delete (token as any).id;
+          return token;
+        }
+
+        const link = recordOAuthAccount({
+          userId: decision.userId,
+          provider: 'google',
+          providerAccountId: account.providerAccountId,
+        });
+        if (link.conflict) {
+          // The Google account is bound to another user: never issue a session
+          // for it. The session callback clears the user when the token has no
+          // id, so this fails closed.
+          console.warn('[auth] refused Google sign-in: provider account already linked to another user.');
+          delete (token as any).id;
+          return token;
+        }
+
+        token.id = decision.userId;
       }
       return token;
     },
+
+    /**
+     * Deny OAuth sign-in when linking would be unsafe (see resolveGoogleSignIn)
+     * and record the verification state for accepted sign-ins.
+     */
     async signIn({ user, account, profile }) {
-      if (account?.provider === 'google' && user.email) {
-        const db = getDb();
-        const existing = db.prepare('SELECT * FROM users WHERE email = ?').get(user.email) as any;
-        if (!existing) {
-          const id = nanoid();
-          const now = new Date().toISOString();
-          db.prepare(
-            'INSERT INTO users (id,name,email,image,emailVerified,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?)'
-          ).run(id, user.name || user.email.split('@')[0], user.email, user.image || null, now, now, now);
-          // ensure account row is tracked via adapter (we don't use adapter for simplicity here)
-        }
+      assertAuthConfiguration();
+      if (account?.provider !== 'google') return true;
+
+      const googleProfile = (profile ?? {}) as any;
+      const email = googleProfile.email || user.email;
+      if (!email) {
+        console.warn('[auth] refused Google sign-in: no email address on the profile.');
+        return false;
+      }
+      // Google only issues this claim for addresses it has verified. Treat an
+      // explicit `false` as untrusted rather than linking on it.
+      if (googleProfile.email_verified === false || googleProfile.verified_email === false) {
+        console.warn(`[auth] refused Google sign-in for ${email}: Google reports the address as unverified.`);
+        return false;
+      }
+
+      const decision = await resolveGoogleSignIn({
+        email,
+        name: user?.name ?? googleProfile.name ?? null,
+        image: user?.image ?? googleProfile.picture ?? null,
+        providerAccountId: account.providerAccountId,
+      });
+      if (!decision.allow) {
+        console.warn(`[auth] refused Google sign-in for ${email}: ${decision.reason}`);
+        return false;
       }
       return true;
     },

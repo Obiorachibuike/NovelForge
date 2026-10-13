@@ -6,7 +6,7 @@ import { toast } from 'sonner';
 import { Loader2, Wand2, CheckCircle2, Lock, ArrowRight, RefreshCw, BookOpen, Play } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 
-export default function OutlineEditor({ novel, outlines, acts, chapters }: any) {
+export default function OutlineEditor({ novel, outlines, acts, chapters, navigation }: any) {
   const router = useRouter();
   const qc = useQueryClient();
   const [structure, setStructure] = useState('three-act');
@@ -35,15 +35,14 @@ export default function OutlineEditor({ novel, outlines, acts, chapters }: any) 
   const plannedWords = outlines.reduce((s:number,c:any)=>s+c.targetWords,0);
   const approvedChapters = chapters.filter((c:any)=>c.status==='approved').length;
 
-  // Determine locked chapters
-  let lastApproved = 0;
-  const enriched = outlines.map((o:any) => {
-    const chapter = chapters.find((c:any)=>c.chapterNumber===o.chapterNumber);
-    const locked = o.chapterNumber > 1 && lastApproved < o.chapterNumber - 1;
-    const status = chapter?.status || (locked ? 'locked' : 'planned');
-    if (chapter?.status === 'approved') lastApproved = o.chapterNumber;
-    return { ...o, chapterId: chapter?.id, status, wordCount: chapter?.wordCount || 0 };
-  });
+  // Statuses come from the server-side workflow gate so this list can never
+  // disagree with the writing workspace about which chapter is unlocked.
+  const enriched = (navigation && navigation.length)
+    ? navigation.map((n:any) => ({ ...n, chapterId: n.chapterId }))
+    : outlines.map((o:any) => {
+        const chapter = chapters.find((c:any)=>c.chapterNumber===o.chapterNumber);
+        return { ...o, chapterId: chapter?.id, status: chapter?.status || 'planned', wordCount: chapter?.wordCount || 0 };
+      });
 
   return (
     <div className="p-8 max-w-7xl mx-auto">
@@ -122,7 +121,7 @@ export default function OutlineEditor({ novel, outlines, acts, chapters }: any) 
                   <Play className="w-3 h-3"/> Open
                 </button>
               ) : (
-                <button className="btn-primary text-xs px-3 py-1.5" disabled={c.chapterNumber > 1 && lastApproved < c.chapterNumber - 1} onClick={()=>router.push(`/novels/${novel.id}/write/${c.chapterNumber}`)}>
+                <button className="btn-primary text-xs px-3 py-1.5" disabled={c.status === 'locked'} onClick={()=>router.push(`/novels/${novel.id}/write/${c.chapterNumber}`)}>
                   Write <ArrowRight className="w-3 h-3"/>
                 </button>
               )}

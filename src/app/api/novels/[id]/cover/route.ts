@@ -1,9 +1,29 @@
-import { NextResponse } from 'next/server';
-import { requireUser, requireNovel, jsonError } from '@/lib/db/ownership';
+import { requireUser, requireNovel } from '@/lib/db/ownership';
 import { generateCovers, listCovers } from '@/services/images/service';
 import { setCover } from '@/services/novels/service';
 import { coverGenerateSchema, coverSelectSchema } from '@/types';
-import { z } from 'zod';
-export async function GET(_,{params}){try{const u=await requireUser();await requireNovel(params.id,u.id);return NextResponse.json(listCovers(params.id));}catch(e){return jsonError(NextResponse,e);}}
-export async function POST(req,{params}){try{const u=await requireUser();await requireNovel(params.id,u.id);const b=coverGenerateSchema.parse(await req.json().catch(()=>({})));const c=await generateCovers(u.id,params.id,b.prompt,b.variants);return NextResponse.json(c);}catch(e){if(e instanceof z.ZodError)return NextResponse.json({error:e.errors[0].message},{status:400});return jsonError(NextResponse,e);}}
-export async function PUT(req,{params}){try{const u=await requireUser();await requireNovel(params.id,u.id);const{imageId}=coverSelectSchema.parse(await req.json());await setCover(params.id,u.id,imageId);return NextResponse.json({ok:true});}catch(e){if(e instanceof z.ZodError)return NextResponse.json({error:e.errors[0].message},{status:400});return jsonError(NextResponse,e);}}
+import { apiHandler, readJsonBody } from '@/lib/api/http';
+import { enforceRateLimit } from '@/lib/security/rate-limit';
+
+export const GET = apiHandler(async (_req: Request, ctx: { params: { id: string } }) => {
+  const user = await requireUser();
+  await requireNovel(ctx.params.id, user.id);
+  return Response.json(await listCovers(ctx.params.id));
+});
+
+export const POST = apiHandler(async (req: Request, ctx: { params: { id: string } }) => {
+  const user = await requireUser();
+  await requireNovel(ctx.params.id, user.id);
+  enforceRateLimit('aiImage', user.id);
+  const body = await readJsonBody(req, v => coverGenerateSchema.parse(v));
+  const covers = await generateCovers(user.id, ctx.params.id, body.prompt, body.variants);
+  return Response.json(covers);
+});
+
+export const PUT = apiHandler(async (req: Request, ctx: { params: { id: string } }) => {
+  const user = await requireUser();
+  await requireNovel(ctx.params.id, user.id);
+  const { imageId } = await readJsonBody(req, v => coverSelectSchema.parse(v));
+  await setCover(ctx.params.id, user.id, imageId);
+  return Response.json({ ok: true });
+});

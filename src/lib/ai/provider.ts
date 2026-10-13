@@ -2,48 +2,74 @@ import OpenAI from 'openai';
 import 'server-only';
 
 let _client: OpenAI | null = null;
+let _clientKey: string | null = null;
 
-/** Returns the OpenAI client, or null when no key is configured (demo mode). */
+function envInt(name: string, fallback: number): number {
+  const raw = Number(process.env[name]);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
+}
+
+/**
+ * Provider configuration.
+ *
+ * Demo mode is explicit and consistent: it is on when no API key is present
+ * **or** when `AI_DEMO_MODE=true`. Every AI helper branches on `demoMode`, so
+ * `OPENAI_API_KEY=… AI_DEMO_MODE=true` performs no paid calls anywhere (text,
+ * structured output, embeddings or images) instead of the previous behaviour
+ * where only image generation honoured the flag.
+ */
+export const aiConfig = {
+  get textModel() { return process.env.OPENAI_TEXT_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini'; },
+  get structuredModel() { return process.env.OPENAI_STRUCTURED_MODEL || process.env.OPENAI_TEXT_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini'; },
+  get imageModel() { return process.env.OPENAI_IMAGE_MODEL || process.env.IMAGE_GENERATION_MODEL || 'gpt-image-1'; },
+  get embeddingModel() { return process.env.OPENAI_EMBEDDING_MODEL || 'text-embedding-3-small'; },
+  get timeoutMs() { return envInt('AI_TIMEOUT_MS', 90_000); },
+  get maxRetries() { return envInt('AI_MAX_RETRIES', 2); },
+  get hasApiKey() { return !!process.env.OPENAI_API_KEY; },
+  get demoMode() { return this.forcedDemo || !this.hasApiKey; },
+  get forcedDemo() { return process.env.AI_DEMO_MODE === 'true'; },
+  get providerName() { return this.demoMode ? 'demo' : 'openai'; },
+};
+
+/**
+ * Returns the OpenAI client, or null when running in demo mode.
+ *
+ * The client is created with a request timeout and a bounded retry count so a
+ * hung or rate-limited upstream cannot hold a worker/job open indefinitely.
+ */
 export function getOpenAI(): OpenAI | null {
-  if (_client) return _client;
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) return null;
-  _client = new OpenAI({ apiKey: key });
+  if (aiConfig.demoMode) return null;
+  const key = process.env.OPENAI_API_KEY!;
+  if (_client && _clientKey === key) return _client;
+  _client = new OpenAI({
+    apiKey: key,
+    timeout: aiConfig.timeoutMs,
+    maxRetries: aiConfig.maxRetries,
+  });
+  _clientKey = key;
   return _client;
 }
 
-export const aiConfig = {
-  textModel: process.env.OPENAI_TEXT_MODEL || 'gpt-4o-mini',
-  structuredModel: process.env.OPENAI_STRUCTURED_MODEL || process.env.OPENAI_TEXT_MODEL || 'gpt-4o-mini',
-  imageModel: process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1',
-  embeddingModel: process.env.OPENAI_EMBEDDING_MODEL || 'text-embedding-3-small',
-  demoMode: !process.env.OPENAI_API_KEY || process.env.AI_DEMO_MODE === 'true',
-};
+/** Test seam: drops the memoised client so env changes take effect. */
+export function resetOpenAIForTests() {
+  _client = null;
+  _clientKey = null;
+}
 
-export type StreamEventHandler = (chunk: string) => void;
+export { estimateCostUsd, estimateImageCostUsd, priceFor } from './pricing';
+export { recordUsage, recordImageUsage, assertAiBudget, checkAiBudget, usageSummary, getAiBudget, clampCompletionTokens } from './usage';
 
-/**
- * Log a single AI usage record. Called from AI helpers after successful requests.
- */
-export async function recordUsage(input: {
-  userId: string; novelId?: string; taskType: string; provider?: string;
-  model: string; promptTokens: number; completionTokens: number;
-}) {
+/** Resolves a promise or rejects after `ms`, so a stuck upstream cannot hang a job. */
+export async function withTimeout<T>(promise: Promise<T>, ms: number, label = 'AI request'): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const { getDb } = await import('@/lib/db');
-    const { nanoid } = await import('nanoid');
-    const db = getDb();
-    // crude pricing in USD per 1k tokens for default models.
-    const pricePrompt = /gpt-4o/i.test(input.model) ? 0.0025 : 0.00015;
-    const priceCompletion = /gpt-4o/i.test(input.model) ? 0.01 : 0.0006;
-    const cost = (input.promptTokens / 1000) * pricePrompt + (input.completionTokens / 1000) * priceCompletion;
-    db.prepare(`INSERT INTO ai_usage (id,userId,novelId,taskType,provider,model,promptTokens,completionTokens,totalTokens,estimatedCostUsd,createdAt)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
-      nanoid(), input.userId, input.novelId || null, input.taskType,
-      input.provider || 'openai', input.model, input.promptTokens, input.completionTokens,
-      input.promptTokens + input.completionTokens, cost, new Date().toISOString(),
-    );
-  } catch (err) {
-    console.warn('recordUsage failed', err);
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
