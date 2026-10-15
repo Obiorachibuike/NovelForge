@@ -1,7 +1,7 @@
 'use client';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import { Home, PlusCircle, Book, BookOpen, Library, PenTool, Eye, Upload, Settings, LogOut, Sparkles, ChevronRight, User, Moon, Sun } from 'lucide-react';
+import { Home, PlusCircle, Book, BookOpen, Library, PenTool, Eye, Upload, Settings, LogOut, Sparkles, ChevronRight, User, Moon, Sun, CreditCard } from 'lucide-react';
 import { signOut, useSession } from 'next-auth/react';
 import { useTheme } from 'next-themes';
 import { cn } from '@/lib/utils/cn';
@@ -44,6 +44,10 @@ export function Sidebar() {
 
         <NavGroup label="MY NOVELS">
           <NavItem href="/novels/new" icon={PlusCircle} label="New novel" active={pathname==='/novels/new'} />
+        </NavGroup>
+
+        <NavGroup label="ACCOUNT">
+          <NavItem href="/pricing" icon={CreditCard} label="Pricing" active={pathname==='/pricing'} />
         </NavGroup>
 
         {novelId && (

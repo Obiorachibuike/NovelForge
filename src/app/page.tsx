@@ -29,6 +29,7 @@ export default async function Landing() {
         <nav className="flex items-center gap-6 text-sm text-slate-400">
           <a href="#features" className="hover:text-white">Features</a>
           <a href="#workflow" className="hover:text-white">Workflow</a>
+          <Link href="/pricing" className="hover:text-white">Pricing</Link>
           <Link href="/login" className="text-slate-200 hover:text-white">Sign in</Link>
           <Link href="/register" className="btn-primary">Start writing →</Link>
         </nav>
