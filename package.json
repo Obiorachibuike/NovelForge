@@ -16,6 +16,7 @@
     "test:e2e": "playwright test",
     "db:migrate": "tsx --tsconfig tsconfig.worker.json scripts/db-migrate.ts",
     "db:status": "tsx --tsconfig tsconfig.worker.json scripts/db-migrate.ts --status",
+    "db:migrate:sqlite-to-pg": "tsx --tsconfig tsconfig.worker.json scripts/migrate-sqlite-to-postgres.ts",
     "admin:grant": "tsx --tsconfig tsconfig.worker.json scripts/grant-admin.ts"
   },
   "dependencies": {

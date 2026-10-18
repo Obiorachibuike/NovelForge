@@ -9,6 +9,11 @@ export { errorResponse as jsonError } from '@/lib/api/http';
 export async function requireUser() {
   const session = await auth();
   if (!session?.user?.id) throw new HttpError(401, 'Not authenticated', 'unauthenticated');
+  const db = getDb();
+  const row = db.prepare('SELECT status FROM users WHERE id = ?').get(session.user.id) as { status?: string } | undefined;
+  if (row?.status === 'suspended') {
+    throw new HttpError(403, 'This account has been suspended.', 'account_suspended');
+  }
   return session.user as { id: string; email?: string | null; name?: string | null; image?: string | null };
 }
 

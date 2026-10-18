@@ -128,6 +128,7 @@ export async function enqueueChapterGeneration(
     type: 'chapter',
     userId,
     novelId,
+    chapterId: existing?.id || null,
     payload: { chapterNumber, confirmOverwrite: !!options.confirmOverwrite },
     idempotencyKey: `chapter:${novelId}:${chapterNumber}`,
   });
@@ -135,7 +136,7 @@ export async function enqueueChapterGeneration(
 
 interface ChapterJobPayload { chapterNumber: number; confirmOverwrite?: boolean }
 
-async function runChapterGeneration({ novelId, userId, payload, setProgress }: any) {
+export async function runChapterGeneration({ id: jobId, novelId, userId, payload, setProgress, isCancelled }: any) {
   const db = getDb();
   const { chapterNumber, confirmOverwrite } = payload as ChapterJobPayload;
   const novel = db.prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as any;
@@ -151,7 +152,7 @@ async function runChapterGeneration({ novelId, userId, payload, setProgress }: a
     if (!prev || prev.status !== 'approved') throw new Error(`Previous chapter must be approved before generating chapter ${chapterNumber}.`);
   }
 
-  const existing = db.prepare('SELECT id,status FROM chapters WHERE novelId=? AND chapterNumber=?').get(novelId, chapterNumber) as any;
+  const existing = db.prepare('SELECT id,status,currentVersionId,revision FROM chapters WHERE novelId=? AND chapterNumber=?').get(novelId, chapterNumber) as any;
   if (existing && existing.status === 'approved') throw new Error('Chapter is already approved.');
   if (existing && existing.status === 'edited' && !confirmOverwrite) {
     throw new Error('Chapter has author edits; regeneration needs explicit confirmation.');
@@ -194,15 +195,39 @@ async function runChapterGeneration({ novelId, userId, payload, setProgress }: a
     messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: prompt.user }],
     temperature: 0.85,
     maxTokens: Math.min(4500, Math.max(1500, Math.round(outline.targetWords * 1.6))),
-    userId, novelId, taskType: 'chapter',
+    userId, novelId,
+    chapterId: existing?.id || undefined,
+    jobId: jobId || undefined,
+    taskType: 'chapter',
     allowFallbackOnError: false,
   });
   if (!generated.text.trim()) throw new Error('Provider returned an empty chapter.');
+
+  // Guard against a job that was cancelled while the AI request was in flight:
+  // never overwrite chapter content if the job is no longer processing.
+  if (isCancelled?.()) {
+    throw new Error('Job was cancelled before completion.');
+  }
+  if (jobId) {
+    const jobRow = db.prepare('SELECT status FROM generation_jobs WHERE id = ?').get(jobId) as { status: string } | undefined;
+    if (jobRow && jobRow.status === 'cancelled') {
+      throw new Error('Job was cancelled before completion.');
+    }
+    // Also re-check if the author edited or approved the chapter while generation was running.
+    const latestChapter = db.prepare('SELECT status FROM chapters WHERE novelId=? AND chapterNumber=?').get(novelId, chapterNumber) as { status: string } | undefined;
+    if (latestChapter?.status === 'approved') {
+      throw new Error('Chapter was approved while generation was in progress.');
+    }
+    if (latestChapter?.status === 'edited' && !confirmOverwrite) {
+      throw new Error('Chapter was edited while generation was in progress.');
+    }
+  }
 
   setProgress?.(70);
 
   const text = generated.text.trim();
   const doc = emptyDoc(text);
+  const serializedDoc = JSON.stringify(doc);
   const html = docToHtml(doc);
   const words = countWords(text);
   const pages = Math.max(1, Math.round(words / wordsPerPage));
@@ -211,26 +236,37 @@ async function runChapterGeneration({ novelId, userId, payload, setProgress }: a
   let chapterId = existing?.id as string | undefined;
   const tx = db.transaction(() => {
     if (chapterId) {
+      const nextRevision = ((existing?.revision as number) || 1) + 1;
       db.prepare(
-        `UPDATE chapters SET title=?, contentJson=?, contentHtml=?, plainText=?, wordCount=?, pageCountEst=?,
-                             status='generated', generationSource=?, generatedAt=?, summary=NULL, updatedAt=? WHERE id=?`,
-      ).run(outline.title, JSON.stringify(doc), html, text, words, pages, generated.meta.source, now, now, chapterId);
+        `UPDATE chapters SET title=?, contentJson=?, generatedContentJson=?, contentHtml=?, plainText=?, wordCount=?, pageCountEst=?,
+                             status='generated', generationSource=?, generatedAt=?, lastJobId=?, revision=?, summary=NULL, updatedAt=? WHERE id=?`,
+      ).run(outline.title, serializedDoc, serializedDoc, html, text, words, pages, generated.meta.source, now, jobId || null, nextRevision, now, chapterId);
     } else {
       chapterId = nanoid();
       db.prepare(
-        `INSERT INTO chapters (id,novelId,outlineId,chapterNumber,title,contentJson,contentHtml,plainText,status,wordCount,pageCountEst,generationSource,generatedAt,createdAt,updatedAt)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO chapters (id,novelId,outlineId,chapterNumber,title,contentJson,generatedContentJson,contentHtml,plainText,status,wordCount,pageCountEst,generationSource,generatedAt,lastJobId,revision,createdAt,updatedAt)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`,
       ).run(chapterId, novelId, outline.id, chapterNumber, outline.title,
-        JSON.stringify(doc), html, text, 'generated', words, pages, generated.meta.source, now, now, now);
+        serializedDoc, serializedDoc, html, text, 'generated', words, pages, generated.meta.source, now, jobId || null, now, now);
+    }
+
+    if (jobId) {
+      db.prepare('UPDATE generation_jobs SET chapterId=? WHERE id=?').run(chapterId, jobId);
     }
 
     const nextVersion = (db.prepare(`SELECT COALESCE(MAX(versionNum),0)+1 AS next FROM chapter_versions WHERE chapterId=?`)
       .get(chapterId) as { next: number }).next;
     const versionId = nanoid();
-    db.prepare(`INSERT INTO chapter_versions (id,chapterId,versionNum,contentJson,wordCount,note,createdAt) VALUES (?,?,?,?,?,?,?)`)
-      .run(versionId, chapterId, nextVersion, JSON.stringify(doc), words, `Generation (${generated.meta.source})`, now);
+    db.prepare(
+      `INSERT INTO chapter_versions (id,novelId,chapterId,versionNum,contentJson,wordCount,note,revisionType,parentVersionId,createdAt)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      versionId, novelId, chapterId, nextVersion, serializedDoc, words,
+      `Generation (${generated.meta.source})`, 'generation', existing?.currentVersionId || null, now,
+    );
     db.prepare(`UPDATE chapters SET currentVersionId=? WHERE id=?`).run(versionId, chapterId);
     db.prepare(`UPDATE chapter_outlines SET status='writing' WHERE id=?`).run(outline.id);
+    db.prepare(`UPDATE novels SET updatedAt=? WHERE id=?`).run(now, novelId);
   });
   tx();
 
@@ -364,7 +400,35 @@ export async function summarizeChapter(chapterId: string, userId: string, novelI
   return runMemoryExtraction({ payload: { chapterId }, userId, novelId: novelId || chapter.novelId });
 }
 
-export async function saveChapterContent(userId: string, novelId: string, chapterId: string, doc: { type?: string; content?: any[] }) {
+export const MAX_AUTOSAVE_VERSIONS_PER_CHAPTER = 25;
+
+export interface SaveChapterOptions {
+  /** Optimistic concurrency guard: if set and different from chapters.revision, 409 is raised and conflicting content is preserved in chapter_versions. */
+  expectedRevision?: number;
+  title?: string;
+  createSnapshot?: boolean;
+  snapshotNote?: string;
+}
+
+function pruneAutosaveVersions(db: any, chapterId: string) {
+  const autosaves = db.prepare(
+    `SELECT id FROM chapter_versions WHERE chapterId = ? AND revisionType = 'autosave' ORDER BY versionNum DESC`,
+  ).all(chapterId) as { id: string }[];
+  if (autosaves.length > MAX_AUTOSAVE_VERSIONS_PER_CHAPTER) {
+    const toDelete = autosaves.slice(MAX_AUTOSAVE_VERSIONS_PER_CHAPTER).map(r => r.id);
+    db.prepare(
+      `DELETE FROM chapter_versions WHERE id IN (${toDelete.map(() => '?').join(',')})`,
+    ).run(...toDelete);
+  }
+}
+
+export async function saveChapterContent(
+  userId: string,
+  novelId: string,
+  chapterId: string,
+  doc: { type?: string; content?: any[] },
+  options: SaveChapterOptions = {},
+) {
   const db = getDb();
   const novel = db.prepare('SELECT * FROM novels WHERE id=? AND userId=?').get(novelId, userId) as any;
   if (!novel) throw new HttpError(404, 'Novel not found', 'novel_not_found');
@@ -373,21 +437,128 @@ export async function saveChapterContent(userId: string, novelId: string, chapte
   if (chapter.status === 'approved') {
     throw new HttpError(409, 'Approved chapters are read-only. Reopen the chapter to edit it.', 'chapter_approved');
   }
+
   const fullDoc: ChapterDoc = { type: 'doc', content: Array.isArray(doc.content) ? doc.content : [] };
+  const serialized = JSON.stringify(fullDoc);
   const plain = docToPlainText(fullDoc);
   const html = docToHtml(fullDoc);
   const words = countWords(plain);
   const settings = getSettings(novelId) as any;
   const pages = Math.max(1, Math.round(words / (settings?.wordsPerPage || 320)));
+  const currentRevision: number = chapter.revision ?? 1;
+  const nextTitle = typeof options.title === 'string' && options.title.trim() ? options.title.trim() : chapter.title;
+  const contentUnchanged = serialized === chapter.contentJson && nextTitle === chapter.title;
+
+  // Optimistic concurrency check: prevent stale/older requests from overwriting newer edits.
+  if (options.expectedRevision !== undefined && options.expectedRevision !== null) {
+    if (options.expectedRevision !== currentRevision) {
+      if (contentUnchanged) {
+        return {
+          wordCount: chapter.wordCount,
+          pages: chapter.pageCountEst,
+          revision: currentRevision,
+          updatedAt: chapter.updatedAt,
+          unchanged: true,
+        };
+      }
+      // Preserve the conflicting incoming draft in version history so no prose is ever lost.
+      const now = new Date().toISOString();
+      const conflictVersionId = nanoid();
+      const txConflict = db.transaction(() => {
+        const nextVer = (db.prepare(`SELECT COALESCE(MAX(versionNum),0)+1 AS next FROM chapter_versions WHERE chapterId=?`)
+          .get(chapterId) as { next: number }).next;
+        db.prepare(
+          `INSERT INTO chapter_versions (id,novelId,chapterId,versionNum,contentJson,wordCount,note,revisionType,parentVersionId,createdAt)
+           VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        ).run(
+          conflictVersionId, novelId, chapterId, nextVer, serialized, words,
+          `Conflicting edit preserved (base revision ${options.expectedRevision})`,
+          'conflict', chapter.currentVersionId || null, now,
+        );
+      });
+      txConflict();
+
+      throw new HttpError(
+        409,
+        'This chapter was modified by a newer save. Your incoming draft was preserved in version history.',
+        'revision_conflict',
+        {
+          currentRevision,
+          serverUpdatedAt: chapter.updatedAt,
+          conflictVersionId,
+        },
+      );
+    }
+  }
+
+  // Avoid unnecessary database writes when content has not changed and no manual snapshot was requested.
+  if (contentUnchanged && !options.createSnapshot) {
+    return {
+      wordCount: chapter.wordCount,
+      pages: chapter.pageCountEst,
+      revision: currentRevision,
+      updatedAt: chapter.updatedAt,
+      unchanged: true,
+    };
+  }
+
   const now = new Date().toISOString();
-  db.prepare(
-    `UPDATE chapters SET contentJson=?, contentHtml=?, plainText=?, wordCount=?, pageCountEst=?,
-                         status=CASE WHEN status='generated' THEN 'edited' ELSE status END, updatedAt=? WHERE id=?`,
-  ).run(JSON.stringify(fullDoc), html, plain, words, pages, now, chapterId);
-  return { wordCount: words, pages };
+  const nextRevision = contentUnchanged ? currentRevision : currentRevision + 1;
+
+  const tx = db.transaction(() => {
+    if (!contentUnchanged) {
+      db.prepare(
+        `UPDATE chapters SET title=?, contentJson=?, contentHtml=?, plainText=?, wordCount=?, pageCountEst=?,
+                             status=CASE WHEN status='generated' THEN 'edited' ELSE status END,
+                             revision=?, updatedAt=? WHERE id=?`,
+      ).run(nextTitle, serialized, html, plain, words, pages, nextRevision, now, chapterId);
+
+      if (nextTitle !== chapter.title && chapter.outlineId) {
+        db.prepare(`UPDATE chapter_outlines SET title=? WHERE id=?`).run(nextTitle, chapter.outlineId);
+      }
+      db.prepare(`UPDATE novels SET updatedAt=? WHERE id=?`).run(now, novelId);
+    }
+
+    const latestVer = db.prepare(
+      `SELECT id, wordCount, contentJson FROM chapter_versions WHERE chapterId=? ORDER BY versionNum DESC LIMIT 1`,
+    ).get(chapterId) as { id: string; wordCount: number; contentJson: string } | undefined;
+
+    const shouldSnapshot = Boolean(
+      options.createSnapshot ||
+      !latestVer ||
+      chapter.status === 'generated' ||
+      (latestVer.contentJson !== serialized && Math.abs(words - (latestVer.wordCount || 0)) >= 100),
+    );
+
+    if (shouldSnapshot && (!latestVer || latestVer.contentJson !== serialized || options.createSnapshot)) {
+      const nextVer = (db.prepare(`SELECT COALESCE(MAX(versionNum),0)+1 AS next FROM chapter_versions WHERE chapterId=?`)
+        .get(chapterId) as { next: number }).next;
+      const versionId = nanoid();
+      const revType = options.createSnapshot ? 'manual' : 'autosave';
+      const note = options.snapshotNote || (options.createSnapshot ? 'Manual save' : 'Autosave checkpoint');
+      db.prepare(
+        `INSERT INTO chapter_versions (id,novelId,chapterId,versionNum,contentJson,wordCount,note,revisionType,parentVersionId,createdAt)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      ).run(
+        versionId, novelId, chapterId, nextVer, serialized, words, note, revType,
+        chapter.currentVersionId || latestVer?.id || null, now,
+      );
+      db.prepare(`UPDATE chapters SET currentVersionId=? WHERE id=?`).run(versionId, chapterId);
+      if (revType === 'autosave') pruneAutosaveVersions(db, chapterId);
+    }
+  });
+  tx();
+
+  return { wordCount: words, pages, revision: nextRevision, updatedAt: now, unchanged: false };
 }
 
-export async function createVersion(userId: string, novelId: string, chapterId: string, note?: string) {
+export async function createVersion(
+  userId: string,
+  novelId: string,
+  chapterId: string,
+  note?: string,
+  revisionType = 'manual',
+) {
   const db = getDb();
   const chapter = db.prepare(
     `SELECT c.* FROM chapters c JOIN novels n ON n.id=c.novelId WHERE c.id=? AND c.novelId=? AND n.userId=?`,
@@ -396,10 +567,15 @@ export async function createVersion(userId: string, novelId: string, chapterId: 
   const current = db.prepare(`SELECT COALESCE(MAX(versionNum),0)+1 AS next FROM chapter_versions WHERE chapterId=?`).get(chapterId) as any;
   const id = nanoid();
   const now = new Date().toISOString();
-  db.prepare(`INSERT INTO chapter_versions (id,chapterId,versionNum,contentJson,wordCount,note,createdAt) VALUES (?,?,?,?,?,?,?)`)
-    .run(id, chapterId, current.next, chapter.contentJson, chapter.wordCount, note || null, now);
+  db.prepare(
+    `INSERT INTO chapter_versions (id,novelId,chapterId,versionNum,contentJson,wordCount,note,revisionType,parentVersionId,createdAt)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+  ).run(
+    id, novelId, chapterId, current.next, chapter.contentJson, chapter.wordCount,
+    note || null, revisionType, chapter.currentVersionId || null, now,
+  );
   db.prepare(`UPDATE chapters SET currentVersionId=?, updatedAt=? WHERE id=?`).run(id, now, chapterId);
-  return { versionNum: current.next };
+  return { id, versionNum: current.next, wordCount: chapter.wordCount, note: note || null, revisionType, createdAt: now };
 }
 
 /**
@@ -467,7 +643,27 @@ export async function getNavigation(novelId: string): Promise<ChapterNav[]> {
 
 export async function listVersions(chapterId: string) {
   const db = getDb();
-  return db.prepare(`SELECT id, chapterId, versionNum, wordCount, note, createdAt FROM chapter_versions WHERE chapterId=? ORDER BY versionNum DESC`).all(chapterId) as any[];
+  return db.prepare(
+    `SELECT id, novelId, chapterId, versionNum, wordCount, note, revisionType, parentVersionId, createdAt
+       FROM chapter_versions WHERE chapterId=? ORDER BY versionNum DESC`,
+  ).all(chapterId) as any[];
+}
+
+export async function getVersion(userId: string, novelId: string, chapterId: string, versionId: string) {
+  const db = getDb();
+  const chapter = db.prepare(
+    `SELECT c.id FROM chapters c JOIN novels n ON n.id=c.novelId WHERE c.id=? AND c.novelId=? AND n.userId=?`,
+  ).get(chapterId, novelId, userId) as any;
+  if (!chapter) throw new HttpError(404, 'Chapter not found', 'chapter_not_found');
+  const v = db.prepare(`SELECT * FROM chapter_versions WHERE id=? AND chapterId=?`).get(versionId, chapterId) as any;
+  if (!v) throw new HttpError(404, 'Version not found', 'version_not_found');
+  let plainText = '';
+  try {
+    plainText = docToPlainText(JSON.parse(v.contentJson));
+  } catch {
+    plainText = '';
+  }
+  return { ...v, plainText };
 }
 
 /** Restores an earlier version as a new version (never destroys history). */
@@ -481,16 +677,61 @@ export async function restoreVersion(userId: string, novelId: string, chapterId:
   const v = db.prepare(`SELECT * FROM chapter_versions WHERE id=? AND chapterId=?`).get(versionId, chapterId) as any;
   if (!v) throw new HttpError(404, 'Version not found', 'version_not_found');
 
-  await createVersion(userId, novelId, chapterId, 'Auto-save before restore');
   const parsed = JSON.parse(v.contentJson);
   const plain = docToPlainText(parsed);
   const words = countWords(plain);
   const settings = getSettings(novelId) as any;
+  const pages = Math.max(1, Math.round(words / (settings?.wordsPerPage || 320)));
   const now = new Date().toISOString();
-  db.prepare(
-    `UPDATE chapters SET contentJson=?, plainText=?, contentHtml=?, wordCount=?, pageCountEst=?, status='edited', updatedAt=? WHERE id=? AND novelId=?`,
-  ).run(v.contentJson, plain, docToHtml(parsed), words, Math.max(1, Math.round(words / (settings?.wordsPerPage || 320))), now, chapterId, novelId);
-  return { restoredVersion: v.versionNum };
+  const nextRevision = ((chapter.revision as number) || 1) + 1;
+
+  const tx = db.transaction(() => {
+    const latestVer = db.prepare(
+      `SELECT id, contentJson FROM chapter_versions WHERE chapterId=? ORDER BY versionNum DESC LIMIT 1`,
+    ).get(chapterId) as { id: string; contentJson: string } | undefined;
+
+    let parentId: string | null = chapter.currentVersionId || latestVer?.id || null;
+    if (chapter.contentJson !== v.contentJson && (!latestVer || latestVer.contentJson !== chapter.contentJson)) {
+      const nextPreVer = (db.prepare(`SELECT COALESCE(MAX(versionNum),0)+1 AS next FROM chapter_versions WHERE chapterId=?`)
+        .get(chapterId) as { next: number }).next;
+      const preId = nanoid();
+      db.prepare(
+        `INSERT INTO chapter_versions (id,novelId,chapterId,versionNum,contentJson,wordCount,note,revisionType,parentVersionId,createdAt)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      ).run(
+        preId, novelId, chapterId, nextPreVer, chapter.contentJson, chapter.wordCount,
+        `Auto-save before restoring v${v.versionNum}`, 'pre_restore', parentId, now,
+      );
+      parentId = preId;
+    }
+
+    const nextVer = (db.prepare(`SELECT COALESCE(MAX(versionNum),0)+1 AS next FROM chapter_versions WHERE chapterId=?`)
+      .get(chapterId) as { next: number }).next;
+    const restoredVerId = nanoid();
+    db.prepare(
+      `INSERT INTO chapter_versions (id,novelId,chapterId,versionNum,contentJson,wordCount,note,revisionType,parentVersionId,createdAt)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      restoredVerId, novelId, chapterId, nextVer, v.contentJson, words,
+      `Restored from v${v.versionNum}`, 'restore', v.id, now,
+    );
+
+    db.prepare(
+      `UPDATE chapters SET contentJson=?, plainText=?, contentHtml=?, wordCount=?, pageCountEst=?,
+                           status='edited', currentVersionId=?, revision=?, updatedAt=? WHERE id=? AND novelId=?`,
+    ).run(v.contentJson, plain, docToHtml(parsed), words, pages, restoredVerId, nextRevision, now, chapterId, novelId);
+    db.prepare(`UPDATE novels SET updatedAt=? WHERE id=?`).run(now, novelId);
+  });
+  tx();
+
+  return {
+    restoredVersion: v.versionNum,
+    revision: nextRevision,
+    wordCount: words,
+    pages,
+    contentJson: parsed,
+    updatedAt: now,
+  };
 }
 
 /** Used by the memory service to read a memory's vector back. */

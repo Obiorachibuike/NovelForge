@@ -7,7 +7,14 @@ export const NovelStage = {
   STRUCTURE: 'structure', OUTLINE: 'outline', APPROVE: 'approve',
   WRITING: 'writing', SYNC: 'sync', CONSISTENCY: 'consistency', EXPORT: 'export',
 } as const;
-export const JobStatus = { QUEUED:'queued', PROCESSING:'processing', COMPLETED:'completed', FAILED:'failed', CANCELLED:'cancelled' } as const;
+export const JobStatus = {
+  QUEUED: 'queued',
+  PROCESSING: 'processing',
+  AWAITING_REVIEW: 'awaiting_review',
+  COMPLETED: 'completed',
+  FAILED: 'failed',
+  CANCELLED: 'cancelled',
+} as const;
 export const ChapterStatus = { DRAFT:'draft', GENERATED:'generated', EDITED:'edited', APPROVED:'approved', LOCKED:'locked' } as const;
 export const IssueSeverity = { INFO:'info', WARNING:'warning', ERROR:'error' } as const;
 
@@ -26,6 +33,21 @@ export const createNovelSchema = z.object({
   writingMode: z.enum(['chapter','page']).default('chapter'),
 });
 export type CreateNovelInput = z.infer<typeof createNovelSchema>;
+
+export const updateNovelSchema = z.object({
+  title: z.string().min(1, 'Title is required').max(120).optional(),
+  premise: z.string().max(2000).nullable().optional(),
+  genre: z.string().min(1).max(80).optional(),
+  tone: z.string().max(120).nullable().optional(),
+  style: z.string().max(120).nullable().optional(),
+  pov: z.string().min(1).max(80).optional(),
+  audience: z.string().max(80).nullable().optional(),
+  targetWords: z.coerce.number().int().min(1000).max(500000).optional(),
+  targetPages: z.coerce.number().int().min(5).max(2000).optional(),
+  targetChapters: z.coerce.number().int().min(1).max(100).optional(),
+  writingMode: z.enum(['chapter','page']).optional(),
+});
+export type UpdateNovelInput = z.infer<typeof updateNovelSchema>;
 
 export const novelSettingsSchema = z.object({
   fontFamily: z.string().default('serif'),
@@ -159,15 +181,21 @@ export interface ChapterOutlineRow {
 }
 export interface ChapterRow {
   id:string; novelId:string; outlineId:string|null; chapterNumber:number; title:string;
-  contentJson:string; contentHtml:string|null; plainText:string|null;
+  contentJson:string; generatedContentJson?:string|null; contentHtml:string|null; plainText:string|null;
   status:string; wordCount:number; pageCountEst:number; summary:string|null; importantEvents:string|null;
-  currentVersionId:string|null; createdAt:string; updatedAt:string; approvedAt:string|null;
+  currentVersionId:string|null; revision?:number; lastJobId?:string|null;
+  generationSource?:string|null; generatedAt?:string|null;
+  createdAt:string; updatedAt:string; approvedAt:string|null;
 }
-export interface ChapterVersionRow { id:string; chapterId:string; versionNum:number; contentJson:string; wordCount:number; note:string|null; createdAt:string; }
+export interface ChapterVersionRow {
+  id:string; novelId?:string|null; chapterId:string; versionNum:number; contentJson:string;
+  wordCount:number; note:string|null; revisionType?:string; parentVersionId?:string|null; createdAt:string;
+}
 export interface ChapterMemoryRow { id:string; novelId:string; chapterId:string|null; characterId:string|null; kind:string; content:string; importance:number; embedding:string|null; meta:string|null; createdAt:string; }
 export interface GenerationJobRow {
-  id:string; userId:string; novelId:string; taskType:string; payload:string; status:string;
-  result:string|null; error:string|null; attempts:number; maxAttempts:number; idempotencyKey:string|null;
+  id:string; userId:string; novelId:string; chapterId?:string|null; taskType:string; payload:string; status:string;
+  result:string|null; error:string|null; errorCode?:string|null; retryable?:number;
+  attempts:number; maxAttempts:number; idempotencyKey:string|null;
   startedAt:string|null; completedAt:string|null; createdAt:string; updatedAt:string;
 }
 export interface ConsistencyIssueRow {

@@ -1,5 +1,7 @@
 # NovelForge
 
+> **Build your story. Write your world. Publish your novel.**
+>
 > The AI prepares the novel, the author controls the story, and NovelForge remembers everything that matters.
 
 NovelForge is a production-quality AI-powered novel-writing and digital publishing studio. It takes a novel from **Title → Cover → Preparation → Story Bible → Outline → Sequential Writing → Synchronization → Consistency → Export**, generating **one chapter at a time** under the author's explicit approval.
@@ -11,16 +13,17 @@ NovelForge is a production-quality AI-powered novel-writing and digital publishi
 - **Subscriptions & administration** — no free tier: novel creation requires an active Stripe plan, the
   administrator role, or free access granted by an administrator. Stripe Checkout + Billing Portal +
   signature-verified, idempotent webhooks, with role and comp changes audited. See [`docs/billing.md`](docs/billing.md).
-- **Tiptap** rich-text editor with autosave, version history, word counts, selection-based AI editing.
-- **Structured AI layer** (OpenAI) with provider interface, streaming, structured JSON output (Zod-validated), embeddings, cost tracking. Works in **demo mode** with deterministic placeholder content when no API key is set.
-- **Sequential writing engine** — only one chapter unlocked at a time; explicit approval unlocks the next. Failure recovery via persisted job records.
+- **Tiptap** rich-text editor with debounced autosave, manual save (`Cmd/Ctrl+S`), optimistic concurrency control (`expectedRevision`) with automatic conflict preservation, supplementary browser draft recovery (compare/restore/discard), full revision history with non-destructive restore, word counts, and selection-based AI editing.
+- **Structured AI layer** (OpenAI) with provider interface, streaming, structured JSON output (Zod-validated), embeddings with bounded LRU cache, pre-operation cost estimation, per-user/novel/chapter/job cost tracking, and transient error retries with exponential backoff + jitter. Works in **demo mode** with deterministic placeholder content when no API key is set.
+- **Sequential writing engine** — only one chapter unlocked at a time; explicit approval unlocks the next. Failure recovery via persisted job records, error classification (`retryable` vs permanent), and user-initiated job cancellation/retry (`POST/DELETE /api/jobs/[jobId]`).
 - **Story Bible** — characters, locations, world rules, timeline events, plot threads; updated automatically after chapter approval.
 - **Story memory** with embeddings (OpenAI or a deterministic stub in demo mode) for retrieval-augmented chapter generation.
 - **Consistency engine** — heuristic + AI checks for timeline clashes, dead characters appearing, word-count targets, world-rule violations.
-- **Exports** to DOCX, PDF, TXT, Markdown and EPUB (all five built for real; `tests/exports`).
+- **Exports & Project Backups** — manuscript exports to DOCX, PDF, TXT, Markdown and EPUB (with unsaved local draft warnings), plus SHA-256 checksum-verified full novel JSON backup export (`GET /api/novels/[id]/backup`), transactional non-destructive restore (`POST /api/novels/[id]/backup` and `POST /api/novels/restore`), and online SQLite database backup (`backupSqliteDatabaseFile`).
+- **Health & Observability** — `GET /api/health` readiness endpoint, startup configuration validation (`src/lib/config/env.ts`), and secret-redacting structured logging (`src/lib/logger/index.ts`).
 - **Queue abstraction** — in-process runner by default; a real BullMQ consumer when `QUEUE_PROVIDER=redis` *and* `REDIS_URL` are set, plus a database poller and stale-job recovery in `npm run worker`.
-- **Storage abstraction** — local disk for development, any S3-compatible bucket (AWS S3, R2, B2, MinIO) or Cloudinary for production. See [`docs/storage.md`](docs/storage.md).
-- **Database** — SQLite via `better-sqlite3`, with versioned migrations. PostgreSQL is **not** implemented and a `postgres://` URL is rejected with an explanation: see [`docs/postgresql.md`](docs/postgresql.md).
+- **Cloudinary cover-image storage** — cover candidates are generated as temporary previews; when the author selects a cover, NovelForge validates the image binary/SVG content, uploads only the selected cover to Cloudinary under `novelforge/covers/<user-id>/<novel-id>/cover_<image-id>`, stores `secure_url` and `public_id` in PostgreSQL, cleans up orphaned assets on DB rollback, and deletes superseded covers on replacement. See [`docs/storage.md`](docs/storage.md).
+- **PostgreSQL primary database** — PostgreSQL via `pg` (`Pool`, `PoolClient`) with connection pooling, transactions (`BEGIN`/`COMMIT`/`ROLLBACK`), versioned migrations (`0001`–`0007`), and a non-destructive, idempotent SQLite-to-PostgreSQL migration tool (`npm run db:migrate:sqlite-to-pg`). Production requires `DATABASE_URL=postgresql://...` and never silently falls back to SQLite. See [`docs/postgresql.md`](docs/postgresql.md).
 
 ## Quick start (local development)
 
@@ -28,27 +31,43 @@ Requires **Node.js 22.x**.
 
 ```bash
 npm ci
-cp .env.example .env          # uses SQLite + demo AI mode by default
+cp .env.example .env          # configure PostgreSQL DATABASE_URL (or local SQLite for offline dev)
+npm run db:migrate
 npm run dev
 ```
 
 Open http://localhost:3000. Register with any email/password — no external services required. In demo mode, stylized SVG covers and deterministic chapter text are used.
 
-### Optional services
+### Environment Variables & Services
 
-Configure the following in `.env` to enable production-grade providers:
+Configure the following in `.env` / `.env.local`:
 
 | Variable | Purpose |
 | --- | --- |
+| `DATABASE_URL` | **Primary PostgreSQL connection string** (`postgresql://user:password@host:5432/novelforge`). Required in production (never silently falls back to SQLite). |
+| `STORAGE_PROVIDER=cloudinary` | Uses Cloudinary for permanent selected novel cover storage (`src/services/covers/cloudinary-cover-service.ts`). |
+| `CLOUDINARY_CLOUD_NAME` / `CLOUDINARY_API_KEY` / `CLOUDINARY_API_SECRET` | Server-only Cloudinary credentials for cover upload, replacement, and cleanup. |
 | `OPENAI_API_KEY` | Enables real AI text, structured output, embeddings, and (if model supports) image generation |
 | `AUTH_GOOGLE_ID` / `AUTH_GOOGLE_SECRET` | Google OAuth (both required) - see [`docs/google-signin.md`](docs/google-signin.md) |
 | `AUTH_SECRET` | **Required in production** (≥32 chars). The app refuses production requests with a placeholder or missing secret. |
 | `QUEUE_PROVIDER=redis` + `REDIS_URL` | Turns on the BullMQ consumer (run `npm run worker`); otherwise jobs run in-process. |
-| `STORAGE_PROVIDER=s3` + `S3_*` | Persistent object storage for covers and exports (required on Vercel). |
-| `STORAGE_PROVIDER=cloudinary` + `CLOUDINARY_*` | Cloudinary image storage (covers only). |
-| `DATA_DIR` | Local file location for `STORAGE_PROVIDER=local` (default `.data/`). |
+| `STORAGE_PROVIDER=s3` + `S3_*` | Persistent S3-compatible object storage for exports/files. |
+| `DATA_DIR` | Local file location for `STORAGE_PROVIDER=local` and temporary cover candidate previews (default `.data/`). |
 | `AI_DAILY_TOKEN_LIMIT` / `AI_MONTHLY_COST_LIMIT_USD` | Per-user spend guards enforced from the `ai_usage` table. |
-| `DATABASE_URL` | SQLite file URL, e.g. `file:./prisma/dev.db`. A `postgres://` URL is rejected — see [`docs/postgresql.md`](docs/postgresql.md). |
+
+### Database & Migration Commands
+
+```bash
+# Apply pending schema migrations (PostgreSQL or SQLite)
+npm run db:migrate
+
+# Inspect applied and pending migrations
+npm run db:status
+
+# Non-destructively migrate existing SQLite records into PostgreSQL
+DATABASE_URL="postgresql://user:password@localhost:5432/novelforge" \
+  npm run db:migrate:sqlite-to-pg -- --sqlite ./prisma/dev.db
+```
 
 Run a dedicated worker (for Redis / BullMQ mode):
 
@@ -140,8 +159,10 @@ src/
 ```bash
 npm run typecheck     # tsc --noEmit
 npm run lint          # next lint (no warnings)
-npm test              # 171 Vitest tests across 15 files
+npm test              # 188 Vitest tests across 19 files
 npm run build         # production build with type + lint validation enabled
+npm run db:migrate    # apply pending SQLite migrations non-destructively
+npm run db:status     # inspect applied and pending SQLite migrations
 npm run worker        # standalone worker (migrations, poller, BullMQ when configured)
 ```
 

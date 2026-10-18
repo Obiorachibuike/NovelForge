@@ -21,17 +21,88 @@ import 'server-only';
  *  - Recovery: `recoverStaleJobs` requeues jobs whose worker died mid-flight.
  */
 
-export type JobStatus = 'queued' | 'processing' | 'completed' | 'failed' | 'cancelled';
+export type JobStatus = 'queued' | 'processing' | 'awaiting_review' | 'completed' | 'failed' | 'cancelled';
+
+export class NonRetryableJobError extends Error {
+  readonly retryable = false;
+  readonly code: string;
+  constructor(message: string, code = 'permanent_failure') {
+    super(message);
+    this.name = 'NonRetryableJobError';
+    this.code = code;
+  }
+}
+
+/**
+ * Redacts API keys, bearer tokens and connection credentials so secrets can
+ * never leak into persisted job rows, API responses or logs.
+ */
+export function sanitizeErrorMessage(raw: string): string {
+  if (!raw) return 'Unknown error';
+  return raw
+    .replace(/sk-[A-Za-z0-9_-]{8,}/g, 'sk-[REDACTED]')
+    .replace(/Bearer\s+[A-Za-z0-9._~+/-]+=*/gi, 'Bearer [REDACTED]')
+    .replace(/(redis|postgres|postgresql|mysql|https?):\/\/([^:\s/@]+):([^@\s/]+)@/gi, '$1://$2:[REDACTED]@');
+}
+
+const PERMANENT_ERROR_PATTERNS = [
+  /no handler registered/i,
+  /novel not found/i,
+  /no outline for chapter/i,
+  /chapter is already approved/i,
+  /previous chapter must be approved/i,
+  /chapter has author edits/i,
+  /job was cancelled/i,
+  /chapter was approved while generation/i,
+  /chapter was edited while generation/i,
+  /daily ai token limit/i,
+  /monthly ai budget/i,
+  /invalid api key/i,
+  /incorrect api key/i,
+];
+
+export function classifyJobError(err: unknown): { message: string; retryable: boolean; code: string } {
+  const rawMessage = err instanceof Error ? err.message : String(err || 'Unknown error');
+  const message = sanitizeErrorMessage(rawMessage);
+  const anyErr = err as any;
+
+  if (anyErr?.retryable === false || err instanceof NonRetryableJobError) {
+    return { message, retryable: false, code: anyErr?.code || 'permanent_failure' };
+  }
+  if (
+    anyErr?.code === 'ai_budget_exhausted' ||
+    anyErr?.code === 'ai_daily_token_limit' ||
+    anyErr?.code === 'ai_monthly_cost_limit' ||
+    anyErr?.code === 'ai_max_completion_tokens'
+  ) {
+    return { message, retryable: false, code: anyErr.code };
+  }
+  const status = typeof anyErr?.status === 'number' ? anyErr.status : undefined;
+  if (status && [400, 401, 402, 403, 404, 409, 413, 422].includes(status)) {
+    return { message, retryable: false, code: anyErr?.code || `http_${status}` };
+  }
+  if (PERMANENT_ERROR_PATTERNS.some(rx => rx.test(message))) {
+    return { message, retryable: false, code: anyErr?.code || 'domain_precondition_failed' };
+  }
+  return {
+    message,
+    retryable: true,
+    code: anyErr?.code || (status === 429 ? 'rate_limited' : 'transient_error'),
+  };
+}
 
 export interface JobRecord {
   id: string;
   userId: string;
   novelId: string;
+  chapterId?: string | null;
   taskType: string;
   payload: string;
   status: JobStatus;
   result: string | null;
   error: string | null;
+  errorCode?: string | null;
+  retryable?: number | null;
   attempts: number;
   maxAttempts: number;
   idempotencyKey: string | null;
@@ -52,6 +123,8 @@ export interface JobHandlerContext {
   userId: string;
   /** Persists 0-100 progress so the status endpoint can report it. */
   setProgress: (percent: number) => void;
+  /** True if the job was cancelled while running. */
+  isCancelled: () => boolean;
 }
 
 type JobHandler = (job: JobHandlerContext) => Promise<unknown>;
@@ -92,6 +165,7 @@ function envInt(name: string, fallback: number) {
 }
 
 export interface EnqueueOptions extends GenerationTask {
+  chapterId?: string | null;
   maxAttempts?: number;
   /** Milliseconds to wait before the job may first be claimed. */
   delayMs?: number;
@@ -111,10 +185,10 @@ export async function enqueue(task: EnqueueOptions): Promise<string> {
 
   try {
     db.prepare(
-      `INSERT INTO generation_jobs (id,userId,novelId,taskType,payload,status,attempts,maxAttempts,idempotencyKey,createdAt,updatedAt,scheduledAt,progress)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO generation_jobs (id,userId,novelId,chapterId,taskType,payload,status,attempts,maxAttempts,idempotencyKey,createdAt,updatedAt,scheduledAt,progress,retryable)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)`,
     ).run(
-      id, task.userId, task.novelId, task.type, JSON.stringify(task.payload ?? {}),
+      id, task.userId, task.novelId, task.chapterId || null, task.type, JSON.stringify(task.payload ?? {}),
       'queued', 0, task.maxAttempts ?? 3, task.idempotencyKey || null, now, now,
       task.delayMs ? new Date(Date.now() + task.delayMs).toISOString() : now, 0,
     );
@@ -180,47 +254,69 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
   const job = db.prepare('SELECT * FROM generation_jobs WHERE id=?').get(id) as JobRecord;
   const handler = handlers.get(job.taskType);
   if (!handler) {
-    db.prepare(`UPDATE generation_jobs SET status='failed', error=?, completedAt=?, updatedAt=? WHERE id=?`)
+    db.prepare(`UPDATE generation_jobs SET status='failed', error=?, errorCode='no_handler', retryable=0, completedAt=?, updatedAt=? WHERE id=?`)
       .run(`No handler registered for task type ${job.taskType}`, nowIso(), nowIso(), id);
     return { id, status: 'failed', reason: 'no handler' };
   }
+
+  const checkCancelled = () => {
+    const row = db.prepare('SELECT status FROM generation_jobs WHERE id=?').get(id) as { status: JobStatus } | undefined;
+    return !row || row.status === 'cancelled';
+  };
 
   try {
     const payload = job.payload ? JSON.parse(job.payload) : {};
     const result = await handler({
       id, payload, novelId: job.novelId, userId: job.userId,
+      isCancelled: checkCancelled,
       setProgress: percent => {
         const value = Math.max(0, Math.min(100, Math.round(percent)));
-        db.prepare('UPDATE generation_jobs SET progress=?, updatedAt=? WHERE id=?').run(value, nowIso(), id);
+        db.prepare(`UPDATE generation_jobs SET progress=?, updatedAt=? WHERE id=? AND status='processing'`).run(value, nowIso(), id);
       },
     });
     const finished = nowIso();
-    db.prepare(
-      `UPDATE generation_jobs SET status='completed', result=?, completedAt=?, updatedAt=?, claimedAt=NULL, claimedBy=NULL, progress=100 WHERE id=?`,
-    ).run(JSON.stringify(result ?? null), finished, finished, id);
-    return { id, status: 'completed' };
+    const targetStatus: JobStatus = (result && typeof result === 'object' && (result as any).awaitingReview === true)
+      ? 'awaiting_review'
+      : 'completed';
+    const completeUpdate = db.prepare(
+      `UPDATE generation_jobs
+          SET status=?, result=?, error=NULL, errorCode=NULL, completedAt=?, updatedAt=?, claimedAt=NULL, claimedBy=NULL, progress=100
+        WHERE id=? AND status='processing'`,
+    ).run(targetStatus, JSON.stringify(result ?? null), finished, finished, id);
+    if (completeUpdate.changes === 0) {
+      return { id, status: 'cancelled', reason: 'cancelled while processing' };
+    }
+    return { id, status: targetStatus };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    if (checkCancelled()) {
+      db.prepare(`UPDATE generation_jobs SET claimedAt=NULL, claimedBy=NULL, updatedAt=? WHERE id=?`).run(nowIso(), id);
+      return { id, status: 'cancelled', reason: 'cancelled' };
+    }
+    const classified = classifyJobError(err);
     const attempts = (db.prepare('SELECT attempts FROM generation_jobs WHERE id=?').get(id) as { attempts: number }).attempts;
     const maxAttempts = job.maxAttempts || 3;
     const finished = nowIso();
-    if (attempts >= maxAttempts) {
+    if (!classified.retryable || attempts >= maxAttempts) {
       db.prepare(
-        `UPDATE generation_jobs SET status='failed', error=?, completedAt=?, updatedAt=?, claimedAt=NULL, claimedBy=NULL WHERE id=?`,
-      ).run(message, finished, finished, id);
-      return { id, status: 'failed', reason: message };
+        `UPDATE generation_jobs
+            SET status='failed', error=?, errorCode=?, retryable=?, completedAt=?, updatedAt=?, claimedAt=NULL, claimedBy=NULL
+          WHERE id=? AND status != 'cancelled'`,
+      ).run(classified.message, classified.code, classified.retryable ? 1 : 0, finished, finished, id);
+      return { id, status: 'failed', reason: classified.message };
     }
     const backoffMs = Math.min(60_000, 2000 * 2 ** (attempts - 1));
     db.prepare(
-      `UPDATE generation_jobs SET status='queued', error=?, scheduledAt=?, updatedAt=?, claimedAt=NULL, claimedBy=NULL WHERE id=?`,
-    ).run(message, new Date(Date.now() + backoffMs).toISOString(), finished, id);
+      `UPDATE generation_jobs
+          SET status='queued', error=?, errorCode=?, retryable=1, scheduledAt=?, updatedAt=?, claimedAt=NULL, claimedBy=NULL
+        WHERE id=? AND status != 'cancelled'`,
+    ).run(classified.message, classified.code, new Date(Date.now() + backoffMs).toISOString(), finished, id);
     if (queueDriver() === 'redis') {
       const { publishJob } = await import('./bullmq');
       await publishJob(id, backoffMs).catch(e => console.error('[queue] retry publish failed', id, e));
     } else if (!process.env.QUEUE_NO_INPROCESS) {
       setTimeout(() => { void runJob(id).catch(e => console.error('[queue] retry failed', id, e)); }, backoffMs);
     }
-    return { id, status: 'queued', reason: message };
+    return { id, status: 'queued', reason: classified.message };
   }
 }
 
@@ -275,13 +371,41 @@ export async function listUserJobs(userId: string, { limit = 20 } = {}) {
     .all(userId, limit) as JobRecord[];
 }
 
-/** Marks a queued job as cancelled. Returns false when it was already claimed. */
+/**
+ * Marks a queued or processing job as cancelled. Returns false when it has
+ * already finished (completed, failed, or cancelled).
+ */
 export function cancelJob(id: string): boolean {
   const db = getDb();
   const res = db.prepare(
-    `UPDATE generation_jobs SET status='cancelled', updatedAt=?, claimedAt=NULL, claimedBy=NULL WHERE id=? AND status='queued'`,
-  ).run(nowIso(), id);
+    `UPDATE generation_jobs
+        SET status='cancelled', updatedAt=?, completedAt=COALESCE(completedAt, ?), claimedAt=NULL, claimedBy=NULL
+      WHERE id=? AND status IN ('queued','processing','awaiting_review')`,
+  ).run(nowIso(), nowIso(), id);
   return res.changes > 0;
+}
+
+/**
+ * Re-queues a failed or cancelled job so the user can retry it safely.
+ */
+export async function retryJob(id: string): Promise<boolean> {
+  const db = getDb();
+  const now = nowIso();
+  const res = db.prepare(
+    `UPDATE generation_jobs
+        SET status='queued', attempts=0, error=NULL, errorCode=NULL, retryable=1,
+            scheduledAt=?, completedAt=NULL, claimedAt=NULL, claimedBy=NULL, progress=0, updatedAt=?
+      WHERE id=? AND status IN ('failed','cancelled')`,
+  ).run(now, now, id);
+  if (res.changes === 0) return false;
+
+  if (queueDriver() === 'redis') {
+    const { publishJob } = await import('./bullmq');
+    await publishJob(id).catch(e => console.error('[queue] retry publish failed', id, e));
+  } else if (!process.env.QUEUE_NO_INPROCESS) {
+    setImmediate(() => { void runJob(id).catch(e => console.error('[queue] retry failed', id, e)); });
+  }
+  return true;
 }
 
 /** Public shape of a job for API responses (no raw payload/result passthrough). */
@@ -289,12 +413,15 @@ export function serializeJob(job: JobRecord) {
   return {
     id: job.id,
     novelId: job.novelId,
+    chapterId: job.chapterId ?? null,
     taskType: job.taskType,
     status: job.status,
     progress: job.progress ?? 0,
     attempts: job.attempts,
     maxAttempts: job.maxAttempts,
-    error: job.error,
+    error: job.error ? sanitizeErrorMessage(job.error) : null,
+    errorCode: job.errorCode ?? null,
+    retryable: job.retryable === undefined || job.retryable === null ? true : Boolean(job.retryable),
     result: safeJson(job.result),
     startedAt: job.startedAt,
     completedAt: job.completedAt,

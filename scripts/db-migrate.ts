@@ -1,38 +1,73 @@
 /**
- * Applies pending database migrations.
+ * Apply pending NovelForge schema migrations, or inspect status with `--status`.
+ * Supports both PostgreSQL (`DATABASE_URL=postgresql://...`) and SQLite.
  *
- *   npm run db:migrate          # apply
- *   npm run db:status           # report applied/pending without changing anything
- *
- * The default DATABASE_URL targets the local SQLite file; set DATABASE_URL to
- * your production database before running it against a deployed environment.
+ *   npm run db:migrate
+ *   npm run db:status
  */
-import { migrateDatabase, databaseStatus, closeDb } from '../src/lib/db';
+import { databaseStatus, migrateDatabase, closeDb, activeDatabaseDriver, resolveSqlitePath } from '../src/lib/db';
+import { getPgPool, redactConnectionString, runPostgresMigrations, postgresMigrationStatus, closePgPool } from '../src/lib/db/postgres';
 
-const mode = process.argv.includes('--status') ? 'status' : 'migrate';
+const statusOnly = process.argv.includes('--status');
 
-try {
-  if (mode === 'status') {
-    const status = databaseStatus();
-    console.log(`driver:   ${status.driver}`);
-    console.log(`database: ${status.path}`);
-    console.log(`applied:  ${status.applied.map(a => a.id).join(', ') || '(none)'}`);
-    console.log(`pending:  ${status.pending.join(', ') || '(none)'}`);
-    if (status.pending.length) process.exitCode = 1;
-  } else {
-    const result = migrateDatabase();
-    console.log(`applied:  ${result.applied.join(', ') || '(none)'}`);
-    console.log(`already:  ${result.skipped.length} migration(s)`);
+async function main() {
+  const driver = activeDatabaseDriver();
+
+  if (driver === 'postgres') {
+    const pool = getPgPool();
+    const redacted = redactConnectionString(process.env.DATABASE_URL || '');
+    if (!statusOnly) {
+      await runPostgresMigrations(pool, (msg) => console.log(msg));
+    }
+    const status = await postgresMigrationStatus(pool);
+    console.log(`Database driver: postgres (${redacted})`);
+    console.log(`\nApplied migrations (${status.applied.length}):`);
+    for (const m of status.applied) {
+      console.log(`  ✓ ${m.id}  (${m.appliedAt})`);
+    }
+    if (status.pending.length === 0) {
+      console.log('\nSchema is up to date.');
+    } else {
+      console.log(`\nPending migrations (${status.pending.length}):`);
+      for (const id of status.pending) {
+        console.log(`  • ${id}`);
+      }
+      if (statusOnly) {
+        process.exitCode = 1;
+      }
+    }
+    await closePgPool();
+    closeDb();
+    return;
   }
-} catch (err) {
-  // Configuration problems are printed without a stack trace: the message is
-  // the actionable part (see docs/postgresql.md / docs/storage.md).
-  if (err instanceof Error && (err.name === 'DatabaseConfigurationError' || /not set|not implemented/i.test(err.message))) {
-    console.error(`error: ${err.message}`);
-    process.exitCode = 1;
-  } else {
-    throw err;
+
+  if (!statusOnly) {
+    migrateDatabase();
   }
-} finally {
+
+  const status = databaseStatus();
+  console.log(`Database driver: sqlite (${resolveSqlitePath()})`);
+  console.log(`\nApplied migrations (${status.applied.length}):`);
+  for (const m of status.applied) {
+    console.log(`  ✓ ${m.id}  (${m.appliedAt})`);
+  }
+
+  if (status.pending.length === 0) {
+    console.log('\nSchema is up to date.');
+  } else {
+    console.log(`\nPending migrations (${status.pending.length}):`);
+    for (const id of status.pending) {
+      console.log(`  • ${id}`);
+    }
+    if (statusOnly) {
+      process.exitCode = 1;
+    }
+  }
+
   closeDb();
 }
+
+main().catch((err) => {
+  console.error('[db:migrate] failed:', err instanceof Error ? err.message : err);
+  process.exit(1);
+});

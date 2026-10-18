@@ -709,3 +709,35 @@ hard-coded one), `README.md`, `.env.example`.
    multi-instance deployments remain blocked by the database limitation in §9.13.
 4. Stripe's own account settings (tax, portal configuration, invoices) are deployment configuration, not
    code; the app does not attempt to configure them.
+
+## 9.17 Production Reliability, Optimistic Concurrency, Revision History, Backups & Health Check
+
+### Summary of upgrades
+
+1. **Migration `0006_persistence_revisions_and_backups` (`src/lib/db/migrations.ts`)**:
+   - Added `users.status` (`'active' | 'suspended'`), enforced in `requireUser()` (`403 account_suspended`).
+   - Added `chapters.revision` (monotonic integer for optimistic concurrency control), `chapters.generatedContentJson` (separating AI-generated baseline from user-edited content), and `chapters.lastJobId`.
+   - Added `chapter_versions.novelId`, `chapter_versions.revisionType` (`'generation' | 'autosave' | 'manual' | 'conflict' | 'pre_restore' | 'restore'`), and `chapter_versions.parentVersionId`.
+   - Added `generation_jobs.chapterId`, `generation_jobs.errorCode`, and `generation_jobs.retryable`.
+   - Added `ai_usage.chapterId`, `ai_usage.jobId`, and `ai_usage.estimatedCostBeforeUsd`.
+   - Added `novel_backups` table and composite indexes (`idx_chapters_novel_status`, `idx_versions_chapter_num`, `idx_jobs_novel_status`, `idx_ai_usage_novel_created`).
+
+2. **Fixed Premise & Outline Persistence Bugs (`src/services/preparation/service.ts`, `src/services/outlines/service.ts`, `src/services/novels/service.ts`)**:
+   - Fixed `updatePremiseField` parameter bind count (`vals.push(now, novelId, novelId, userId)` for the 4 trailing `?` placeholders), added column allowlisting, transactional upsert when a premise row does not yet exist, and `404` on unknown novel.
+   - Added column allowlisting and transactional unapproved chapter title synchronization to `updateOutline`.
+   - Added `updateNovel` and `PATCH /api/novels/[id]`, plus `limit`/`offset` pagination on `listNovels` and `GET /api/novels`.
+
+3. **Autosave, Optimistic Concurrency, Draft Recovery & Revision History (`src/services/chapters/service.ts`, `src/lib/editor/draft-recovery.ts`, `src/components/editor/WritingWorkspace.tsx`, `src/app/api/novels/[id]/chapters/[chapterId]/versions/route.ts`)**:
+   - Implemented `expectedRevision` optimistic concurrency checking in `saveChapterContent`. Stale saves return `409 revision_conflict` while automatically preserving the incoming draft as a `revisionType = 'conflict'` snapshot in `chapter_versions`.
+   - Implemented `createAutosaveController` and browser draft recovery (`saveLocalDraft`, `loadLocalDraft`, `hasRecoverableDraft`, `clearLocalDraft`, `listUnsavedDraftsForNovel`, bounded at `MAX_RECOVERY_ENTRIES = 20`) with debounced autosave, manual save (`Cmd/Ctrl+S`), bounded exponential backoff retries, out-of-order response protection, and `beforeunload` warning.
+   - Added `GET` and `POST` `/api/novels/[id]/chapters/[chapterId]/versions` and a Revision History panel in `WritingWorkspace.tsx` to inspect, create snapshots, and non-destructively restore earlier versions (recording `pre_restore` and `restore` snapshots).
+
+4. **AI Job Lifecycle, Cancellation, Error Classification & Cost Estimation (`src/lib/queue/index.ts`, `src/app/api/jobs/[jobId]/route.ts`, `src/lib/ai/pricing.ts`, `src/lib/ai/usage.ts`, `src/lib/ai/text-generation.ts`, `src/lib/ai/embeddings.ts`)**:
+   - Added `classifyJobError`, `NonRetryableJobError`, `sanitizeErrorMessage`, `awaiting_review` job status, mid-flight cancellation check (`isCancelled()`), and owner-scoped job cancellation/retry endpoints (`POST` and `DELETE /api/jobs/[jobId]`).
+   - Added `estimateOperationCost`, `novelUsageSummary`, transient provider retries with exponential backoff + jitter (`isRetryableProviderError`), and bounded embedding LRU cache (`MAX_EMBEDDING_CACHE = 256`).
+
+5. **Verified Project Backups, Transactional Restore & Health Endpoint (`src/services/backups/service.ts`, `src/app/api/novels/[id]/backup/route.ts`, `src/app/api/novels/restore/route.ts`, `src/app/api/health/route.ts`, `src/lib/config/env.ts`, `src/lib/logger/index.ts`)**:
+   - Implemented SHA-256 checksum-verified novel backup export (`createNovelBackup`), credential exclusion, and transactional restore (`restoreNovelBackup`) plus online SQLite backup (`backupSqliteDatabaseFile`).
+   - Added `GET /api/health`, startup config validation (`validateEnvConfig`), and secret-redacting structured logging (`logger`).
+   - Expanded automated test suite from 15 files (171 tests) to **19 files (188 tests)** — all passing alongside `npm run typecheck`, `npm run lint`, and `npm run build`.
+

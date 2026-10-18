@@ -124,11 +124,15 @@ export function clampCompletionTokens(requested?: number): number {
 export interface UsageRecord {
   userId: string;
   novelId?: string | null;
+  chapterId?: string | null;
+  jobId?: string | null;
   taskType: string;
   provider?: string;
   model: string;
   promptTokens: number;
   completionTokens: number;
+  /** Pre-call estimated cost in USD (stored separately from actual token-based cost). */
+  estimatedCostBeforeUsd?: number;
   /** 'openai' for real calls, 'demo' for deliberate demo-mode output. */
   source?: 'openai' | 'demo' | 'stub';
   meta?: Record<string, unknown>;
@@ -139,17 +143,22 @@ export function recordUsage(input: UsageRecord): void {
   try {
     const db = getDb();
     const price = priceFor(input.model);
-    const cost = input.source === 'demo' || input.source === 'stub'
+    const isDemo = input.source === 'demo' || input.source === 'stub';
+    const cost = isDemo
       ? 0
       : estimateCostUsd(input.model, input.promptTokens, input.completionTokens);
+    const estBefore = isDemo
+      ? 0
+      : (typeof input.estimatedCostBeforeUsd === 'number' ? input.estimatedCostBeforeUsd : cost);
     db.prepare(
-      `INSERT INTO ai_usage (id,userId,novelId,taskType,provider,model,promptTokens,completionTokens,
-                             totalTokens,estimatedCostUsd,createdAt,pricePromptPer1k,priceCompletionPer1k,source,meta)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO ai_usage (id,userId,novelId,chapterId,jobId,taskType,provider,model,promptTokens,completionTokens,
+                             totalTokens,estimatedCostUsd,estimatedCostBeforeUsd,createdAt,pricePromptPer1k,priceCompletionPer1k,source,meta)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
-      nanoid(), input.userId, input.novelId || null, input.taskType,
-      input.provider || 'openai', input.model, input.promptTokens, input.completionTokens,
-      input.promptTokens + input.completionTokens, cost, new Date().toISOString(),
+      nanoid(), input.userId, input.novelId || null, input.chapterId || null, input.jobId || null,
+      input.taskType, input.provider || 'openai', input.model,
+      input.promptTokens, input.completionTokens,
+      input.promptTokens + input.completionTokens, cost, estBefore, new Date().toISOString(),
       price.promptPer1k, price.completionPer1k, input.source || 'openai',
       input.meta ? JSON.stringify(input.meta) : null,
     );
@@ -159,20 +168,59 @@ export function recordUsage(input: UsageRecord): void {
 }
 
 /** Records one image generation (priced per image rather than per token). */
-export function recordImageUsage(input: { userId: string; novelId?: string | null; model: string; images: number; source?: 'openai' | 'demo' }) {
+export function recordImageUsage(input: {
+  userId: string;
+  novelId?: string | null;
+  jobId?: string | null;
+  model: string;
+  images: number;
+  source?: 'openai' | 'demo';
+}) {
   try {
     const db = getDb();
     const cost = input.source === 'demo' ? 0 : estimateImageCostUsd(input.model, input.images);
     db.prepare(
-      `INSERT INTO ai_usage (id,userId,novelId,taskType,provider,model,promptTokens,completionTokens,
-                             totalTokens,estimatedCostUsd,createdAt,pricePromptPer1k,priceCompletionPer1k,source,meta)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO ai_usage (id,userId,novelId,chapterId,jobId,taskType,provider,model,promptTokens,completionTokens,
+                             totalTokens,estimatedCostUsd,estimatedCostBeforeUsd,createdAt,pricePromptPer1k,priceCompletionPer1k,source,meta)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
-      nanoid(), input.userId, input.novelId || null, 'cover', 'openai', input.model,
-      0, 0, 0, cost, new Date().toISOString(), 0, 0,
+      nanoid(), input.userId, input.novelId || null, null, input.jobId || null,
+      'cover', 'openai', input.model,
+      0, 0, 0, cost, cost, new Date().toISOString(), 0, 0,
       input.source || 'openai', JSON.stringify({ images: input.images }),
     );
   } catch (err) {
     console.warn('[ai] recordImageUsage failed:', err);
   }
+}
+
+export function novelUsageSummary(userId: string, novelId: string) {
+  const db = getDb();
+  const totals = db.prepare(
+    `SELECT COUNT(*) AS requests,
+            COALESCE(SUM(promptTokens),0) AS promptTokens,
+            COALESCE(SUM(completionTokens),0) AS completionTokens,
+            COALESCE(SUM(totalTokens),0) AS totalTokens,
+            COALESCE(SUM(estimatedCostBeforeUsd),0) AS estimatedCostBeforeUsd,
+            COALESCE(SUM(estimatedCostUsd),0) AS actualCostUsd
+       FROM ai_usage WHERE userId = ? AND novelId = ?`,
+  ).get(userId, novelId) as any;
+  const byChapter = db.prepare(
+    `SELECT chapterId, taskType, COUNT(*) AS requests,
+            COALESCE(SUM(totalTokens),0) AS totalTokens,
+            COALESCE(SUM(estimatedCostBeforeUsd),0) AS estimatedCostBeforeUsd,
+            COALESCE(SUM(estimatedCostUsd),0) AS actualCostUsd
+       FROM ai_usage WHERE userId = ? AND novelId = ?
+      GROUP BY chapterId, taskType ORDER BY actualCostUsd DESC`,
+  ).all(userId, novelId) as any[];
+  return {
+    novelId,
+    requests: totals?.requests ?? 0,
+    promptTokens: totals?.promptTokens ?? 0,
+    completionTokens: totals?.completionTokens ?? 0,
+    totalTokens: totals?.totalTokens ?? 0,
+    estimatedCostBeforeUsd: Math.round((totals?.estimatedCostBeforeUsd ?? 0) * 1e6) / 1e6,
+    actualCostUsd: Math.round((totals?.actualCostUsd ?? 0) * 1e6) / 1e6,
+    byChapter,
+  };
 }

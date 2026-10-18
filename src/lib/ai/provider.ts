@@ -56,8 +56,8 @@ export function resetOpenAIForTests() {
   _clientKey = null;
 }
 
-export { estimateCostUsd, estimateImageCostUsd, priceFor } from './pricing';
-export { recordUsage, recordImageUsage, assertAiBudget, checkAiBudget, usageSummary, getAiBudget, clampCompletionTokens } from './usage';
+export { estimateCostUsd, estimateImageCostUsd, estimateOperationCost, priceFor } from './pricing';
+export { recordUsage, recordImageUsage, assertAiBudget, checkAiBudget, usageSummary, novelUsageSummary, getAiBudget, clampCompletionTokens } from './usage';
 
 /** Resolves a promise or rejects after `ms`, so a stuck upstream cannot hang a job. */
 export async function withTimeout<T>(promise: Promise<T>, ms: number, label = 'AI request'): Promise<T> {

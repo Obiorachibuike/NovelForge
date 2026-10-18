@@ -33,6 +33,18 @@ export function isHttpError(err: unknown): err is HttpError {
  * and answered with a generic 500 so SQL text, file paths and upstream provider
  * errors never reach the client.
  */
+/**
+ * Redacts API keys, bearer tokens and connection credentials so secrets can
+ * never leak into API error responses.
+ */
+export function redactSecrets(raw: string): string {
+  if (!raw) return raw;
+  return raw
+    .replace(/sk-[A-Za-z0-9_-]{8,}/g, 'sk-[REDACTED]')
+    .replace(/Bearer\s+[A-Za-z0-9._~+/-]+=*/gi, 'Bearer [REDACTED]')
+    .replace(/(redis|postgres|postgresql|mysql|https?):\/\/([^:\s/@]+):([^@\s/]+)@/gi, '$1://$2:[REDACTED]@');
+}
+
 export function errorResponse(err: unknown): Response {
   // Next.js signals "this route is dynamic" with an internal error. It must be
   // rethrown so the framework can handle it, not swallowed into a 500.
@@ -52,11 +64,11 @@ export function errorResponse(err: unknown): Response {
   }
   if (isHttpError(err)) {
     return Response.json(
-      { error: err.message, ...(err.code ? { code: err.code } : {}), ...(err.details ?? {}) },
+      { error: redactSecrets(err.message), ...(err.code ? { code: err.code } : {}), ...(err.details ?? {}) },
       { status: err.status },
     );
   }
-  console.error('[api] unhandled error:', err);
+  console.error('[api] unhandled error:', err instanceof Error ? redactSecrets(err.message) : err);
   return Response.json({ error: 'Internal server error' }, { status: 500 });
 }
 

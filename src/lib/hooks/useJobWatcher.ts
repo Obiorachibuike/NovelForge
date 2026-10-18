@@ -4,8 +4,10 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 export interface WatchedJob {
   id: string;
-  status: 'queued' | 'processing' | 'completed' | 'failed' | 'cancelled';
+  status: 'queued' | 'processing' | 'awaiting_review' | 'completed' | 'failed' | 'cancelled';
   error?: string | null;
+  errorCode?: string | null;
+  retryable?: number | null;
   result?: string | null;
   progress?: number | null;
 }
@@ -52,7 +54,7 @@ export function useJobWatcher(options: JobWatcherOptions = {}) {
         if (res.ok) {
           const data = (await res.json()) as WatchedJob;
           setJob(data);
-          if (data.status === 'completed') {
+          if (data.status === 'completed' || data.status === 'awaiting_review') {
             stop();
             callbacks.current.onComplete?.(data);
             return;

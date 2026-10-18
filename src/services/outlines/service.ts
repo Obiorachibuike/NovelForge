@@ -46,7 +46,7 @@ export async function getNovelContext(novelId: string) {
   return { novel, premise, characters };
 }
 
-async function runOutline({ novelId, userId, payload }: any) {
+export async function runOutline({ novelId, userId, payload }: any) {
   const db = getDb();
   const ctx = await getNovelContext(novelId);
   if (!ctx.novel) throw new Error('Novel not found');
@@ -123,20 +123,46 @@ export async function approveOutline(userId: string, novelId: string) {
   db.prepare(`UPDATE novels SET stage='writing', approvedAt=?, status='writing', updatedAt=? WHERE id=?`).run(now, now, novelId);
 }
 
+const OUTLINE_PATCHABLE_COLUMNS = new Set([
+  'title', 'summary', 'targetWords', 'estimatedPages', 'orderIndex',
+]);
+
 export async function updateOutline(outlineId: string, novelId: string, userId: string, patch: Partial<{title:string; summary:string; targetWords:number; estimatedPages:number; orderIndex:number}>){
   const db = getDb();
+  const novel = db.prepare('SELECT id FROM novels WHERE id = ? AND userId = ?').get(novelId, userId);
+  if (!novel) throw new HttpError(404, 'Novel not found', 'novel_not_found');
+
+  const existing = db.prepare('SELECT * FROM chapter_outlines WHERE id = ? AND novelId = ?').get(outlineId, novelId) as any;
+  if (!existing) throw new HttpError(404, 'Outline chapter not found', 'outline_not_found');
+
   const sets: string[] = []; const vals: any[] = [];
   for (const [k,v] of Object.entries(patch)) {
-    if (v === undefined || v === null) continue;
+    if (v === undefined || v === null || !OUTLINE_PATCHABLE_COLUMNS.has(k)) continue;
     sets.push(`${k}=?`); vals.push(v);
   }
-  if (!sets.length) return;
-  vals.push(outlineId, novelId, novelId, userId);
-  // Placeholder order: sets…, outline id, novel id, novels.id, novels.userId.
-  db.prepare(
-    `UPDATE chapter_outlines SET ${sets.join(',')}
-      WHERE id=? AND novelId=? AND EXISTS(SELECT 1 FROM novels WHERE id=? AND userId=?)`,
-  ).run(...vals);
+  if (!sets.length) return existing;
+
+  const now = new Date().toISOString();
+  const tx = db.transaction(() => {
+    const queryVals = [...vals, outlineId, novelId, novelId, userId];
+    // Placeholder order: sets…, outline id, novel id, novels.id, novels.userId.
+    db.prepare(
+      `UPDATE chapter_outlines SET ${sets.join(',')}
+        WHERE id=? AND novelId=? AND EXISTS(SELECT 1 FROM novels WHERE id=? AND userId=?)`,
+    ).run(...queryVals);
+
+    // Keep unapproved chapter titles synchronized with outline edits.
+    if (typeof patch.title === 'string' && patch.title.trim()) {
+      db.prepare(
+        `UPDATE chapters SET title=?, updatedAt=?
+          WHERE novelId=? AND (outlineId=? OR chapterNumber=?) AND status != 'approved'`,
+      ).run(patch.title.trim(), now, novelId, outlineId, existing.chapterNumber);
+    }
+    db.prepare(`UPDATE novels SET updatedAt=? WHERE id=? AND userId=?`).run(now, novelId, userId);
+  });
+  tx();
+
+  return db.prepare('SELECT * FROM chapter_outlines WHERE id = ? AND novelId = ?').get(outlineId, novelId) as any;
 }
 
 function buildDemoOutline(novel: any) {

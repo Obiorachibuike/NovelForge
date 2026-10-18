@@ -5,6 +5,7 @@ import { premisePrompt } from '@/lib/ai/prompts';
 import { embed } from '@/lib/ai/embeddings';
 import { serialize } from '@/lib/ai/embeddings';
 import { registerHandler } from '@/lib/queue';
+import { HttpError } from '@/lib/api/http';
 import { z } from 'zod';
 import 'server-only';
 
@@ -43,7 +44,7 @@ export async function getPremise(novelId: string) {
   return db.prepare('SELECT * FROM premises WHERE novelId = ?').get(novelId) as any;
 }
 
-async function runPremise({ novelId, userId }: { novelId:string; userId:string }) {
+export async function runPremise({ novelId, userId }: { novelId:string; userId:string }) {
   const db = getDb();
   const novel = db.prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as any;
   if (!novel) throw new Error('Novel not found');
@@ -168,21 +169,46 @@ function protagonistName(title: string) {
   return 'Alex';
 }
 
+const PREMISE_PATCHABLE_COLUMNS = new Set([
+  'logline', 'shortSynopsis', 'fullSynopsis', 'themes', 'setting', 'majorConflicts',
+]);
+
 export async function updatePremiseField(novelId: string, userId: string, patch: Record<string,unknown>) {
   const db = getDb();
   const novel = db.prepare('SELECT * FROM novels WHERE id=? AND userId=?').get(novelId, userId);
-  if (!novel) throw new Error('Novel not found');
+  if (!novel) throw new HttpError(404, 'Novel not found', 'novel_not_found');
+
+  const entries = Object.entries(patch).filter(
+    ([k, v]) => v !== undefined && PREMISE_PATCHABLE_COLUMNS.has(k),
+  );
+  if (!entries.length) return getPremise(novelId);
+
+  const now = new Date().toISOString();
   const existing = await getPremise(novelId);
-  const sets: string[] = []; const vals: any[] = [];
-  for (const [k,v] of Object.entries(patch)) {
-    sets.push(`${k} = ?`); vals.push(typeof v === 'object' ? JSON.stringify(v) : v);
-  }
-  vals.push(new Date().toISOString(), novelId, userId);
-  // novelId is bound twice (SET ... WHERE novelId=? AND EXISTS(… novels.id=? AND userId=?))
-  // in placeholder order: sets, updatedAt, novelId, novelId, userId.
-  db.prepare(
-    `UPDATE premises SET ${sets.join(', ')}, updatedAt=?
-      WHERE novelId=? AND EXISTS(SELECT 1 FROM novels WHERE id=? AND userId=?)`,
-  ).run(...vals);
+
+  const tx = db.transaction(() => {
+    if (!existing) {
+      db.prepare(
+        `INSERT INTO premises (id,novelId,logline,shortSynopsis,fullSynopsis,themes,setting,majorConflicts,createdAt,updatedAt)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      ).run(nanoid(), novelId, null, null, null, '[]', null, '[]', now, now);
+    }
+
+    const sets: string[] = [];
+    const vals: any[] = [];
+    for (const [k, v] of entries) {
+      sets.push(`${k} = ?`);
+      vals.push(v !== null && typeof v === 'object' ? JSON.stringify(v) : v);
+    }
+    // Placeholder order: sets, updatedAt, novelId, novels.id, novels.userId.
+    vals.push(now, novelId, novelId, userId);
+    db.prepare(
+      `UPDATE premises SET ${sets.join(', ')}, updatedAt=?
+        WHERE novelId=? AND EXISTS(SELECT 1 FROM novels WHERE id=? AND userId=?)`,
+    ).run(...vals);
+    db.prepare(`UPDATE novels SET updatedAt=? WHERE id=? AND userId=?`).run(now, novelId, userId);
+  });
+  tx();
+
   return getPremise(novelId);
 }

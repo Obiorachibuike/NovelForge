@@ -1,7 +1,8 @@
 import { getDb } from '@/lib/db';
 import { requireUser } from '@/lib/db/ownership';
 import { apiHandler, HttpError } from '@/lib/api/http';
-import { readFile } from '@/lib/storage';
+import { readFile, contentTypeFor } from '@/lib/storage';
+import { readCandidateCoverBytes } from '@/services/covers/cloudinary-cover-service';
 
 /**
  * Authenticated file delivery for generated covers and exports.
@@ -24,7 +25,14 @@ export const GET = apiHandler(async (_req: Request, ctx: { params: { key: string
   if (!ownerId) throw new HttpError(404, 'File not found', 'file_not_found');
   if (ownerId !== user.id) throw new HttpError(404, 'File not found', 'file_not_found');
 
-  const file = await readFile(key);
+  let file = await readFile(key);
+  if (!file && asset) {
+    const candidateBuf = await readCandidateCoverBytes(key);
+    if (candidateBuf) {
+      const ext = key.split('.').pop() || 'png';
+      file = { data: candidateBuf, contentType: contentTypeFor(ext) };
+    }
+  }
   if (!file) throw new HttpError(404, 'File not found', 'file_not_found');
 
   const filename = key.split('/').pop() || 'download';
