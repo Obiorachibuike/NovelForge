@@ -1,5 +1,12 @@
-import { getOpenAI, aiConfig, recordUsage } from './provider';
+import { getOpenAI, aiConfig, recordUsage, withTimeout, assertAiBudget, estimateCostUsd } from './provider';
 import 'server-only';
+
+const MAX_EMBEDDING_CACHE = 256;
+const embeddingCache = new Map<string, number[]>();
+
+export function clearEmbeddingCacheForTests() {
+  embeddingCache.clear();
+}
 
 /**
  * Produce an embedding vector for the given text. Falls back to a cheap
@@ -7,20 +14,45 @@ import 'server-only';
  * story-memory retrieval still returns *something* in demo mode.
  */
 export async function embed(text: string, userId: string, novelId?: string): Promise<number[]> {
+  const trimmed = (text || '').slice(0, 8000);
   const client = getOpenAI();
-  if (!client) return stubEmbedding(text);
-  const resp = await client.embeddings.create({
-    model: aiConfig.embeddingModel,
-    input: text.slice(0, 8000),
-  });
+  if (!client) return stubEmbedding(trimmed);
+
+  const cacheKey = `${aiConfig.embeddingModel}:${trimmed}`;
+  const cached = embeddingCache.get(cacheKey);
+  if (cached) return cached;
+
+  const estTokens = Math.ceil(trimmed.length / 4);
+  assertAiBudget(userId, estTokens);
+  const estimatedCostBeforeUsd = estimateCostUsd(aiConfig.embeddingModel, estTokens, 0);
+
+  const resp = await withTimeout(
+    client.embeddings.create({
+      model: aiConfig.embeddingModel,
+      input: trimmed,
+    }, { timeout: aiConfig.timeoutMs }),
+    aiConfig.timeoutMs,
+    'embedding generation',
+  );
   const vec = resp.data[0].embedding;
   const usage = resp.usage;
   if (usage) {
-    await recordUsage({
-      userId, novelId, taskType: 'embedding', model: aiConfig.embeddingModel,
-      promptTokens: usage.prompt_tokens, completionTokens: 0,
+    recordUsage({
+      userId,
+      novelId,
+      taskType: 'embedding',
+      model: aiConfig.embeddingModel,
+      promptTokens: usage.prompt_tokens,
+      completionTokens: 0,
+      estimatedCostBeforeUsd,
+      source: 'openai',
     });
   }
+  if (embeddingCache.size >= MAX_EMBEDDING_CACHE) {
+    const oldest = embeddingCache.keys().next().value;
+    if (oldest) embeddingCache.delete(oldest);
+  }
+  embeddingCache.set(cacheKey, vec);
   return vec;
 }
 

@@ -69,3 +69,73 @@ export function estimateImageCostUsd(model: string, images = 1): number {
   const unit = key ? IMAGE_PRICES[key] : 0.04;
   return Math.round(unit * images * 1e6) / 1e6;
 }
+
+export interface OperationCostEstimateInput {
+  taskType: string;
+  model?: string;
+  promptChars?: number;
+  targetWords?: number;
+  imageVariants?: number;
+  demoMode?: boolean;
+}
+
+export interface OperationCostEstimate {
+  taskType: string;
+  model: string;
+  demoMode: boolean;
+  estimatedPromptTokens: number;
+  estimatedCompletionTokens: number;
+  estimatedTotalTokens: number;
+  estimatedCostUsd: number;
+  providerCostUsd: number;
+}
+
+/**
+ * Estimates expected token and USD cost before an AI operation runs.
+ */
+export function estimateOperationCost(input: OperationCostEstimateInput): OperationCostEstimate {
+  const demoMode = Boolean(input.demoMode);
+  if (input.taskType === 'cover') {
+    const model = input.model || process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1';
+    const variants = Math.max(1, input.imageVariants ?? 2);
+    const providerCostUsd = estimateImageCostUsd(model, variants);
+    return {
+      taskType: 'cover',
+      model,
+      demoMode,
+      estimatedPromptTokens: 0,
+      estimatedCompletionTokens: 0,
+      estimatedTotalTokens: 0,
+      estimatedCostUsd: demoMode ? 0 : providerCostUsd,
+      providerCostUsd,
+    };
+  }
+
+  const model = input.model || process.env.OPENAI_TEXT_MODEL || 'gpt-4o-mini';
+  const promptTokens = input.promptChars
+    ? Math.ceil(input.promptChars / 4)
+    : input.taskType === 'chapter'
+      ? 2200
+      : input.taskType === 'outline' || input.taskType === 'premise'
+        ? 1600
+        : 900;
+  const completionTokens = input.targetWords
+    ? Math.ceil(input.targetWords * 1.35)
+    : input.taskType === 'chapter'
+      ? 3200
+      : input.taskType === 'outline' || input.taskType === 'premise'
+        ? 1800
+        : 800;
+
+  const providerCostUsd = estimateCostUsd(model, promptTokens, completionTokens);
+  return {
+    taskType: input.taskType,
+    model,
+    demoMode,
+    estimatedPromptTokens: promptTokens,
+    estimatedCompletionTokens: completionTokens,
+    estimatedTotalTokens: promptTokens + completionTokens,
+    estimatedCostUsd: demoMode ? 0 : providerCostUsd,
+    providerCostUsd,
+  };
+}

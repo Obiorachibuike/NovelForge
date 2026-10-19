@@ -1,76 +1,59 @@
-# Persistent storage
+# Storage & Cloudinary Cover-Image Workflow
 
-NovelForge writes two kinds of generated file:
+NovelForge uses **Cloudinary** as the permanent storage provider for user-selected AI-generated novel cover images (`src/services/covers/cloudinary-cover-service.ts`), while keeping unselected cover candidate variations temporary so provider storage is never polluted with discarded drafts.
 
-| Artefact | Folder prefix | Notes |
-| --- | --- | --- |
-| Cover concepts (PNG/JPG from the image provider, SVG demo/fallback) | `covers/` | up to 24 concepts per novel |
-| Exports (`.txt`, `.md`, `.docx`, `.pdf`, `.epub`) | `exports/` | written by the `export` job |
+---
 
-Every file is recorded in the database (`image_assets.storageKey`,
-`exports.fileKey`) and downloaded through `GET /api/files/<key>`, which resolves
-the row and checks that the caller owns it. Nothing is served from `public/`
-any more, so cover and manuscript URLs are private by default.
+## 1. Environment Variables
 
-## Choosing a driver
+Configure these server-only environment variables in `.env.local` or your deployment secret manager (never prefix `CLOUDINARY_API_SECRET` with `NEXT_PUBLIC_`):
 
-```
-STORAGE_PROVIDER=local | s3 | cloudinary
+```env
+STORAGE_PROVIDER="cloudinary"
+CLOUDINARY_CLOUD_NAME="your-cloud-name"
+CLOUDINARY_API_KEY="your-cloudinary-api-key"
+CLOUDINARY_API_SECRET="your-cloudinary-api-secret"
+CLOUDINARY_FOLDER="novelforge"
 ```
 
-* **`local`** (default) — `<DATA_DIR>/uploads/<key>`, where `DATA_DIR` defaults
-  to `./.data`. Works for local development and a single long-lived server.
-  Files written by older versions into `public/uploads` are moved into the new
-  location on first use and their URLs are rewritten in the database.
-  `local` deliberately throws on Vercel: the filesystem there is ephemeral and
-  a redeploy would silently lose every cover and export.
-* **`s3`** — any S3-compatible object store. Implemented in-process with a
-  dependency-free AWS Signature V4 signer (`src/lib/storage/s3-signature.ts`),
-  verified against the published AWS test vector in
-  `tests/storage/sigv4.test.ts`.
-* **`cloudinary`** — image uploads only. Exports cannot be stored on Cloudinary,
-  so `cloudinary` is rejected for export files. *This driver has not been
-  exercised against a live Cloudinary account in this repository.*
+---
 
-## S3 / R2 / B2 / MinIO configuration
+## 2. Folder & Public ID Convention
 
-```
-STORAGE_PROVIDER=s3
-S3_BUCKET=my-novelforge-bucket
-S3_REGION=eu-central-1
-S3_ACCESS_KEY_ID=...
-S3_SECRET_ACCESS_KEY=...
-# Optional
-S3_ENDPOINT=https://<accountid>.r2.cloudflarestorage.com   # non-AWS only
-S3_FORCE_PATH_STYLE=true                                   # required by MinIO/B2
-S3_PREFIX=novelforge                                        # key prefix in the bucket
-S3_PUBLIC_BASE_URL=https://cdn.example.com                  # only if you front the bucket with a CDN
-```
+Every permanently saved novel cover is stored in Cloudinary under a predictable user-and-novel-scoped namespace:
 
-Startup behaviour: `readS3Config()` throws
-`S3 storage is selected but S3_BUCKET, … is not set. See docs/storage.md.`
-as soon as a save/read is attempted, so a half-configured deployment fails
-loudly instead of dropping files.
+- **Folder**: `novelforge/covers/<user-id>/<novel-id>`
+- **Public ID**: `novelforge/covers/<user-id>/<novel-id>/cover_<image-id>`
 
-Objects are uploaded with a signed `PUT` and a `content-type`; reads and deletes
-are signed the same way. With `S3_PREFIX`, every object lives under that prefix.
+This scoping guarantees that `deleteCloudinaryCover()` can verify ownership (`publicId.startsWith('novelforge/covers/<userId>/<novelId>/')`) before issuing a signed destroy request, preventing any cross-user asset deletion.
 
-## Verifying a deployment
+---
 
-1. Generate a cover concept; the response contains `url: /api/files/covers/...`.
-2. Confirm the object exists in the bucket under the configured prefix.
-3. Restart the app (or redeploy) and download the same URL again — it must still
-   resolve, because both the row and the object are outside the instance.
-4. Try the URL while signed in as a different user: it must return 404.
+## 3. Image Content Validation
 
-## Tests
+Before any cover image is stored or uploaded to Cloudinary, `validateCoverImageBuffer()` in `src/services/covers/cloudinary-cover-service.ts`:
+1. Enforces a strict maximum size limit (`MAX_COVER_IMAGE_BYTES = 10 MB`).
+2. Inspects the actual binary magic bytes / XML structure rather than trusting file extensions or MIME headers:
+   - **PNG**: `89 50 4E 47 0D 0A 1A 0A` (and extracts IHDR width/height)
+   - **JPEG**: `FF D8 FF`
+   - **WebP**: `RIFF....WEBP`
+   - **SVG**: Valid `<svg>...</svg>` XML without `<script>` tags or `on*=` inline event handlers.
 
-```
-npx vitest run tests/storage
-```
+---
 
-`tests/storage/s3-driver.test.ts` runs the real driver against a local
-S3-shaped HTTP server and asserts the signed request, the object path (bucket +
-prefix), read-back, delete, CDN URL rewriting and the missing-credential error.
-`tests/storage/sigv4.test.ts` checks the signer against AWS's documented
-`GET Object` example (`f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41`).
+## 4. End-to-End 10-Step Cover Selection Workflow
+
+1. **User creates or opens a novel** (`/novels/[id]/cover`).
+2. **User generates cover image options** (`POST /api/novels/[id]/cover`):
+   - `generateCovers()` generates 1–4 candidate variations (via OpenAI `dall-e-3` or stylized SVG concepts in demo mode).
+   - When `STORAGE_PROVIDER="cloudinary"`, candidate previews are saved to temporary local candidate storage via `saveCandidateCoverPreview()` — **unselected variations are NOT uploaded to Cloudinary**.
+3. **Frontend displays generated cover candidates** (`CoverStudio.tsx`).
+4. **User selects the preferred cover** (`PUT /api/novels/[id]/cover` with `{ imageId }`).
+5. **Backend verifies ownership** (`setCover()` in `src/services/novels/service.ts` verifies that the authenticated user owns both the novel and the `image_assets` row).
+6. **Backend uploads the selected image to Cloudinary** (`uploadCoverToCloudinary()` signs and uploads the validated buffer to `novelforge/covers/<userId>/<novelId>/cover_<imageId>`).
+7. **Backend saves Cloudinary metadata in the database** (`secureUrl`, `publicId`, `format`, `bytes`, `folder`, `width`, `height`, `uploadedAt`, `updatedAt` in `image_assets`).
+8. **Backend updates the novel record** (`novels.coverImageId = imageId`) inside the same database transaction:
+   - **Rollback Cleanup**: If the database transaction fails after the Cloudinary upload succeeded, `setCover()` immediately calls `deleteCloudinaryCover(uploaded.publicId)` so no orphaned Cloudinary asset remains.
+   - **Replacement Cleanup**: If the novel previously had a different primary cover stored in Cloudinary, `setCover()` calls `deleteCloudinaryCover(previousPrimary.publicId)` after the DB commit.
+9. **Frontend refreshes and displays the saved cover** (`CoverStudio.tsx` displays `c.secureUrl || c.url`, shows a `Cloudinary` badge, and provides an inline **Retry** button if an upload fails).
+10. **Permanent cover persists** across page refreshes, sign-outs/sign-ins, dashboard views (`COALESCE(img.secureUrl, img.url) AS coverUrl`), backups, and deployments.

@@ -3,7 +3,7 @@ import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { toast } from 'sonner';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Sparkles, Check, Wand2, ArrowRight, Loader2, Image as ImageIcon } from 'lucide-react';
+import { Sparkles, Check, Wand2, ArrowRight, Loader2, Image as ImageIcon, RotateCcw } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 
 export default function CoverStudio({ novel, initialCovers }: { novel: any; initialCovers: any[] }) {
@@ -11,18 +11,20 @@ export default function CoverStudio({ novel, initialCovers }: { novel: any; init
   const qc = useQueryClient();
   const [prompt, setPrompt] = useState('');
   const [variants, setVariants] = useState(3);
-  const [selectedId, setSelectedId] = useState<string | null>(initialCovers.find(c=>c.isPrimary)?.id || null);
+  const [selectedId, setSelectedId] = useState<string | null>(initialCovers.find(c => c.isPrimary)?.id || null);
+  const [failedSelectionId, setFailedSelectionId] = useState<string | null>(null);
 
   const { data: covers = initialCovers } = useQuery({
-    queryKey:['covers', novel.id],
-    queryFn: async () => (await fetch(`/api/novels/${novel.id}/cover`).then(r=>r.json())) as any[],
+    queryKey: ['covers', novel.id],
+    queryFn: async () => (await fetch(`/api/novels/${novel.id}/cover`).then(r => r.json())) as any[],
     initialData: initialCovers,
   });
 
   const gen = useMutation({
     mutationFn: async () => {
       const res = await fetch(`/api/novels/${novel.id}/cover`, {
-        method:'POST', headers:{'Content-Type':'application/json'},
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt: prompt || undefined, variants }),
       });
       if (!res.ok) throw new Error((await res.json()).error || 'Generation failed');
@@ -35,21 +37,32 @@ export default function CoverStudio({ novel, initialCovers }: { novel: any; init
       } else {
         toast.success('Cover concepts generated');
       }
-      qc.invalidateQueries({queryKey:['covers',novel.id]});
+      qc.invalidateQueries({ queryKey: ['covers', novel.id] });
     },
-    onError: (e:any) => toast.error(e.message),
+    onError: (e: any) => toast.error(e.message),
   });
 
   const select = useMutation({
     mutationFn: async (imageId: string) => {
       const res = await fetch(`/api/novels/${novel.id}/cover`, {
-        method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ imageId }),
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ imageId }),
       });
-      if (!res.ok) throw new Error((await res.json()).error || 'Failed');
+      if (!res.ok) throw new Error((await res.json()).error || 'Failed to save selected cover');
       return res.json();
     },
-    onSuccess: (_, imageId) => { setSelectedId(imageId); toast.success('Cover selected — story preparation is next'); qc.invalidateQueries({queryKey:['covers',novel.id]}); },
-    onError: (e:any) => toast.error(e.message),
+    onSuccess: (_data, imageId) => {
+      setSelectedId(imageId);
+      setFailedSelectionId(null);
+      toast.success('Cover selected — story preparation is next');
+      qc.invalidateQueries({ queryKey: ['covers', novel.id] });
+      router.refresh();
+    },
+    onError: (e: any, imageId) => {
+      setFailedSelectionId(imageId);
+      toast.error(e.message);
+    },
   });
 
   return (
@@ -57,22 +70,33 @@ export default function CoverStudio({ novel, initialCovers }: { novel: any; init
       <div className="mb-8">
         <div className="label text-primary mb-2">STAGE 2 · COVER</div>
         <h1 className="font-serif text-3xl font-semibold">Give your story a face.</h1>
-        <p className="text-muted-foreground mt-2 max-w-2xl">Generate cover concepts before you begin writing. Pick a primary cover — you can generate more or edit the prompt at any time.</p>
+        <p className="text-muted-foreground mt-2 max-w-2xl">
+          Generate cover concepts before you begin writing. Pick a primary cover — you can generate more or edit the prompt at any time.
+        </p>
       </div>
 
       <div className="surface p-6 mb-8">
         <div className="grid md:grid-cols-[1fr_auto_auto] gap-4 items-end">
           <div>
             <label className="label block mb-2">Cover prompt (optional)</label>
-            <input className="input" placeholder="Leave blank for an auto-generated cinematic hardcover concept" value={prompt} onChange={e=>setPrompt(e.target.value)} />
+            <input
+              className="input"
+              placeholder="Leave blank for an auto-generated cinematic hardcover concept"
+              value={prompt}
+              onChange={e => setPrompt(e.target.value)}
+            />
           </div>
           <div>
             <label className="label block mb-2">Variants</label>
-            <select className="input" value={variants} onChange={e=>setVariants(+e.target.value)}>
-              {[1,2,3,4].map(n=><option key={n} value={n}>{n}</option>)}
+            <select className="input" value={variants} onChange={e => setVariants(+e.target.value)}>
+              {[1, 2, 3, 4].map(n => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
             </select>
           </div>
-          <button className="btn-primary" onClick={()=>gen.mutate()} disabled={gen.isPending}>
+          <button className="btn-primary" onClick={() => gen.mutate()} disabled={gen.isPending}>
             {gen.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
             Generate concepts
           </button>
@@ -92,44 +116,69 @@ export default function CoverStudio({ novel, initialCovers }: { novel: any; init
       )}
 
       <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-6 mb-10">
-        {covers.map((c:any) => (
-          <div key={c.id} className={cn('surface p-3 card-hover', c.id===selectedId && 'border-primary shadow-[0_0_0_1px_hsl(var(--primary))]')}>
+        {covers.map((c: any) => (
+          <div
+            key={c.id}
+            className={cn(
+              'surface p-3 card-hover',
+              c.id === selectedId && 'border-primary shadow-[0_0_0_1px_hsl(var(--primary))]',
+            )}
+          >
             <div className="aspect-[3/4] rounded-md overflow-hidden border border-white/10 relative mb-3">
               {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={c.url} alt="" className="w-full h-full object-cover" />
-              {c.id===selectedId && <div className="absolute top-2 right-2 bg-primary text-primary-foreground rounded-full p-1"><Check className="w-3 h-3" /></div>}
+              <img src={c.secureUrl || c.url} alt="" className="w-full h-full object-cover" />
+              {c.id === selectedId && (
+                <div className="absolute top-2 right-2 bg-primary text-primary-foreground rounded-full p-1">
+                  <Check className="w-3 h-3" />
+                </div>
+              )}
             </div>
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <div className="min-w-0">
                 <div className="text-sm font-semibold truncate">
                   {c.isPrimary ? 'Primary cover' : 'Concept'}
                   {c.provider === 'demo-svg' && <span className="chip chip-muted ml-2">demo</span>}
                   {c.provider === 'svg-fallback' && <span className="chip chip-warning ml-2">placeholder</span>}
+                  {c.publicId && <span className="chip chip-success ml-2">Cloudinary</span>}
                 </div>
                 <div className="text-xs text-muted-foreground">{new Date(c.createdAt).toLocaleDateString()}</div>
               </div>
               {c.id !== selectedId ? (
-                <button className="btn-outline text-xs px-3 py-1.5" onClick={()=>select.mutate(c.id)} disabled={select.isPending}>Set primary</button>
+                <button
+                  className="btn-outline text-xs px-3 py-1.5"
+                  onClick={() => select.mutate(c.id)}
+                  disabled={select.isPending}
+                >
+                  {failedSelectionId === c.id ? (
+                    <span className="inline-flex items-center gap-1">
+                      <RotateCcw className="w-3 h-3" /> Retry
+                    </span>
+                  ) : (
+                    'Set primary'
+                  )}
+                </button>
               ) : (
                 <span className="chip chip-primary">Selected</span>
               )}
             </div>
           </div>
         ))}
-        {gen.isPending && Array.from({length: variants}).map((_,i)=>(
-          <div key={i} className="surface p-3">
-            <div className="aspect-[3/4] rounded-md shimmer mb-3" />
-            <div className="h-4 w-1/3 bg-white/5 rounded shimmer mb-2" />
-            <div className="h-3 w-1/2 bg-white/5 rounded shimmer" />
-          </div>
-        ))}
+        {gen.isPending &&
+          Array.from({ length: variants }).map((_, i) => (
+            <div key={i} className="surface p-3">
+              <div className="aspect-[3/4] rounded-md shimmer mb-3" />
+              <div className="h-4 w-1/3 bg-white/5 rounded shimmer mb-2" />
+              <div className="h-3 w-1/2 bg-white/5 rounded shimmer" />
+            </div>
+          ))}
       </div>
 
       <div className="flex justify-end">
         <button
           className="btn-primary"
           disabled={!selectedId}
-          onClick={()=>router.push(`/novels/${novel.id}/prepare`)}>
+          onClick={() => router.push(`/novels/${novel.id}/prepare`)}
+        >
           Continue to Preparation <ArrowRight className="w-4 h-4" />
         </button>
       </div>

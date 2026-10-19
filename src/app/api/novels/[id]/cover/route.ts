@@ -24,6 +24,6 @@ export const PUT = apiHandler(async (req: Request, ctx: { params: { id: string }
   const user = await requireUser();
   await requireNovel(ctx.params.id, user.id);
   const { imageId } = await readJsonBody(req, v => coverSelectSchema.parse(v));
-  await setCover(ctx.params.id, user.id, imageId);
-  return Response.json({ ok: true });
+  const result = await setCover(ctx.params.id, user.id, imageId);
+  return Response.json(result);
 });

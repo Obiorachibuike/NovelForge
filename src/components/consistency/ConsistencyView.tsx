@@ -2,19 +2,40 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { useRouter } from 'next/navigation';
-import { Loader2, Play, CheckCircle, AlertTriangle, Info, XCircle, ArrowRight, RefreshCw } from 'lucide-react';
+import { Loader2, Play, CheckCircle, AlertTriangle, Info, XCircle, ArrowRight } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
+import { useJobWatcher } from '@/lib/hooks/useJobWatcher';
 
 export default function ConsistencyView({ novel, score, issues, chapterCount, approvedCount, issueCount }: any) {
   const router = useRouter();
   const qc = useQueryClient();
+
+  const { job: checkJob, watch } = useJobWatcher({
+    onComplete: () => {
+      toast.success('Consistency check complete');
+      qc.invalidateQueries();
+      router.refresh();
+    },
+    onFail: (job) => toast.error(`Consistency check failed: ${job.error || 'unknown error'}`),
+  });
+  const isChecking = checkJob?.status === 'queued' || checkJob?.status === 'processing';
+
   const run = useMutation({
     mutationFn: async () => {
       const res = await fetch(`/api/novels/${novel.id}/consistency`, { method:'POST' });
       if (!res.ok) throw new Error((await res.json()).error || 'Failed');
       return res.json();
     },
-    onSuccess: () => { toast.success('Consistency check queued'); setTimeout(()=>{qc.invalidateQueries(); router.refresh();}, 1500); },
+    onSuccess: (data: any) => {
+      if (data?.jobId) {
+        toast.message('Running consistency check…');
+        watch(data.jobId);
+      } else {
+        toast.success('Consistency check complete');
+        qc.invalidateQueries();
+        router.refresh();
+      }
+    },
     onError: (e:any)=>toast.error(e.message),
   });
   const resolve = useMutation({
@@ -34,8 +55,8 @@ export default function ConsistencyView({ novel, score, issues, chapterCount, ap
           <h1 className="font-serif text-3xl font-semibold">Keep every detail true.</h1>
           <p className="text-muted-foreground mt-2 max-w-xl">The consistency engine checks your manuscript against the Story Bible for timeline clashes, world-rule violations, and forgotten threads.</p>
         </div>
-        <button className="btn-primary" onClick={()=>run.mutate()} disabled={run.isPending}>
-          {run.isPending ? <Loader2 className="w-4 h-4 animate-spin"/> : <Play className="w-4 h-4"/>} Run check
+        <button className="btn-primary" onClick={()=>run.mutate()} disabled={run.isPending || isChecking}>
+          {(run.isPending || isChecking) ? <Loader2 className="w-4 h-4 animate-spin"/> : <Play className="w-4 h-4"/>} {isChecking ? 'Checking…' : 'Run check'}
         </button>
       </div>
 

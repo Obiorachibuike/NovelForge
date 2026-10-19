@@ -6,8 +6,16 @@ import { apiHandler, readJsonBody } from '@/lib/api/http';
 import { checkRateLimit } from '@/lib/security/rate-limit';
 import { HttpError } from '@/lib/api/http';
 
-export const GET = apiHandler(async () => {
+export const GET = apiHandler(async (req?: Request) => {
   const user = await requireUser();
+  if (req?.url) {
+    const url = new URL(req.url);
+    const limitParam = url.searchParams.get('limit');
+    const offsetParam = url.searchParams.get('offset');
+    const limit = limitParam ? Number.parseInt(limitParam, 10) : undefined;
+    const offset = offsetParam ? Number.parseInt(offsetParam, 10) : undefined;
+    return Response.json(await listNovels(user.id, { limit, offset }));
+  }
   return Response.json(await listNovels(user.id));
 });
 

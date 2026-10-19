@@ -1,5 +1,6 @@
 import { getDb } from '@/lib/db';
-import { saveFile } from '@/lib/storage';
+import { saveFile, storageProviderName } from '@/lib/storage';
+import { saveCandidateCoverPreview } from '@/services/covers/cloudinary-cover-service';
 import { getOpenAI, aiConfig, recordImageUsage } from '@/lib/ai/provider';
 import { HttpError } from '@/lib/api/http';
 import { nanoid } from 'nanoid';
@@ -44,6 +45,13 @@ export async function generateCovers(userId: string, novelId: string, promptOver
   const width = 768, height = 1024;
   const prompt = promptOverride || coverPrompt(novel, 'cinematic hardcover');
 
+  const storeCandidate = async (data: Buffer, ext: 'png' | 'svg') => {
+    if (storageProviderName() === 'cloudinary') {
+      return saveCandidateCoverPreview({ data, ext });
+    }
+    return saveFile({ data, folder: 'covers', ext });
+  };
+
   for (let i = 0; i < variants; i++) {
     const client = getOpenAI();
     if (client) {
@@ -58,8 +66,12 @@ export async function generateCovers(userId: string, novelId: string, promptOver
         if (url) {
           const img = await fetch(url);
           buf = Buffer.from(await img.arrayBuffer());
-          const stored = await saveFile({ data: buf, folder: 'covers', ext: 'png' });
-          const id = saveImageRecord(db, { userId, novelId, url: stored.url, key: stored.key, width: 1024, height: 1792, prompt, provider: 'openai' });
+          const stored = await storeCandidate(buf, 'png');
+          const id = saveImageRecord(db, {
+            userId, novelId, url: stored.url, key: stored.key,
+            width: 1024, height: 1792, prompt, provider: 'openai',
+            format: 'png', bytes: buf.length,
+          });
           recordImageUsage({ userId, novelId, model: aiConfig.imageModel, images: 1, source: 'openai' });
           results.push({ imageId: id, url: stored.url, provider: 'openai', source: 'openai' });
           continue;
@@ -72,9 +84,13 @@ export async function generateCovers(userId: string, novelId: string, promptOver
     }
     const fallbackReason = client ? 'OpenAI image generation failed' : undefined;
     const svg = makeSvgCover(novel, i);
-    const stored = await saveFile({ data: svg, folder: 'covers', ext: 'svg' });
+    const stored = await storeCandidate(svg, 'svg');
     const provider = client ? 'svg-fallback' : 'demo-svg';
-    const id = saveImageRecord(db, { userId, novelId, url: stored.url, key: stored.key, width, height, prompt, provider });
+    const id = saveImageRecord(db, {
+      userId, novelId, url: stored.url, key: stored.key,
+      width, height, prompt, provider,
+      format: 'svg', bytes: svg.length,
+    });
     results.push({
       imageId: id, url: stored.url, provider,
       source: client ? 'svg-fallback' : 'demo',
@@ -84,14 +100,15 @@ export async function generateCovers(userId: string, novelId: string, promptOver
   return results;
 }
 
-function saveImageRecord(db: any, { userId, novelId, url, key, width, height, prompt, provider }:{
-  userId:string; novelId:string; url:string; key:string; width:number; height:number; prompt:string; provider:string;
+function saveImageRecord(db: any, { userId, novelId, url, key, width, height, prompt, provider, format, bytes }:{
+  userId:string; novelId:string; url:string; key:string; width:number; height:number; prompt:string; provider:string; format?:string; bytes?:number;
 }) {
   const id = nanoid();
+  const now = new Date().toISOString();
   db.prepare(
-    `INSERT INTO image_assets (id,novelId,userId,kind,provider,storageKey,url,width,height,prompt,isPrimary,meta,createdAt)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
-  ).run(id, novelId, userId, 'cover', provider, key, url, width, height, prompt, 0, null, new Date().toISOString());
+    `INSERT INTO image_assets (id,novelId,userId,kind,provider,storageKey,url,width,height,prompt,isPrimary,meta,format,bytes,createdAt,updatedAt)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).run(id, novelId, userId, 'cover', provider, key, url, width, height, prompt, 0, null, format || null, bytes ?? null, now, now);
   return id;
 }
 
