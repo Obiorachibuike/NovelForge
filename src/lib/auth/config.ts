@@ -6,6 +6,7 @@ import { googleAuthStatus } from './providers';
 import {
   verifyCredentials, resolveGoogleSignIn, recordOAuthAccount, assertAuthConfiguration,
 } from '@/services/auth/service';
+import { classifyDatabaseError, describeDatabaseFailure } from '@/lib/db/errors';
 
 const google = googleAuthStatus();
 const googleEnabled = google.enabled;
@@ -16,6 +17,34 @@ if (google.problem) {
 
 export const authConfig: NextAuthConfig = {
   ...edgeAuthConfig,
+  /**
+   * Auth.js reports every failure of `authorize()` as a generic
+   * `Configuration`/`CallbackRouteError`, which reads like a credentials
+   * problem. When the real cause is environmental (unreachable database,
+   * missing AUTH_SECRET, ...) say so once, with the remediation, in the logs.
+   */
+  logger: {
+    error(error) {
+      // Auth.js nests the real failure a couple of levels down (`cause.err`);
+      // walk it instead of guessing at one fixed shape.
+      const chain: unknown[] = [];
+      let current: any = error;
+      for (let depth = 0; depth < 4 && current; depth++) {
+        chain.push(current);
+        current = current.cause ?? current.err;
+      }
+      for (const candidate of chain) {
+        const failure = classifyDatabaseError(candidate);
+        if (failure) {
+          console.error(
+            `[auth] sign-in blocked by a database problem (${describeDatabaseFailure(failure)}). ${failure.hint}`,
+          );
+          return;
+        }
+      }
+      console.error('[auth] error:', error);
+    },
+  },
   providers: [
     ...(googleEnabled
       ? [Google({

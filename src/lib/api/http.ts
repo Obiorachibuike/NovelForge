@@ -1,5 +1,6 @@
 import 'server-only';
 import { ZodError } from 'zod';
+import { classifyDatabaseError, describeDatabaseFailure } from '@/lib/db/errors';
 
 /**
  * Thrown by guards/helpers to produce a specific HTTP status. Messages on
@@ -66,6 +67,25 @@ export function errorResponse(err: unknown): Response {
     return Response.json(
       { error: redactSecrets(err.message), ...(err.code ? { code: err.code } : {}), ...(err.details ?? {}) },
       { status: err.status },
+    );
+  }
+  // Database failures are environmental, not code faults: answer 503 with the
+  // concrete cause and remediation instead of an opaque 500. The classifier
+  // returns secret-free text, so this is safe to expose (see lib/db/errors.ts).
+  const dbFailure = classifyDatabaseError(err);
+  if (dbFailure) {
+    console.error(
+      `[api] database error (${describeDatabaseFailure(dbFailure)}): ${redactSecrets(
+        err instanceof Error ? err.message : String(err),
+      )}`,
+    );
+    return Response.json(
+      {
+        error: dbFailure.message,
+        code: `database_${dbFailure.kind}`,
+        hint: dbFailure.hint,
+      },
+      { status: 503 },
     );
   }
   console.error('[api] unhandled error:', err instanceof Error ? redactSecrets(err.message) : err);
