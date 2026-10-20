@@ -1,5 +1,7 @@
-import { getDb, databaseStatus } from '@/lib/db';
+import { getDb, databaseStatus, isPostgresUrl } from '@/lib/db';
 import { validateEnvConfig } from '@/lib/config/env';
+import { classifyDatabaseError, databaseTarget, describeDatabaseFailure } from '@/lib/db/errors';
+import { redactSecrets } from '@/lib/api/http';
 
 export const dynamic = 'force-dynamic';
 
@@ -62,11 +64,51 @@ export async function GET() {
       { status: 200, headers: { 'Cache-Control': 'no-store' } },
     );
   } catch (err: any) {
+    // A readiness probe is only useful if it says *what* is broken: report the
+    // concrete database/config failure (secret-free) instead of a generic text.
+    const dbFailure = classifyDatabaseError(err);
+    console.error(
+      `[health] check failed${dbFailure ? ` (${describeDatabaseFailure(dbFailure)})` : ''}: ${redactSecrets(
+        err instanceof Error ? err.message : String(err),
+      )}`,
+    );
+
+    // Configuration errors raised by src/lib/config/env.ts are our own, safe,
+    // actionable messages (missing env var, invalid storage provider, ...).
+    const configMessage =
+      !dbFailure && typeof err?.message === 'string' && err.message.startsWith('[config]')
+        ? err.message.replace(/^\[config\]\s*/, '')
+        : null;
+
     return Response.json(
       {
         status: 'unhealthy',
         timestamp: new Date().toISOString(),
-        error: 'Service health check failed',
+        error: dbFailure?.message ?? configMessage ?? 'Service health check failed',
+        code: dbFailure
+          ? // AUTH_SECRET problems are configuration, not a database outage.
+            dbFailure.kind === 'configuration' && !/DATABASE_URL|database/i.test(dbFailure.message)
+            ? 'invalid_configuration'
+            : `database_${dbFailure.kind}`
+          : configMessage
+            ? 'invalid_configuration'
+            : 'health_check_failed',
+        hint:
+          dbFailure?.hint ??
+          (configMessage
+            ? 'Fix the environment variable named above and redeploy/restart.'
+            : 'Check the server logs for the underlying error.'),
+        database: {
+          driver: isPostgresUrl()
+            ? 'postgres'
+            : process.env.DATABASE_URL
+              ? 'sqlite'
+              : process.env.NODE_ENV === 'production'
+                ? 'unconfigured'
+                : 'sqlite',
+          target: databaseTarget(),
+          connected: false,
+        },
       },
       { status: 503, headers: { 'Cache-Control': 'no-store' } },
     );

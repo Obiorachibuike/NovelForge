@@ -31,12 +31,14 @@ Requires **Node.js 22.x**.
 
 ```bash
 npm ci
-cp .env.example .env          # configure PostgreSQL DATABASE_URL (or local SQLite for offline dev)
+cp .env.example .env.local    # defaults to SQLite (file:./prisma/dev.db) — no database server needed
 npm run db:migrate
 npm run dev
 ```
 
 Open http://localhost:3000. Register with any email/password — no external services required. In demo mode, stylized SVG covers and deterministic chapter text are used.
+
+Local development uses a SQLite file; **production requires PostgreSQL** (`DATABASE_URL=postgresql://…`) and `AUTH_SECRET`. The app refuses to fall back to SQLite in production — see [Troubleshooting](#troubleshooting-login-or-register-fails) if sign-in answers with an error.
 
 ### Environment Variables & Services
 
@@ -54,6 +56,31 @@ Configure the following in `.env` / `.env.local`:
 | `STORAGE_PROVIDER=s3` + `S3_*` | Persistent S3-compatible object storage for exports/files. |
 | `DATA_DIR` | Local file location for `STORAGE_PROVIDER=local` and temporary cover candidate previews (default `.data/`). |
 | `AI_DAILY_TOKEN_LIMIT` / `AI_MONTHLY_COST_LIMIT_USD` | Per-user spend guards enforced from the `ai_usage` table. |
+
+### Troubleshooting: `/login` or `/register` fails
+
+Sign-in and registration are the first requests that touch the database, so a
+bad `DATABASE_URL` (or a missing `AUTH_SECRET`) shows up there first. The server
+never returns a bare `500 Internal server error` for these any more: it answers
+`503` with a `code` and a `hint` that name the cause (credentials in the URL are
+never echoed back).
+
+```bash
+curl -s localhost:3000/api/health | jq   # live diagnosis: error, code, hint, database.target
+```
+
+| Symptom | `code` | Cause & fix |
+| --- | --- | --- |
+| "Nothing is accepting connections…" | `database_unreachable` | No PostgreSQL at that host/port. Start it (`docs/postgresql.md`), or use `DATABASE_URL="file:./prisma/dev.db"` for zero-setup local development. |
+| "Production requires a PostgreSQL DATABASE_URL…" | `database_configuration` | `NODE_ENV=production` with a `file:`/missing URL. Point `DATABASE_URL` at `postgresql://…`, or set `ALLOW_SQLITE_IN_PRODUCTION="true"` intentionally. |
+| "The database rejected the credentials" | `database_authentication` | Wrong user/password in `DATABASE_URL` (SQLSTATE 28P01). |
+| "…schema is missing" | `database_missing_schema` | Reachable database without tables (SQLSTATE 42P01): run `npm run db:migrate`. |
+| "TLS certificate could not be verified" | `database_ssl` | Managed provider with its own CA: set `PG_SSL="no-verify"` (or install the provider CA). |
+| `?error=Configuration` on `/login`, register still works | — | `AUTH_SECRET` is missing, a placeholder, or shorter than 32 chars. Generate one with `openssl rand -base64 48`. |
+
+The server log carries the full classification, e.g.
+`[api] database error (unreachable/ECONNREFUSED at 127.0.0.1:5432/novelforge): …`
+or `[auth] sign-in blocked by a database problem (…). <hint>`.
 
 ### Database & Migration Commands
 

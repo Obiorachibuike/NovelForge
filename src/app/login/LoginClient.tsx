@@ -17,7 +17,7 @@ const OAUTH_ERRORS: Record<string, string> = {
   OAuthCallback: 'Google sign-in did not complete. Please try again.',
   OAuthCreateAccount: 'A NovelForge account could not be created for that Google account.',
   Configuration:
-    'Google sign-in is not configured correctly on this deployment (check AUTH_GOOGLE_ID / AUTH_GOOGLE_SECRET).',
+    'Sign-in is not available: the server is missing required configuration (AUTH_SECRET) or cannot reach its database. Open /api/health for the exact cause.',
   Verification: 'That sign-in link has expired or was already used.',
 };
 
@@ -32,11 +32,28 @@ function LoginForm({ googleEnabled }: { googleEnabled: boolean }) {
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault(); setLoading(true);
-    const res = await signIn('credentials', { email, password, redirect: false });
-    setLoading(false);
-    if (res?.error) { toast.error('Those credentials were not accepted.'); return; }
-    toast.success('Welcome back');
-    router.push(callbackUrl);
+    try {
+      const res = await signIn('credentials', { email, password, redirect: false });
+      if (res?.error) {
+        // Auth.js collapses a thrown `authorize()` (unreachable database, bad
+        // AUTH_SECRET, ...) into `Configuration`. Saying "wrong password" there
+        // sends people down the wrong path, so name the server-side cause.
+        if (res.error === 'Configuration') {
+          toast.error(
+            'Sign-in failed on the server: it cannot reach its database or is missing AUTH_SECRET. Open /api/health for the exact cause.',
+          );
+        } else {
+          toast.error('Those credentials were not accepted.');
+        }
+        return;
+      }
+      toast.success('Welcome back');
+      router.push(callbackUrl);
+    } catch {
+      toast.error('Could not reach the server. Check your connection and try again.');
+    } finally {
+      setLoading(false);
+    }
   }
 
   return <form onSubmit={onSubmit} className="w-full max-w-md space-y-5">

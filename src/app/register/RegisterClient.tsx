@@ -27,17 +27,26 @@ export default function RegisterClient({ googleEnabled }: { googleEnabled: boole
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        toast.error(data.error || 'Could not create your account.');
+        // The API reports database/config outages as 503 with a `hint`; show it
+        // so a self-hosted operator can fix the deployment without guessing.
+        const detail = data.error || 'Could not create your account.';
+        toast.error(data.hint ? `${detail} ${data.hint}` : detail);
         return;
       }
       const signInRes = await signIn('credentials', { email, password, redirect: false });
       if (signInRes?.error) {
-        toast.error('Account created — please sign in.');
+        toast.error(
+          signInRes.error === 'Configuration'
+            ? 'Account created, but sign-in is unavailable: the server cannot reach its database or is missing AUTH_SECRET. Open /api/health for the exact cause.'
+            : 'Account created — please sign in.',
+        );
         router.push('/login');
         return;
       }
       toast.success('Welcome to NovelForge');
       router.push('/dashboard');
+    } catch {
+      toast.error('Could not reach the server. Check your connection and try again.');
     } finally {
       setLoading(false);
     }
