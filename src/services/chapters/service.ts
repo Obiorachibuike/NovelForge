@@ -85,7 +85,7 @@ export async function enqueueChapterGeneration(
   userId: string,
   novelId: string,
   chapterNumber: number,
-  options: { confirmOverwrite?: boolean } = {},
+  options: { confirmOverwrite?: boolean; textModel?: string; allowFallback?: boolean } = {},
 ) {
   const db = getDb();
   const novel = db.prepare('SELECT id FROM novels WHERE id = ? AND userId = ?').get(novelId, userId);
@@ -129,16 +129,21 @@ export async function enqueueChapterGeneration(
     userId,
     novelId,
     chapterId: existing?.id || null,
-    payload: { chapterNumber, confirmOverwrite: !!options.confirmOverwrite },
+    payload: {
+      chapterNumber,
+      confirmOverwrite: !!options.confirmOverwrite,
+      ...(options.textModel ? { textModel: options.textModel } : {}),
+      allowFallback: options.allowFallback !== false,
+    },
     idempotencyKey: `chapter:${novelId}:${chapterNumber}`,
   });
 }
 
-interface ChapterJobPayload { chapterNumber: number; confirmOverwrite?: boolean }
+interface ChapterJobPayload { chapterNumber: number; confirmOverwrite?: boolean; textModel?: string; allowFallback?: boolean }
 
 export async function runChapterGeneration({ id: jobId, novelId, userId, payload, setProgress, isCancelled }: any) {
   const db = getDb();
-  const { chapterNumber, confirmOverwrite } = payload as ChapterJobPayload;
+  const { chapterNumber, confirmOverwrite, textModel, allowFallback } = payload as ChapterJobPayload;
   const novel = db.prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as any;
   if (!novel) throw new Error('Novel not found');
 
@@ -200,7 +205,11 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
     jobId: jobId || undefined,
     taskType: 'chapter',
     allowFallbackOnError: false,
+    ...(textModel ? { model: textModel } : {}),
+    allowModelFallback: allowFallback !== false,
   });
+  // A model-level fallback is a real generation by another eligible model, not
+  // a stub: it is recorded in meta.actualModel and surfaced to the author.
   if (!generated.text.trim()) throw new Error('Provider returned an empty chapter.');
 
   // Guard against a job that was cancelled while the AI request was in flight:

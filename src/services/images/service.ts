@@ -2,9 +2,12 @@ import { getDb } from '@/lib/db';
 import { saveFile, storageProviderName } from '@/lib/storage';
 import { saveCandidateCoverPreview } from '@/services/covers/cloudinary-cover-service';
 import { getOpenAI, aiConfig, recordImageUsage } from '@/lib/ai/provider';
+import { huggingFaceBackendActive } from '@/lib/ai/text-generation';
+import { generateImageHuggingFace } from '@/lib/ai/image-generation';
 import { HttpError } from '@/lib/api/http';
 import { nanoid } from 'nanoid';
 import { coverPrompt } from '@/lib/ai/prompts';
+import { buildCoverPrompt, DEFAULT_COVER_STYLE } from '@/lib/ai/prompt-builder';
 import 'server-only';
 
 export interface GeneratedCover {
@@ -12,8 +15,12 @@ export interface GeneratedCover {
   url: string;
   provider: string;
   /** Where the image really came from, so the UI can label a substitute honestly. */
-  source: 'openai' | 'demo' | 'svg-fallback';
+  source: 'openai' | 'huggingface' | 'demo' | 'svg-fallback';
   fallbackReason?: string;
+  /** The model that produced the image (may differ from the requested one). */
+  actualModel?: string;
+  requestedModel?: string;
+  modelFallbackUsed?: boolean;
 }
 
 /** Hard ceiling per novel so a stuck client cannot run up unbounded image spend. */
@@ -27,7 +34,13 @@ export const MAX_COVERS_PER_NOVEL = 24;
  *   labelled `svg-fallback` with the provider reason instead of being passed
  *   off as a generated image.
  */
-export async function generateCovers(userId: string, novelId: string, promptOverride?: string, variants = 2): Promise<GeneratedCover[]> {
+export async function generateCovers(
+  userId: string,
+  novelId: string,
+  promptOverride?: string,
+  variants = 2,
+  options: { imageModel?: string; allowFallback?: boolean } = {},
+): Promise<GeneratedCover[]> {
   const db = getDb();
   const novel = db.prepare('SELECT * FROM novels WHERE id = ? AND userId = ?').get(novelId, userId) as any;
   if (!novel) throw new HttpError(404, 'Novel not found', 'novel_not_found');
@@ -43,9 +56,9 @@ export async function generateCovers(userId: string, novelId: string, promptOver
 
   const results: GeneratedCover[] = [];
   const width = 768, height = 1024;
-  const prompt = promptOverride || coverPrompt(novel, 'cinematic hardcover');
+  const prompt = promptOverride || buildNovelCoverPrompt(db, novel);
 
-  const storeCandidate = async (data: Buffer, ext: 'png' | 'svg') => {
+  const storeCandidate = async (data: Buffer, ext: 'png' | 'svg' | 'jpg' | 'webp') => {
     if (storageProviderName() === 'cloudinary') {
       return saveCandidateCoverPreview({ data, ext });
     }
@@ -53,6 +66,53 @@ export async function generateCovers(userId: string, novelId: string, promptOver
   };
 
   for (let i = 0; i < variants; i++) {
+    // ── Hugging Face hosted inference (with task-compatible fallback) ───────
+    if (huggingFaceBackendActive()) {
+      try {
+        const generated = await generateImageHuggingFace({
+          ...(options.imageModel ? { modelId: options.imageModel } : {}),
+          prompt,
+          width,
+          height,
+          userId,
+          novelId,
+          taskType: 'cover',
+          allowFallback: options.allowFallback !== false,
+        });
+        const ext = generated.mimeType === 'image/jpeg' ? 'jpg' : generated.mimeType === 'image/webp' ? 'webp' : 'png';
+        const stored = await storeCandidate(generated.image, ext);
+        const id = saveImageRecord(db, {
+          userId, novelId, url: stored.url, key: stored.key,
+          width: generated.width || width, height: generated.height || height, prompt,
+          provider: generated.provider || 'huggingface',
+          format: ext, bytes: generated.image.length,
+          model: generated.actualModelId, requestedModel: generated.requestedModelId,
+        });
+        results.push({
+          imageId: id, url: stored.url, provider: generated.provider || 'huggingface',
+          source: 'huggingface', actualModel: generated.actualModelId,
+          requestedModel: generated.requestedModelId,
+          modelFallbackUsed: generated.fallbackUsed,
+        });
+        continue;
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        console.warn('[images] Hugging Face image generation failed, substituting a labelled SVG concept:', reason);
+        const svg = makeSvgCover(novel, i);
+        const stored = await storeCandidate(svg, 'svg');
+        const id = saveImageRecord(db, {
+          userId, novelId, url: stored.url, key: stored.key,
+          width, height, prompt, provider: 'svg-fallback',
+          format: 'svg', bytes: svg.length,
+        });
+        results.push({
+          imageId: id, url: stored.url, provider: 'svg-fallback',
+          source: 'svg-fallback', fallbackReason: reason,
+        });
+        continue;
+      }
+    }
+
     const client = getOpenAI();
     if (client) {
       let buf: Buffer;
@@ -100,15 +160,52 @@ export async function generateCovers(userId: string, novelId: string, promptOver
   return results;
 }
 
-function saveImageRecord(db: any, { userId, novelId, url, key, width, height, prompt, provider, format, bytes }:{
+/**
+ * Builds a structured cover prompt from the novel's own story bible.
+ *
+ * Uses title, genre, tone, audience, premise, main characters, setting and a
+ * print-composition template. Lettering is deliberately kept out of the image:
+ * diffusion models render text unreliably, so the title is composited later.
+ */
+export function buildNovelCoverPrompt(db: any, novel: any): string {
+  let premise: string | null = null;
+  let setting: string | null = null;
+  let characters: Array<{ name?: string; role?: string; appearance?: string | null }> = [];
+  try {
+    const premiseRow = db.prepare('SELECT logline, shortSynopsis, setting FROM premises WHERE novelId = ?').get(novel.id) as any;
+    premise = premiseRow?.logline || premiseRow?.shortSynopsis || null;
+    setting = premiseRow?.setting || null;
+    characters = db
+      .prepare('SELECT name, role, appearance FROM characters WHERE novelId = ? ORDER BY rowid LIMIT 3')
+      .all(novel.id) as any[];
+  } catch {
+    // A missing story bible must not block cover generation.
+  }
+
+  const { prompt } = buildCoverPrompt({
+    title: novel.title,
+    genre: novel.genre,
+    tone: novel.tone,
+    audience: novel.audience,
+    premise: premise || novel.premise,
+    characters,
+    setting,
+    style: DEFAULT_COVER_STYLE,
+    visualMood: novel.tone,
+  });
+  return prompt;
+}
+
+function saveImageRecord(db: any, { userId, novelId, url, key, width, height, prompt, provider, format, bytes, model, requestedModel }:{
   userId:string; novelId:string; url:string; key:string; width:number; height:number; prompt:string; provider:string; format?:string; bytes?:number;
+  model?: string | null; requestedModel?: string | null;
 }) {
   const id = nanoid();
   const now = new Date().toISOString();
   db.prepare(
-    `INSERT INTO image_assets (id,novelId,userId,kind,provider,storageKey,url,width,height,prompt,isPrimary,meta,format,bytes,createdAt,updatedAt)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-  ).run(id, novelId, userId, 'cover', provider, key, url, width, height, prompt, 0, null, format || null, bytes ?? null, now, now);
+    `INSERT INTO image_assets (id,novelId,userId,kind,provider,storageKey,url,width,height,prompt,isPrimary,meta,format,bytes,model,requestedModel,createdAt,updatedAt)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).run(id, novelId, userId, 'cover', provider, key, url, width, height, prompt, 0, null, format || null, bytes ?? null, model ?? null, requestedModel ?? null, now, now);
   return id;
 }
 

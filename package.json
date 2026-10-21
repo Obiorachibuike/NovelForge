@@ -17,7 +17,10 @@
     "db:migrate": "tsx --tsconfig tsconfig.worker.json scripts/db-migrate.ts",
     "db:status": "tsx --tsconfig tsconfig.worker.json scripts/db-migrate.ts --status",
     "db:migrate:sqlite-to-pg": "tsx --tsconfig tsconfig.worker.json scripts/migrate-sqlite-to-postgres.ts",
-    "admin:grant": "tsx --tsconfig tsconfig.worker.json scripts/grant-admin.ts"
+    "admin:grant": "tsx --tsconfig tsconfig.worker.json scripts/grant-admin.ts",
+    "ai:verify": "tsx --tsconfig tsconfig.worker.json scripts/verify-hf-models.ts",
+    "ai:verify:smoke": "tsx --tsconfig tsconfig.worker.json scripts/verify-hf-models.ts --smoke",
+    "ai:models:report": "tsx --tsconfig tsconfig.worker.json scripts/generate-model-status.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",

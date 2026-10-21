@@ -2,27 +2,45 @@ import { z, type ZodType, type ZodTypeDef } from 'zod';
 import {
   getOpenAI, aiConfig, withTimeout, recordUsage, assertAiBudget, clampCompletionTokens, estimateCostUsd,
 } from './provider';
+import { aiBackend } from './config';
+import { generateStructuredHuggingFace, generateTextHuggingFace } from './hf-text-generation';
 import type { ChatMessage } from '@/types';
 import 'server-only';
 
 /**
  * Where a piece of generated output actually came from.
  *
- * - `openai`   — a real provider response.
- * - `demo`     — deliberate demo mode (no API key, or AI_DEMO_MODE=true).
- * - `fallback` — a real request was attempted and the stub was substituted
- *                because the provider failed or the structured output could not
- *                be parsed. `fallbackReason` explains why, and callers are
- *                expected to surface/log it rather than treat the output as
- *                real. Chapter generation refuses this substitution entirely.
+ * - `openai`      — a real OpenAI response.
+ * - `huggingface` — a real response from a Hugging Face hosted model (possibly
+ *                   a different model than requested: `actualModel` records it,
+ *                   and `fallbackUsed` distinguishes that from a stub).
+ * - `demo`        — deliberate demo mode (no API key, or AI_DEMO_MODE=true).
+ * - `fallback`    — a real request was attempted and the stub was substituted
+ *                   because the provider failed or the structured output could
+ *                   not be parsed. `fallbackReason` explains why, and callers
+ *                   are expected to surface/log it rather than treat the output
+ *                   as real. Chapter generation refuses this substitution.
  */
-export type GenerationSource = 'openai' | 'demo' | 'fallback';
+export type GenerationSource = 'openai' | 'huggingface' | 'demo' | 'fallback';
 
 export interface GenerationMeta {
   source: GenerationSource;
   model: string;
   usedFallback: boolean;
   fallbackReason?: string;
+  /** The model that actually produced the output (differs from `model` when a
+   *  task-compatible fallback model was used). */
+  actualModel?: string;
+  /** True when a different model than requested produced the output. */
+  modelFallbackUsed?: boolean;
+  provider?: string;
+  attempts?: number;
+  latencyMs?: number;
+}
+
+/** True when hosted Hugging Face inference should serve this request. */
+export function huggingFaceBackendActive(): boolean {
+  return aiBackend() === 'huggingface';
 }
 
 export interface TextResult { text: string; meta: GenerationMeta }
@@ -41,6 +59,12 @@ export interface GenerateTextInput {
   signal?: AbortSignal;
   /** When true (default) a provider failure rethrows so the caller decides. */
   allowFallbackOnError?: boolean;
+  /**
+   * Hugging Face backend: allow another *eligible hosted model* to serve the
+   * request when the requested/selected one fails. This is a real generation by
+   * a different model (recorded in `meta.actualModel`), not a stub substitute.
+   */
+  allowModelFallback?: boolean;
   /** Used only when `allowFallbackOnError` is true; defaults to demo prose. */
   fallbackText?: string;
 }
@@ -65,6 +89,57 @@ async function sleepWithJitter(attempt: number, baseMs = 250): Promise<void> {
 
 /** Chat completion that returns plain text plus provenance. */
 export async function generateTextDetailed(input: GenerateTextInput): Promise<TextResult> {
+  // Hugging Face hosted inference (with automatic, task-compatible fallback).
+  if (huggingFaceBackendActive()) {
+    try {
+      const result = await generateTextHuggingFace({
+        messages: input.messages,
+        ...(input.model ? { model: input.model } : {}),
+        temperature: input.temperature ?? 0.8,
+        maxTokens: input.maxTokens,
+        userId: input.userId,
+        novelId: input.novelId,
+        chapterId: input.chapterId,
+        jobId: input.jobId,
+        taskType: input.taskType,
+        signal: input.signal,
+        allowFallback: input.allowModelFallback !== false && input.allowFallbackOnError !== false,
+        deduplicate: true,
+      });
+      if (!result.text.trim()) throw new Error('The model returned an empty response.');
+      return {
+        text: result.text,
+        meta: {
+          source: 'huggingface',
+          model: result.model,
+          usedFallback: false,
+          actualModel: result.model,
+          modelFallbackUsed: result.fallbackUsed,
+          provider: result.provider,
+          attempts: result.attempts,
+          latencyMs: result.latencyMs,
+        },
+      };
+    } catch (err) {
+      // Interactive editing and chapters must never silently receive stub
+      // prose: a real failure is reported so the caller can retry.
+      if (input.allowFallbackOnError) {
+        const reason = errorMessage(err);
+        console.warn(`[ai] ${input.taskType}: Hugging Face generation failed, using labelled fallback — ${reason}`);
+        return {
+          text: input.fallbackText ?? demoTextResponse(input.messages),
+          meta: {
+            source: 'fallback',
+            model: input.model || 'auto',
+            usedFallback: true,
+            fallbackReason: reason,
+          },
+        };
+      }
+      throw err;
+    }
+  }
+
   const client = getOpenAI();
   const model = input.model || aiConfig.textModel;
   if (!client) {
@@ -158,6 +233,8 @@ export interface GenerateStructuredInput<T> {
   signal?: AbortSignal;
   /** Deterministic demo/stub value used in demo mode or after parse failures. */
   fallback: T;
+  /** Allow another eligible hosted model to serve the request (HF backend). */
+  allowModelFallback?: boolean;
   /** Total provider attempts before the fallback is returned (default 2). */
   retries?: number;
 }
@@ -172,6 +249,48 @@ export async function generateStructuredDetailed<T>(
   schema: ZodType<T, ZodTypeDef, unknown>,
   input: GenerateStructuredInput<T>,
 ): Promise<StructuredResult<T>> {
+  // Hugging Face hosted inference (with automatic, task-compatible fallback).
+  if (huggingFaceBackendActive()) {
+    try {
+      const { data, meta } = await generateStructuredHuggingFace<T>({
+        schema,
+        messages: input.messages,
+        ...(input.model ? { model: input.model } : {}),
+        temperature: input.temperature ?? 0.4,
+        userId: input.userId,
+        novelId: input.novelId,
+        chapterId: input.chapterId,
+        jobId: input.jobId,
+        taskType: input.taskType,
+        signal: input.signal,
+        allowFallback: input.allowModelFallback !== false,
+      });
+      return {
+        data,
+        meta: {
+          source: 'huggingface',
+          model: meta.model,
+          usedFallback: false,
+          actualModel: meta.model,
+          modelFallbackUsed: meta.fallbackUsed,
+          provider: meta.provider,
+          attempts: meta.attempts,
+          latencyMs: meta.latencyMs,
+        },
+      };
+    } catch (err) {
+      const reason = errorMessage(err);
+      // Structured output is never invented: an unusable response is a failure
+      // and the caller decides (outline/premise generation aborts, so no
+      // placeholder content is written into the author's story).
+      console.warn(`[ai] ${input.taskType}: Hugging Face structured generation failed — ${reason}`);
+      return {
+        data: input.fallback,
+        meta: { source: 'fallback', model: input.model || 'auto', usedFallback: true, fallbackReason: reason },
+      };
+    }
+  }
+
   const client = getOpenAI();
   const model = input.model || aiConfig.structuredModel;
   if (!client) {

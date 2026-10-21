@@ -3,6 +3,8 @@ import { enqueuePrepareNovel, getPremise } from '@/services/preparation/service'
 import { apiHandler, readJsonBody } from '@/lib/api/http';
 import { prepareSchema } from '@/types';
 import { enforceRateLimit } from '@/lib/security/rate-limit';
+import { enforceAiRateLimit } from '@/lib/ai/rate-limit';
+import { assertRegisteredModel } from '@/lib/ai/model-selection';
 
 export const GET = apiHandler(async (_req: Request, ctx: { params: { id: string } }) => {
   const user = await requireUser();
@@ -14,6 +16,13 @@ export const POST = apiHandler(async (req: Request, ctx: { params: { id: string 
   const user = await requireUser();
   await requireNovel(ctx.params.id, user.id);
   enforceRateLimit('aiGeneration', user.id);
-  await readJsonBody(req, v => prepareSchema.parse(v));
-  return Response.json({ jobId: await enqueuePrepareNovel(user.id, ctx.params.id) });
+  enforceAiRateLimit('text', user.id);
+  const body = await readJsonBody(req, v => prepareSchema.parse(v));
+  const textModel = assertRegisteredModel(body.textModel, 'text-generation');
+  return Response.json({
+    jobId: await enqueuePrepareNovel(user.id, ctx.params.id, {
+      ...(textModel !== 'auto' ? { textModel } : {}),
+      allowFallback: body.allowFallback,
+    }),
+  });
 });

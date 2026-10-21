@@ -1,4 +1,11 @@
 import type { NovelRow, NovelSettingsRow } from '@/types';
+import { compactStoryMemory } from './prompt-builder';
+
+/** Bounds the story memories injected into a chapter prompt. */
+function boundMemories(memories: Array<{ content: string; kind: string }> | undefined): Array<{ content: string; kind: string }> {
+  if (!memories?.length) return [];
+  return memories.slice(0, 8).map(m => ({ kind: m.kind, content: String(m.content || '').replace(/\s+/g, ' ').trim().slice(0, 240) }));
+}
 
 export interface NovelContext {
   novel: NovelRow;
@@ -79,7 +86,10 @@ Chapters must be ordered by chapterNumber starting at 1.`,
 }
 
 export function chapterPrompt(ctx: NovelContext, chapter: { number:number; title:string; summary?:string|null; targetWords:number; charactersInvolved?:string|null; location?:string|null; conflict?:string|null; }, previousSummary?: string) {
-  const memories = (ctx.memories || []).map(m => `- [${m.kind}] ${m.content}`).join('\n');
+  const memories = compactStoryMemory(
+    { previousSummaries: ctx.previousSummary ? [ctx.previousSummary] : [], majorEvents: boundMemories(ctx.memories).map(m => `[${m.kind}] ${m.content}`) },
+    { maxChars: 3_000, maxPreviousSummaries: 1 },
+  );
   return {
     system: buildSystemPrompt(`Write chapter ${chapter.number} of a novel. Write literary, immersive prose. Stay in POV. Do not summarise; dramatize scene by scene. Use dialogue, sensory detail, and interiority. Write to approximately ${chapter.targetWords} words. End the chapter with a new question or hook, not a tidy resolution. Never write meta-commentary. Never explain your choices.`),
     user: `Novel: ${ctx.novel.title}
