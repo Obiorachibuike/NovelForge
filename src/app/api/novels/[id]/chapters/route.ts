@@ -4,6 +4,8 @@ import { listOutlines } from '@/services/outlines/service';
 import { chapterGenerateSchema } from '@/types';
 import { apiHandler, readJsonBody, HttpError } from '@/lib/api/http';
 import { enforceRateLimit } from '@/lib/security/rate-limit';
+import { enforceAiRateLimit } from '@/lib/ai/rate-limit';
+import { assertRegisteredModel } from '@/lib/ai/model-selection';
 import { getDb } from '@/lib/db';
 
 export const GET = apiHandler(async (req: Request, ctx: { params: { id: string } }) => {
@@ -26,6 +28,7 @@ export const POST = apiHandler(async (req: Request, ctx: { params: { id: string 
   const user = await requireUser();
   await requireNovel(ctx.params.id, user.id);
   enforceRateLimit('aiGeneration', user.id);
+  enforceAiRateLimit('text', user.id);
   const body = await readJsonBody(req, v => chapterGenerateSchema.parse(v));
 
   const db = getDb();
@@ -44,8 +47,11 @@ export const POST = apiHandler(async (req: Request, ctx: { params: { id: string 
   }
   if (!chapterNumber) throw new HttpError(409, 'Every scheduled chapter has already been approved.', 'nothing_to_write');
 
+  const textModel = assertRegisteredModel(body.textModel, 'text-generation');
   const jobId = await enqueueChapterGeneration(user.id, ctx.params.id, chapterNumber, {
     confirmOverwrite: body.confirmOverwrite,
+    ...(textModel !== 'auto' ? { textModel } : {}),
+    allowFallback: body.allowFallback,
   });
   return Response.json({ jobId, chapterNumber });
 });

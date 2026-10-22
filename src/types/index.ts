@@ -64,7 +64,11 @@ export const novelSettingsSchema = z.object({
 });
 export type NovelSettingsInput = z.infer<typeof novelSettingsSchema>;
 
-export const prepareSchema = z.object({ sections: z.array(z.string()).optional() });
+export const prepareSchema = z.object({
+  sections: z.array(z.string()).optional(),
+  textModel: z.string().max(200).optional(),
+  allowFallback: z.boolean().default(true),
+});
 
 // ---------- Billing & administration ----------
 export const checkoutSchema = z.object({ plan: z.enum(['author', 'studio']) });
@@ -74,10 +78,29 @@ export const adminUserPatchSchema = z.object({
 }).refine(v => v.role !== undefined || v.freeNovelAccess !== undefined, {
   message: 'Provide role and/or freeNovelAccess.',
 });
+/**
+ * Optional AI model selection.
+ *
+ * `textModel` / `imageModel` must be a registered model id or the literal
+ * "auto"; unknown ids are rejected server-side so the app can never be used as
+ * an open proxy to arbitrary Hugging Face repositories.
+ */
+export const aiModelSelectionSchema = z.object({
+  textModel: z.string().max(200).optional(),
+  imageModel: z.string().max(200).optional(),
+  allowFallback: z.boolean().default(true),
+});
+export type AiModelSelection = z.infer<typeof aiModelSelectionSchema>;
+
 export const outlineSchema = z.object({
   structure: z.enum(['three-act','five-act','heros-journey','custom']).default('three-act'),
+}).merge(aiModelSelectionSchema.partial({ textModel: true, imageModel: true }));
+export const coverGenerateSchema = z.object({
+  prompt: z.string().min(3).max(500).optional(),
+  variants: z.coerce.number().int().min(1).max(4).default(2),
+  imageModel: z.string().max(200).optional(),
+  allowFallback: z.boolean().default(true),
 });
-export const coverGenerateSchema = z.object({ prompt: z.string().min(3).max(500).optional(), variants: z.coerce.number().int().min(1).max(4).default(2) });
 export const coverSelectSchema = z.object({ imageId: z.string().min(1).max(64) });
 export const chapterGenerateSchema = z.object({
   chapterId: z.string().max(64).optional(),
@@ -88,6 +111,8 @@ export const chapterGenerateSchema = z.object({
    * the UI sends after a confirmation prompt.
    */
   confirmOverwrite: z.boolean().default(false),
+  textModel: z.string().max(200).optional(),
+  allowFallback: z.boolean().default(true),
 });
 export const chapterApproveSchema = z.object({});
 export const editorActionSchema = z.object({
@@ -96,6 +121,8 @@ export const editorActionSchema = z.object({
   chapterId: z.string().min(1).max(64),
   before: z.string().max(2000).optional(),
   after: z.string().max(2000).optional(),
+  textModel: z.string().max(200).optional(),
+  allowFallback: z.boolean().default(true),
 });
 export const exportSchema = z.object({
   format: z.enum(['pdf','docx','epub','txt','markdown']),

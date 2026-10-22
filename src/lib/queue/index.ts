@@ -104,6 +104,12 @@ export interface JobRecord {
   errorCode?: string | null;
   retryable?: number | null;
   attempts: number;
+  /** Hosted-inference provenance (which model was asked for, which one answered). */
+  requestedModel?: string | null;
+  actualModel?: string | null;
+  provider?: string | null;
+  fallbackCount?: number | null;
+  durationMs?: number | null;
   maxAttempts: number;
   idempotencyKey: string | null;
   startedAt: string | null;

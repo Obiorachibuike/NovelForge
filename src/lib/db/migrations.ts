@@ -380,6 +380,93 @@ export const migrations: Migration[] = [
       `CREATE INDEX IF NOT EXISTS idx_images_user_novel ON image_assets(userId, novelId)`,
     ],
   },
+  {
+    id: '0008_hf_model_registry',
+    description: 'Hugging Face model registry, verification events, generation provenance and richer AI usage accounting.',
+    statements: [
+      // ── Model registry ────────────────────────────────────────────────────
+      // One row per configured model id. Availability/pricing start as
+      // `unverified`/`unknown` and are only advanced by the verification
+      // service or a successful live inference.
+      `CREATE TABLE IF NOT EXISTS ai_model_registry (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        task TEXT NOT NULL,
+        category TEXT NOT NULL,
+        provider TEXT,
+        availabilityStatus TEXT NOT NULL DEFAULT 'unverified',
+        pricingStatus TEXT NOT NULL DEFAULT 'unknown',
+        license TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        verified INTEGER NOT NULL DEFAULT 0,
+        contextLength INTEGER,
+        supportedSizes TEXT,
+        supportsNegativePrompt INTEGER,
+        limitations TEXT,
+        adapter TEXT,
+        verificationSource TEXT NOT NULL DEFAULT 'unverified',
+        verifiedAt TEXT,
+        lastCheckedAt TEXT,
+        lastSuccessfulAt TEXT,
+        averageLatencyMs REAL,
+        failureCount INTEGER NOT NULL DEFAULT 0,
+        successCount INTEGER NOT NULL DEFAULT 0,
+        isPrimary INTEGER NOT NULL DEFAULT 0,
+        disabledReason TEXT,
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      )`,
+      `CREATE INDEX IF NOT EXISTS idx_model_registry_task ON ai_model_registry(task)`,
+      `CREATE INDEX IF NOT EXISTS idx_model_registry_task_enabled ON ai_model_registry(task, enabled)`,
+      `CREATE INDEX IF NOT EXISTS idx_model_registry_availability ON ai_model_registry(availabilityStatus)`,
+
+      // ── Verification / inference events (recent failures & successes) ─────
+      `CREATE TABLE IF NOT EXISTS ai_model_events (
+        id TEXT PRIMARY KEY,
+        modelId TEXT NOT NULL,
+        task TEXT,
+        kind TEXT NOT NULL,
+        ok INTEGER NOT NULL DEFAULT 0,
+        category TEXT,
+        provider TEXT,
+        latencyMs INTEGER,
+        message TEXT,
+        createdAt TEXT NOT NULL
+      )`,
+      `CREATE INDEX IF NOT EXISTS idx_model_events_model_date ON ai_model_events(modelId, createdAt DESC)`,
+      `CREATE INDEX IF NOT EXISTS idx_model_events_created ON ai_model_events(createdAt DESC)`,
+
+      // ── Generation provenance on jobs ─────────────────────────────────────
+      `ALTER TABLE generation_jobs ADD COLUMN requestedModel TEXT`,
+      `ALTER TABLE generation_jobs ADD COLUMN actualModel TEXT`,
+      `ALTER TABLE generation_jobs ADD COLUMN provider TEXT`,
+      `ALTER TABLE generation_jobs ADD COLUMN fallbackCount INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE generation_jobs ADD COLUMN durationMs INTEGER`,
+      `CREATE INDEX IF NOT EXISTS idx_jobs_requested_model ON generation_jobs(requestedModel)`,
+
+      // ── Richer usage accounting (never fabricated; unknown stays unknown) ──
+      `ALTER TABLE ai_usage ADD COLUMN requestedModel TEXT`,
+      `ALTER TABLE ai_usage ADD COLUMN actualModel TEXT`,
+      `ALTER TABLE ai_usage ADD COLUMN attemptCount INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE ai_usage ADD COLUMN fallbackCount INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE ai_usage ADD COLUMN durationMs INTEGER`,
+      `ALTER TABLE ai_usage ADD COLUMN costStatus TEXT NOT NULL DEFAULT 'unknown'`,
+      `ALTER TABLE ai_usage ADD COLUMN confirmedCostUsd REAL`,
+      `ALTER TABLE ai_usage ADD COLUMN imageWidth INTEGER`,
+      `ALTER TABLE ai_usage ADD COLUMN imageHeight INTEGER`,
+    ],
+  },
+  {
+    id: '0009_generation_provenance',
+    description: 'Per-artefact generation provenance (which model actually produced a cover or chapter).',
+    statements: [
+      `ALTER TABLE image_assets ADD COLUMN model TEXT`,
+      `ALTER TABLE image_assets ADD COLUMN requestedModel TEXT`,
+      `CREATE INDEX IF NOT EXISTS idx_images_model ON image_assets(model)`,
+      `ALTER TABLE chapters ADD COLUMN modelRequested TEXT`,
+      `ALTER TABLE chapters ADD COLUMN modelUsed TEXT`,
+    ],
+  },
 ];
 
 export interface MigrationResult {

@@ -34,9 +34,16 @@ const premiseShape = z.object({
   })).default([]),
 });
 
-export async function enqueuePrepareNovel(userId: string, novelId: string) {
+export async function enqueuePrepareNovel(
+  userId: string,
+  novelId: string,
+  options: { textModel?: string; allowFallback?: boolean } = {},
+) {
   const { enqueue } = await import('@/lib/queue');
-  return enqueue({ type: 'premise', userId, novelId, payload: {} });
+  return enqueue({
+    type: 'premise', userId, novelId,
+    payload: { ...(options.textModel ? { textModel: options.textModel } : {}), allowFallback: options.allowFallback !== false },
+  });
 }
 
 export async function getPremise(novelId: string) {
@@ -44,7 +51,7 @@ export async function getPremise(novelId: string) {
   return db.prepare('SELECT * FROM premises WHERE novelId = ?').get(novelId) as any;
 }
 
-export async function runPremise({ novelId, userId }: { novelId:string; userId:string }) {
+export async function runPremise({ id, novelId, userId, payload }: { id?: string; novelId:string; userId:string; payload?: { textModel?: string; allowFallback?: boolean } }) {
   const db = getDb();
   const novel = db.prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as any;
   if (!novel) throw new Error('Novel not found');
@@ -55,7 +62,10 @@ export async function runPremise({ novelId, userId }: { novelId:string; userId:s
     messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: prompt.user }],
     temperature: 0.7,
     userId, novelId, taskType: 'premise',
+    ...(id ? { jobId: id } : {}),
     fallback,
+    ...(payload?.textModel ? { model: payload.textModel } : {}),
+    allowModelFallback: payload?.allowFallback !== false,
   });
   // In real (non-demo) mode a provider failure must not be written into the
   // author's Story Bible as if it were generated content.

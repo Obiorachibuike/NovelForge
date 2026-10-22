@@ -6,11 +6,14 @@ import { useRouter } from 'next/navigation';
 import { Loader2, Sparkles, ArrowRight, Wand2, RefreshCw, User, MapPin, Scroll } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 import { useJobWatcher } from '@/lib/hooks/useJobWatcher';
+import ModelSelector from '@/components/ai/ModelSelector';
 
 export default function PreparationWorkspace({ novel, premise, characters, worldRules }: any) {
   const router = useRouter();
   const qc = useQueryClient();
   const [activeSection, setActiveSection] = useState('logline');
+  const [textModel, setTextModel] = useState('auto');
+  const [allowFallback, setAllowFallback] = useState(true);
   const hasContent = premise?.logline || characters.length;
 
   // Preparation runs as a durable background job: follow the job row instead of
@@ -27,7 +30,7 @@ export default function PreparationWorkspace({ novel, premise, characters, world
 
   const prep = useMutation({
     mutationFn: async () => {
-      const res = await fetch(`/api/novels/${novel.id}/prepare`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({}) });
+      const res = await fetch(`/api/novels/${novel.id}/prepare`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ textModel, allowFallback }) });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error || 'Preparation failed');
@@ -73,6 +76,17 @@ export default function PreparationWorkspace({ novel, premise, characters, world
               <button onClick={()=>prep.mutate()} className="btn-primary w-full" disabled={prep.isPending || prepRunning}>
                 {(prep.isPending || prepRunning) ? <><Loader2 className="w-4 h-4 animate-spin" /> Preparing…</> : <><Wand2 className="w-4 h-4" /> Generate Story Bible</>}
               </button>
+              <div className="mt-4 pt-4 border-t border-border">
+                <ModelSelector
+                  task="text-generation"
+                  value={textModel}
+                  allowFallback={allowFallback}
+                  onChange={setTextModel}
+                  onAllowFallbackChange={setAllowFallback}
+                  disabled={prep.isPending || prepRunning}
+                  compact
+                />
+              </div>
                       <p className="text-[11px] text-muted-foreground mt-3">You&apos;ll be able to edit and regenerate every section.</p>
             </div>
           ) : (

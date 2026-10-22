@@ -4,6 +4,8 @@ import { editorActionPrompt } from '@/lib/ai/prompts';
 import { editorActionSchema } from '@/types';
 import { apiHandler, readJsonBody, HttpError } from '@/lib/api/http';
 import { enforceRateLimit } from '@/lib/security/rate-limit';
+import { enforceAiRateLimit } from '@/lib/ai/rate-limit';
+import { assertRegisteredModel } from '@/lib/ai/model-selection';
 
 /**
  * Selection-based AI editing.
@@ -16,12 +18,14 @@ export const POST = apiHandler(async (req: Request) => {
   const user = await requireUser();
   const body = await readJsonBody(req, v => editorActionSchema.parse(v));
   enforceRateLimit('aiEditor', user.id);
+  enforceAiRateLimit('text', user.id);
 
   const chapter = await requireChapter(body.chapterId, user.id);
   if (chapter.status === 'approved' && body.action === 'rewrite') {
     throw new HttpError(409, 'This chapter is approved. Unlock it for editing before rewriting it.', 'chapter_approved');
   }
 
+  const textModel = assertRegisteredModel(body.textModel, 'text-generation');
   const prompt = editorActionPrompt(body.action, {
     selection: body.selection || '',
     before: body.before,
@@ -39,7 +43,13 @@ export const POST = apiHandler(async (req: Request) => {
     // Interactive editing must never substitute fabricated prose for a real
     // failure — the author is told and can retry.
     allowFallbackOnError: false,
+    ...(textModel !== 'auto' ? { model: textModel } : {}),
   });
 
-  return Response.json({ text: result.text.trim(), source: result.meta.source });
+  return Response.json({
+    text: result.text.trim(),
+    source: result.meta.source,
+    model: result.meta.actualModel ?? result.meta.model,
+    fallbackUsed: result.meta.modelFallbackUsed ?? false,
+  });
 });

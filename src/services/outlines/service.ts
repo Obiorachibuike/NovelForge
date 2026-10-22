@@ -33,9 +33,22 @@ const outlineShape = z.object({
   })).min(1),
 });
 
-export async function enqueueOutline(userId: string, novelId: string, structureType = 'three-act') {
+export async function enqueueOutline(
+  userId: string,
+  novelId: string,
+  structureType = 'three-act',
+  options: { textModel?: string; allowFallback?: boolean } = {},
+) {
   const { enqueue } = await import('@/lib/queue');
-  return enqueue({ type: 'outline', userId, novelId, payload: { structureType }, idempotencyKey: `outline:${novelId}:${structureType}` });
+  return enqueue({
+    type: 'outline', userId, novelId,
+    payload: {
+      structureType,
+      ...(options.textModel ? { textModel: options.textModel } : {}),
+      allowFallback: options.allowFallback !== false,
+    },
+    idempotencyKey: `outline:${novelId}:${structureType}`,
+  });
 }
 
 export async function getNovelContext(novelId: string) {
@@ -46,7 +59,7 @@ export async function getNovelContext(novelId: string) {
   return { novel, premise, characters };
 }
 
-export async function runOutline({ novelId, userId, payload }: any) {
+export async function runOutline({ id, novelId, userId, payload }: any) {
   const db = getDb();
   const ctx = await getNovelContext(novelId);
   if (!ctx.novel) throw new Error('Novel not found');
@@ -56,7 +69,11 @@ export async function runOutline({ novelId, userId, payload }: any) {
   const prompt = outlinePrompt(ctx as any, structureType);
   const { data: result, meta } = await generateStructuredDetailed(outlineShape, {
     messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: prompt.user }],
-    temperature: 0.6, userId, novelId, taskType: 'outline', fallback,
+    temperature: 0.6, userId, novelId, taskType: 'outline',
+    ...(id ? { jobId: id } : {}),
+    fallback,
+    ...(payload?.textModel ? { model: payload.textModel } : {}),
+    allowModelFallback: payload?.allowFallback !== false,
   });
   // Never persist demo outline content over a real failure: the fallback
   // outline contains placeholder characters and random word budgets.

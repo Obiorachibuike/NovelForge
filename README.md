@@ -15,6 +15,7 @@ NovelForge is a production-quality AI-powered novel-writing and digital publishi
   signature-verified, idempotent webhooks, with role and comp changes audited. See [`docs/billing.md`](docs/billing.md).
 - **Tiptap** rich-text editor with debounced autosave, manual save (`Cmd/Ctrl+S`), optimistic concurrency control (`expectedRevision`) with automatic conflict preservation, supplementary browser draft recovery (compare/restore/discard), full revision history with non-destructive restore, word counts, and selection-based AI editing.
 - **Structured AI layer** (OpenAI) with provider interface, streaming, structured JSON output (Zod-validated), embeddings with bounded LRU cache, pre-operation cost estimation, per-user/novel/chapter/job cost tracking, and transient error retries with exponential backoff + jitter. Works in **demo mode** with deterministic placeholder content when no API key is set.
+- **Hosted inference on Hugging Face** — 50 text-to-text and 20 text-to-image models configured in a database-backed registry, with repository/provider verification, bounded task-compatible fallback, per-model circuit breakers, output validation, cost-status accounting (`confirmed` / `estimated` / `unknown`) and an administrator model console at `/admin/ai`. Availability and pricing are only ever reported from evidence that was actually collected. See [`docs/AI_INFERENCE.md`](docs/AI_INFERENCE.md) and [`MODEL_STATUS.md`](MODEL_STATUS.md).
 - **Sequential writing engine** — only one chapter unlocked at a time; explicit approval unlocks the next. Failure recovery via persisted job records, error classification (`retryable` vs permanent), and user-initiated job cancellation/retry (`POST/DELETE /api/jobs/[jobId]`).
 - **Story Bible** — characters, locations, world rules, timeline events, plot threads; updated automatically after chapter approval.
 - **Story memory** with embeddings (OpenAI or a deterministic stub in demo mode) for retrieval-augmented chapter generation.
@@ -50,6 +51,9 @@ Configure the following in `.env` / `.env.local`:
 | `STORAGE_PROVIDER=cloudinary` | Uses Cloudinary for permanent selected novel cover storage (`src/services/covers/cloudinary-cover-service.ts`). |
 | `CLOUDINARY_CLOUD_NAME` / `CLOUDINARY_API_KEY` / `CLOUDINARY_API_SECRET` | Server-only Cloudinary credentials for cover upload, replacement, and cleanup. |
 | `OPENAI_API_KEY` | Enables real AI text, structured output, embeddings, and (if model supports) image generation |
+| `HF_TOKEN` | Hugging Face token with *Inference Providers* permission. Enables the hosted-inference backend (50 text + 20 image models). Server-side only — see [`docs/AI_INFERENCE.md`](docs/AI_INFERENCE.md) |
+| `AI_BACKEND` | `auto` (default: Hugging Face if `HF_TOKEN`, else OpenAI, else demo) · `huggingface` · `openai` |
+| `AI_ALLOW_PAID_INFERENCE` / `AI_REQUIRE_CONFIRMED_PRICING` | Pricing guardrails for hosted inference (default `false` / `true`) |
 | `AUTH_GOOGLE_ID` / `AUTH_GOOGLE_SECRET` | Google OAuth (both required) - see [`docs/google-signin.md`](docs/google-signin.md) |
 | `AUTH_SECRET` | **Required in production** (≥32 chars). The app refuses production requests with a placeholder or missing secret. |
 | `QUEUE_PROVIDER=redis` + `REDIS_URL` | Turns on the BullMQ consumer (run `npm run worker`); otherwise jobs run in-process. |
@@ -115,12 +119,18 @@ src/
     editor/                Tiptap editor workspace
     story-bible/           Preparation + Bible views
     outline/               Outline editor
+    ai/                    Model selector used by the preparation and cover surfaces
+    admin/                 Admin console (users, AI models)
     visuals/               Cover studio
     consistency/           Consistency checker
     export/                Export UI
     layout/                Sidebar / headers
   lib/
     ai/                    Provider-agnostic AI layer (text/structured/embeddings/usage/pricing/prompts)
+                             + hosted inference: config, huggingface-client, error-classifier,
+                               retry-policy, circuit-breaker, output-validation, model-selection,
+                               model-registry, model-verification, fallback-orchestrator,
+                               usage-tracker, rate-limit, model-report
     api/                   Route-handler wrapper, error mapping, body limits
     auth/                  Auth.js config (node) + edge config used by middleware
     db/                    SQLite data layer, versioned migrations, ownership helpers
@@ -132,7 +142,7 @@ src/
     utils/                 cn, formatters, words-to-pages, hash
   services/
     novels/                Core novel/settings/progress service
-    images/                Cover generation (OpenAI images with SVG demo fallback)
+    images/                Cover generation (hosted inference / OpenAI images with labelled SVG fallback)
     preparation/           Premise + Story Bible initial generation
     outlines/              Story structure + chapter outline generation
     chapters/              Sequential writing, autosave, versions, approval, summary memory
@@ -166,6 +176,8 @@ src/
 - [x] Pricing page, Stripe Checkout/Portal and verified webhooks; administrators and comped accounts create novels for free
 - [x] Admin console for roles and per-user free-access grants, with an audit log
 - [x] Explicit demo vs. real AI separation, with degraded runs labelled instead of silently substituted
+- [x] Hosted-inference backend (Hugging Face): 50 text + 20 image models, registry, verification, bounded task-compatible fallback, circuit breakers, cost-status accounting, admin model console
+- [x] Per-artefact model provenance (which model was requested and which one actually answered, on jobs, usage rows and cover assets)
 - [ ] PostgreSQL adapter (see `docs/postgresql.md`)
 - [ ] Live Redis/BullMQ and Cloudinary runs (code present; not exercised against live services here)
 
@@ -180,17 +192,20 @@ src/
 | `npm run lint` / `typecheck` | Lint & type check |
 | `npm test` | Run Vitest unit tests |
 | `npm run admin:grant -- <email> [--revoke]` | Promote (or demote) an administrator account |
+| `npm run ai:verify` | Verify every configured Hugging Face model (Hub metadata + provider mapping; `--smoke` adds a tiny live text call) |
+| `npm run ai:models:report` | Regenerate `MODEL_STATUS.md` and `docs/model-status.json` from stored verification results (no network) |
 
 ## Verification
 
 ```bash
 npm run typecheck     # tsc --noEmit
 npm run lint          # next lint (no warnings)
-npm test              # 188 Vitest tests across 19 files
+npm test              # 317 Vitest tests across 30 files
 npm run build         # production build with type + lint validation enabled
 npm run db:migrate    # apply pending SQLite migrations non-destructively
 npm run db:status     # inspect applied and pending SQLite migrations
 npm run worker        # standalone worker (migrations, poller, BullMQ when configured)
+npm run ai:verify     # verify hosted-inference models (requires HF_TOKEN)
 ```
 
 Coverage highlights: cross-user isolation for every API route and stored file,
@@ -203,7 +218,19 @@ for novels, settings, chapters, covers, jobs and exports, and billing
 portal calls, webhook signature verification and replay idempotency) against a
 local Stripe-shaped server — 36 of those tests; no live Stripe call was made.
 
+Hosted inference adds 107 tests (`tests/ai/*`) that run against an injected
+`fetch`, so no test touches the network and no test spends provider credits:
+model registry and the exact 70 configured IDs; text and image generation
+success and every failure class; bounded, task-correct fallback; circuit
+breakers, retries and per-user rate limits; Hub/router verification verdicts;
+the full story-bible → outline → chapter → cover workflow with model provenance;
+and API security (authentication, admin-only actions, model-id validation, no
+token in any response).
+
 ## Production deployment notes
+
+See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full deployment runbook, including
+the hosted-inference configuration (`HF_TOKEN`, verification, worker, timeouts).
 
 The default runtime targets a **persistent, single-instance Node.js server**:
 SQLite needs a writable disk (`DATABASE_URL=file:/data/novelforge.db`), files live

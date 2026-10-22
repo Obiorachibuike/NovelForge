@@ -1,5 +1,6 @@
 import { isPostgresUrl, parsePostgresConfig } from '@/lib/db/postgres';
 import { isCloudinaryConfigured } from '@/services/covers/cloudinary-cover-service';
+import { aiBackend, huggingFaceConfigured, validateAiConfig } from '@/lib/ai/config';
 
 export interface ValidatedEnvConfig {
   nodeEnv: 'development' | 'production' | 'test';
@@ -12,6 +13,11 @@ export interface ValidatedEnvConfig {
   hasOpenAiKey: boolean;
   hasRedisUrl: boolean;
   hasCloudinary: boolean;
+  hasHuggingFaceToken: boolean;
+  aiBackend: 'huggingface' | 'openai' | 'demo';
+  allowPaidInference: boolean;
+  requireConfirmedPricing: boolean;
+  aiProblems: string[];
 }
 
 const KNOWN_DEV_SECRETS = new Set([
@@ -112,6 +118,13 @@ export function validateEnvConfig(env: NodeJS.ProcessEnv = process.env): Validat
     (dbUrl.startsWith('file:') ? dbUrl.replace(/^file:/, '') : '') ||
     './prisma/dev.db';
 
+  const aiProblems = validateAiConfig(env);
+  if (aiProblems.length) {
+    // AI misconfiguration must not crash unrelated pages: report it once, and
+    // let the AI endpoints return a precise configuration error.
+    console.warn(`[config] AI configuration problems:\n- ${aiProblems.join('\n- ')}`);
+  }
+
   return {
     nodeEnv,
     databaseDriver,
@@ -123,5 +136,10 @@ export function validateEnvConfig(env: NodeJS.ProcessEnv = process.env): Validat
     hasOpenAiKey: Boolean(env.OPENAI_API_KEY && !env.OPENAI_API_KEY.startsWith('sk-...')),
     hasRedisUrl: Boolean(env.REDIS_URL),
     hasCloudinary: hasFullCloudinary,
+    hasHuggingFaceToken: huggingFaceConfigured(),
+    aiBackend: aiBackend(),
+    allowPaidInference: env.AI_ALLOW_PAID_INFERENCE !== 'false',
+    requireConfirmedPricing: env.AI_REQUIRE_CONFIRMED_PRICING !== 'false',
+    aiProblems,
   };
 }
