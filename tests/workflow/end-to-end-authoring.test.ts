@@ -189,7 +189,7 @@ describe('end-to-end authoring workflow, production health & config validation',
     expect(body.database.connected).toBe(true);
     expect(body.database.foreignKeysEnabled).toBe(true);
     // Updated by the hosted-inference migrations (0008 model registry, 0009 provenance).
-    expect(body.database.latestMigrationVersion).toBe('0009_generation_provenance');
+    expect(body.database.latestMigrationVersion).toBe('0010_auth_recovery_tokens');
     expect(body.queue.status).toBe('healthy');
 
     // Startup config validator rejects weak/default AUTH_SECRET in production

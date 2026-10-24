@@ -77,6 +77,8 @@ describe('login is login-only', () => {
   it('rejects a wrong password and accepts the right one', async () => {
     const created = await registerUser({ name: 'Ada', email: 'ada@example.com', password: 'correct horse battery' });
     expect(await verifyCredentials('ada@example.com', 'wrong password')).toBeNull();
+    expect(await verifyCredentials('ADA@example.com', 'correct horse battery')).toBeNull();
+    db().prepare('UPDATE users SET emailVerified=? WHERE id=?').run(new Date().toISOString(), created.id);
     const ok = await verifyCredentials('ADA@example.com', 'correct horse battery');
     expect(ok?.id).toBe(created.id);
   });

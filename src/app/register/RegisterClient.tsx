@@ -1,6 +1,5 @@
 'use client';
 import { useState } from 'react';
-import { signIn } from 'next-auth/react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { toast } from 'sonner';
@@ -33,18 +32,9 @@ export default function RegisterClient({ googleEnabled }: { googleEnabled: boole
         toast.error(data.hint ? `${detail} ${data.hint}` : detail);
         return;
       }
-      const signInRes = await signIn('credentials', { email, password, redirect: false });
-      if (signInRes?.error) {
-        toast.error(
-          signInRes.error === 'Configuration'
-            ? 'Account created, but sign-in is unavailable: the server cannot reach its database or is missing AUTH_SECRET. Open /api/health for the exact cause.'
-            : 'Account created — please sign in.',
-        );
-        router.push('/login');
-        return;
-      }
-      toast.success('Welcome to NovelForge');
-      router.push('/dashboard');
+      const data = await res.json().catch(() => ({}));
+      toast.success(data.verificationSent ? 'Account created. Check your email to verify it before signing in.' : 'Account created. Email verification could not be sent yet; use the resend link after email delivery is configured.');
+      router.push(`/login?verification=required&email=${encodeURIComponent(email)}`);
     } catch {
       toast.error('Could not reach the server. Check your connection and try again.');
     } finally {

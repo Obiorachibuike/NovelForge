@@ -3,7 +3,8 @@ import SignOutButton from '@/components/auth/SignOutButton';
 import { databaseStatus } from '@/lib/db';
 import { queueInfo } from '@/lib/queue';
 import { storageInfo } from '@/lib/storage';
-import { aiConfig, getAiBudget } from '@/lib/ai/provider';
+import { getAiBudget } from '@/lib/ai/provider';
+import { aiPolicy } from '@/lib/ai/config';
 import { usageSummary } from '@/lib/ai/usage';
 import { listLinkedProviders } from '@/services/auth/service';
 import { entitlementSummary, resolveEntitlement } from '@/services/billing/service';
@@ -22,6 +23,12 @@ export default async function SettingsPage() {
   const storage = await storageInfo();
   const queue = queueInfo();
   const budget = getAiBudget();
+  const ai = aiPolicy();
+  const aiStatus = ai.backend === 'huggingface'
+    ? `Hugging Face · ${ai.defaultTextModel}`
+    : ai.backend === 'openai'
+      ? `OpenAI · ${process.env.OPENAI_TEXT_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini'}`
+      : 'Demo mode — configure HF_TOKEN (Hugging Face) or OPENAI_API_KEY';
   const usage = session?.user?.id ? usageSummary(session.user.id, 24) : null;
   const linkedProviders = session?.user?.id ? listLinkedProviders(session.user.id) : [];
   const entitlement = session?.user?.id ? resolveEntitlement(session.user.id) : null;
@@ -43,7 +50,7 @@ export default async function SettingsPage() {
       <div className="surface p-6">
         <h3 className="font-serif text-lg font-semibold mb-3">Runtime (what the code actually does)</h3>
         <div className="space-y-2 text-sm">
-          <Row label="AI mode" value={aiConfig.demoMode ? 'Demo mode (no paid calls)' : `OpenAI · ${aiConfig.textModel}`}/>
+          <Row label="AI mode" value={aiStatus}/>
           <Row label="Storage" value={`${storage.provider}${storage.persistent ? ' · persistent' : ' · not persistent'}`}/>
           <Row label="Queue" value={queue.driver === 'redis' ? 'Redis (BullMQ) + database' : 'In-process + database'}/>
           <Row label="Database" value={'driver' in db && db.driver === 'error' ? 'Configuration error' : 'SQLite (single instance)'}/>
