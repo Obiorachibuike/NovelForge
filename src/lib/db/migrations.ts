@@ -467,6 +467,18 @@ export const migrations: Migration[] = [
       `ALTER TABLE chapters ADD COLUMN modelUsed TEXT`,
     ],
   },
+  {
+    id: '0010_auth_recovery_tokens',
+    description: 'Hashed, expiring, single-use email-verification and password-reset tokens.',
+    statements: [
+      `CREATE TABLE IF NOT EXISTS auth_action_tokens (
+        id TEXT PRIMARY KEY, userId TEXT, email TEXT NOT NULL, purpose TEXT NOT NULL,
+        tokenHash TEXT NOT NULL UNIQUE, expiresAt TEXT NOT NULL, createdAt TEXT NOT NULL,
+        consumedAt TEXT, FOREIGN KEY(userId) REFERENCES users(id) ON DELETE CASCADE
+      )`,
+      `CREATE INDEX IF NOT EXISTS idx_auth_tokens_email_purpose ON auth_action_tokens(email,purpose,expiresAt)`,
+    ],
+  },
 ];
 
 export interface MigrationResult {

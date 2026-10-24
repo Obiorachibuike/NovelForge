@@ -272,3 +272,15 @@ not by itself enable any adapter — each one either works or refuses loudly.
 ## The guiding principle
 
 **The AI prepares the novel, the author controls the story, and NovelForge remembers everything that matters.**
+
+## Email verification and password recovery
+
+Credentials-based sign-up now requires a verified email before password sign-in. Configure the transactional mail sender in the server environment:
+
+- `RESEND_API_KEY` — server-only Resend API key.
+- `MAIL_FROM` — verified sender identity, for example `NovelForge <no-reply@your-domain.example>`.
+- `NEXT_PUBLIC_APP_URL` (or `NEXTAUTH_URL`) — canonical application URL used to create one-hour action links.
+
+Registration sends an email-verification link. The sign-in page offers verification resend and a forgot-password link. Reset links are single-use, expire after one hour, and password updates revoke the reset token and replace the password hash. Request responses do not reveal whether an account exists. If email delivery is missing or unavailable, registration is retained but sign-in remains blocked until the user requests a new verification email after delivery is configured. Existing unverified password accounts can use the resend flow; OAuth identities remain verified according to the existing Google verification policy.
+
+The additive database migration `0010_auth_recovery_tokens` stores only SHA-256 hashes of random action tokens. Run the normal migration procedure (`npm run db:migrate`) before deploying the new code. Do not log or expose raw links or email-provider credentials.
