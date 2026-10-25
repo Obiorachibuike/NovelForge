@@ -46,27 +46,41 @@ or refuses loudly — setting a variable alone never enables an adapter.
 
 ---
 
-## 3. Hosted inference (Hugging Face)
+## 3. Hosted inference (Agnes AI primary · Hugging Face fallback)
 
 ### 3.1 Credentials
 
-Create a **fine-grained Hugging Face user access token** with the
-*Make calls to Inference Providers* permission and put it in `HF_TOKEN` on the
-server only:
+**Agnes AI (primary — text and images).** Create an API key in the
+[Agnes AI console](https://platform.agnes-ai.com) and put it in `AGNES_API_KEY`
+on the server only. With this one key, `agnes-2.5-flash` generates all text
+(chapters, outlines, premises, structured JSON, editor actions) and
+`agnes-image-2.5-flash` generates all covers:
+
+```bash
+AGNES_API_KEY="…"
+AI_BACKEND="auto"          # Agnes AI when AGNES_API_KEY is set
+```
+
+**Hugging Face (fallback).** Create a **fine-grained Hugging Face user access
+token** with the *Make calls to Inference Providers* permission and put it in
+`HF_TOKEN`. Its hosted models serve a request when Agnes AI fails, and are the
+primary backend when `AGNES_API_KEY` is absent:
 
 ```bash
 HF_TOKEN="hf_…"
-AI_BACKEND="auto"          # Hugging Face when HF_TOKEN is set, else OpenAI, else demo
+AI_BACKEND="auto"          # Agnes → Hugging Face → OpenAI → demo
 ```
 
 Rules that the code enforces:
 
-- The token is read per request inside `src/lib/ai/huggingface-client.ts`. It is
-  never logged, never returned by an API route, and never included in a client
-  bundle (`server-only` + no `NEXT_PUBLIC_*` usage).
-- Placeholder tokens (`your…`, `replace…`, `hf_your…`, `xxx…`) are treated as
-  unset, so a copy-pasted template can never silently switch the backend on.
-- Without a token the app stays on the OpenAI or demo backend and every model in
+- Each key is read per request inside `src/lib/ai/agnes-client.ts` /
+  `src/lib/ai/huggingface-client.ts`. Keys are never logged, never returned by
+  an API route, and never included in a client bundle (`server-only` + no
+  `NEXT_PUBLIC_*` usage).
+- Placeholder keys (`your…`, `replace…`, `hf_your…`, `agnes_your…`, `xxx…`) are
+  treated as unset, so a copy-pasted template can never silently switch a
+  backend on.
+- Without any key the app stays on the OpenAI or demo backend and every model in
   `/admin/ai` is reported as **Unverified** — which is the truth, because nothing
   has been checked.
 
@@ -197,7 +211,7 @@ are preserved; registry rows are seeded on first use.
 
 1. `npm run typecheck && npm run lint && npm test && npm run build`
 2. `npm run db:migrate` against the production database
-3. Set `HF_TOKEN` (server-side only) and run `npm run ai:verify`
+3. Set `AGNES_API_KEY` (primary) and optionally `HF_TOKEN` (fallback), server-side only; run `npm run ai:verify` to verify the Hugging Face fallback models
 4. Skim `/admin/ai`: disable models that are unavailable for your account, set a
    primary model per task, and confirm pricing states
 5. `npm run ai:models:report` and commit the refreshed `MODEL_STATUS.md`

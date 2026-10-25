@@ -11,15 +11,19 @@ export type MockHandler = (url: string, init: RequestInit) => Response | Promise
 export interface MockRouter {
   (url: string, init: RequestInit): Promise<Response>;
   calls: Array<{ url: string; body?: any }>;
+  /** The RequestInit of every call, index-aligned with `calls`. */
+  inits: RequestInit[];
   callsTo(fragment: string): number;
 }
 
 /** Builds a fake `fetch` from an ordered list of handlers (first match wins). */
 export function mockFetch(handlers: MockHandler[]): MockRouter {
   const calls: Array<{ url: string; body?: any }> = [];
+  const inits: RequestInit[] = [];
   const router = (async (url: string, init: RequestInit = {}) => {
     const body = typeof init.body === 'string' ? safeJson(init.body) : undefined;
     calls.push({ url: String(url), body });
+    inits.push(init);
     for (const handler of handlers) {
       const result = await handler(String(url), init);
       if (result) return result;
@@ -27,6 +31,7 @@ export function mockFetch(handlers: MockHandler[]): MockRouter {
     return jsonResponse({ error: 'Unhandled request in test' }, 500);
   }) as MockRouter;
   router.calls = calls;
+  router.inits = inits;
   router.callsTo = (fragment: string) => calls.filter(c => c.url.includes(fragment)).length;
   return router;
 }
@@ -145,6 +150,74 @@ export function useHuggingFaceBackend() {
       if (!(key in previous)) delete process.env[key];
     }
     Object.assign(process.env, previous);
+  };
+}
+
+/**
+ * Activates the Agnes AI backend for the duration of a test.
+ *
+ * With `fallback` (default) a Hugging Face token is configured as well and
+ * `AI_BACKEND` stays `auto`, so `agnes` is the active backend with the Hugging
+ * Face chain reachable as the fallback — the production configuration this
+ * codebase ships.
+ */
+export function useAgnesBackend(options: { fallback?: boolean } = {}) {
+  const previous = { ...process.env } as Record<string, string | undefined>;
+  process.env.AGNES_API_KEY = 'agnes_test_key_0123456789abcdef';
+  delete process.env.AGNES_BASE_URL;
+  delete process.env.AGNES_TEXT_MODEL;
+  delete process.env.AGNES_IMAGE_MODEL;
+  if (options.fallback === false) {
+    delete process.env.HF_TOKEN;
+    process.env.AI_BACKEND = 'agnes';
+  } else {
+    process.env.HF_TOKEN = 'hf_test_token_0123456789abcdef';
+    delete process.env.AI_BACKEND;
+  }
+  process.env.AI_ALLOW_PAID_INFERENCE = 'false';
+  process.env.AI_REQUIRE_CONFIRMED_PRICING = 'false';
+  process.env.AI_FALLBACK_ENABLED = 'true';
+  process.env.AI_MAX_FALLBACK_ATTEMPTS = '4';
+  process.env.AI_MAX_RETRIES_PER_MODEL = '0';
+  process.env.AI_REQUEST_TIMEOUT_MS = '5000';
+  process.env.AI_MODEL_CACHE_TTL_SECONDS = '0';
+  process.env.AI_MAX_TEXT_REQUESTS_PER_USER_PER_HOUR = '1000';
+  process.env.AI_MAX_IMAGE_REQUESTS_PER_USER_PER_HOUR = '1000';
+  return () => {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in previous)) delete process.env[key];
+    }
+    Object.assign(process.env, previous);
+  };
+}
+
+/** Agnes AI chat-completions response (OpenAI-compatible shape). */
+export function agnesChatSuccess(text: string): Response {
+  return jsonResponse({
+    id: 'chatcmpl_agnes_test',
+    object: 'chat.completion',
+    model: 'agnes-2.5-flash',
+    choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 15, completion_tokens: 9, total_tokens: 24 },
+  });
+}
+
+/** Agnes AI images/generations response (Base64 output shape). */
+export function agnesImageSuccess(b64 = BIG_PNG_BASE64): Response {
+  return jsonResponse({
+    created: 1_780_000_000,
+    data: [{ url: null, b64_json: b64, revised_prompt: null }],
+  });
+}
+
+/** Handler matching only Agnes AI endpoints on apihub.agnes-ai.com. */
+export function agnesHandler(
+  decide: (body: any, url: string) => Response | null | Promise<Response | null>,
+): MockHandler {
+  return (url, init) => {
+    if (!url.includes('apihub.agnes-ai.com')) return null;
+    const body = safeJson(String(init.body ?? '{}'));
+    return decide(body, url);
   };
 }
 

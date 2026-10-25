@@ -14,8 +14,9 @@ NovelForge is a production-quality AI-powered novel-writing and digital publishi
   administrator role, or free access granted by an administrator. Stripe Checkout + Billing Portal +
   signature-verified, idempotent webhooks, with role and comp changes audited. See [`docs/billing.md`](docs/billing.md).
 - **Tiptap** rich-text editor with debounced autosave, manual save (`Cmd/Ctrl+S`), optimistic concurrency control (`expectedRevision`) with automatic conflict preservation, supplementary browser draft recovery (compare/restore/discard), full revision history with non-destructive restore, word counts, and selection-based AI editing.
-- **Structured AI layer** (OpenAI) with provider interface, streaming, structured JSON output (Zod-validated), embeddings with bounded LRU cache, pre-operation cost estimation, per-user/novel/chapter/job cost tracking, and transient error retries with exponential backoff + jitter. Works in **demo mode** with deterministic placeholder content when no API key is set.
-- **Hosted inference on Hugging Face** — 50 text-to-text and 20 text-to-image models configured in a database-backed registry, with repository/provider verification, bounded task-compatible fallback, per-model circuit breakers, output validation, cost-status accounting (`confirmed` / `estimated` / `unknown`) and an administrator model console at `/admin/ai`. Availability and pricing are only ever reported from evidence that was actually collected. See [`docs/AI_INFERENCE.md`](docs/AI_INFERENCE.md) and [`MODEL_STATUS.md`](MODEL_STATUS.md).
+- **Agnes AI as the primary provider (text + image)** — `agnes-2.5-flash` for prose, outlines, structured JSON and editor actions; `agnes-image-2.5-flash` for covers, with tier/aspect-ratio image sizing and Base64 or URL output. Set `AGNES_API_KEY` and it becomes the main AI power for both modalities.
+- **Hosted inference on Hugging Face as the fallback** — 50 text-to-text and 20 text-to-image models configured in a database-backed registry, with repository/provider verification, bounded task-compatible fallback, per-model circuit breakers, output validation, cost-status accounting (`confirmed` / `estimated` / `unknown`) and an administrator model console at `/admin/ai`. When Agnes AI fails (or an HF model is explicitly chosen), the request automatically continues down the Hugging Face chain. Availability and pricing are only ever reported from evidence that was actually collected. See [`docs/AI_INFERENCE.md`](docs/AI_INFERENCE.md) and [`MODEL_STATUS.md`](MODEL_STATUS.md).
+- **Structured AI layer** with provider interface, streaming, structured JSON output (Zod-validated), embeddings with bounded LRU cache, pre-operation cost estimation, per-user/novel/chapter/job cost tracking, and transient error retries with exponential backoff + jitter. Works in **demo mode** with deterministic placeholder content when no API key is set.
 - **Sequential writing engine** — only one chapter unlocked at a time; explicit approval unlocks the next. Failure recovery via persisted job records, error classification (`retryable` vs permanent), and user-initiated job cancellation/retry (`POST/DELETE /api/jobs/[jobId]`).
 - **Story Bible** — characters, locations, world rules, timeline events, plot threads; updated automatically after chapter approval.
 - **Story memory** with embeddings (OpenAI or a deterministic stub in demo mode) for retrieval-augmented chapter generation.
@@ -51,8 +52,10 @@ Configure the following in `.env` / `.env.local`:
 | `STORAGE_PROVIDER=cloudinary` | Uses Cloudinary for permanent selected novel cover storage (`src/services/covers/cloudinary-cover-service.ts`). |
 | `CLOUDINARY_CLOUD_NAME` / `CLOUDINARY_API_KEY` / `CLOUDINARY_API_SECRET` | Server-only Cloudinary credentials for cover upload, replacement, and cleanup. |
 | `OPENAI_API_KEY` | Enables real AI text, structured output, embeddings, and (if model supports) image generation |
-| `HF_TOKEN` | Hugging Face token with *Inference Providers* permission. Enables the hosted-inference backend (50 text + 20 image models). Server-side only — see [`docs/AI_INFERENCE.md`](docs/AI_INFERENCE.md) |
-| `AI_BACKEND` | `auto` (default: Hugging Face if `HF_TOKEN`, else OpenAI, else demo) · `huggingface` · `openai` |
+| `AGNES_API_KEY` | **Agnes AI API key (primary provider)** — powers text (`agnes-2.5-flash`) and image (`agnes-image-2.5-flash`) generation. Server-side only. Get one at [platform.agnes-ai.com](https://platform.agnes-ai.com) |
+| `AGNES_TEXT_MODEL` / `AGNES_IMAGE_MODEL` / `AGNES_BASE_URL` | Optional Agnes overrides (defaults: `agnes-2.5-flash`, `agnes-image-2.5-flash`, `https://apihub.agnes-ai.com/v1`) |
+| `HF_TOKEN` | Hugging Face token with *Inference Providers* permission. **Fallback provider**: 50 text + 20 image models that serve requests when Agnes AI fails (or the primary backend when Agnes is unset). Server-side only — see [`docs/AI_INFERENCE.md`](docs/AI_INFERENCE.md) |
+| `AI_BACKEND` | `auto` (default: Agnes if `AGNES_API_KEY`, else Hugging Face if `HF_TOKEN`, else OpenAI, else demo) · `agnes` · `huggingface` · `openai` |
 | `AI_ALLOW_PAID_INFERENCE` / `AI_REQUIRE_CONFIRMED_PRICING` | Pricing guardrails for hosted inference (default `false` / `true`) |
 | `AUTH_GOOGLE_ID` / `AUTH_GOOGLE_SECRET` | Google OAuth (both required) - see [`docs/google-signin.md`](docs/google-signin.md) |
 | `AUTH_SECRET` | **Required in production** (≥32 chars). The app refuses production requests with a placeholder or missing secret. |
@@ -176,7 +179,7 @@ src/
 - [x] Pricing page, Stripe Checkout/Portal and verified webhooks; administrators and comped accounts create novels for free
 - [x] Admin console for roles and per-user free-access grants, with an audit log
 - [x] Explicit demo vs. real AI separation, with degraded runs labelled instead of silently substituted
-- [x] Hosted-inference backend (Hugging Face): 50 text + 20 image models, registry, verification, bounded task-compatible fallback, circuit breakers, cost-status accounting, admin model console
+- [x] **Agnes AI primary provider** for text (`agnes-2.5-flash`) and image (`agnes-image-2.5-flash`) generation, with the hosted Hugging Face chain (50 text + 20 image models, registry, verification, bounded task-compatible fallback, circuit breakers, cost-status accounting, admin model console) as the automatic fallback
 - [x] Per-artefact model provenance (which model was requested and which one actually answered, on jobs, usage rows and cover assets)
 - [ ] PostgreSQL adapter (see `docs/postgresql.md`)
 - [ ] Live Redis/BullMQ and Cloudinary runs (code present; not exercised against live services here)
@@ -200,12 +203,12 @@ src/
 ```bash
 npm run typecheck     # tsc --noEmit
 npm run lint          # next lint (no warnings)
-npm test              # 317 Vitest tests across 30 files
+npm test              # 339 Vitest tests across 31 files
 npm run build         # production build with type + lint validation enabled
 npm run db:migrate    # apply pending SQLite migrations non-destructively
 npm run db:status     # inspect applied and pending SQLite migrations
 npm run worker        # standalone worker (migrations, poller, BullMQ when configured)
-npm run ai:verify     # verify hosted-inference models (requires HF_TOKEN)
+npm run ai:verify     # verify hosted-inference Hugging Face models (requires HF_TOKEN; Agnes AI needs no verification)
 ```
 
 Coverage highlights: cross-user isolation for every API route and stored file,

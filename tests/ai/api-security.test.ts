@@ -202,15 +202,16 @@ describe('model id validation (no open proxy)', () => {
     assertNoSecret(body);
   });
 
-  it('returns 503 when no Hugging Face backend is configured', async () => {
+  it('returns 503 when no hosted inference backend (Agnes/HF) is configured', async () => {
     delete process.env.HF_TOKEN;
+    delete process.env.AGNES_API_KEY;
     process.env.AI_BACKEND = 'auto';
     const res = await generateTextRoute(jsonRequest('/api/ai/generate/text', {
       prompt: 'Write a paragraph about a lighthouse.',
       modelId: 'Qwen/Qwen2.5-7B-Instruct',
     }, { method: 'POST' }));
     expect(res.status).toBe(503);
-    expect((await readJson(res)).code).toBe('hf_not_configured');
+    expect((await readJson(res)).code).toBe('hosted_inference_not_configured');
   });
 });
 

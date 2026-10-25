@@ -607,7 +607,7 @@ export default function WritingWorkspace({
 
             {isDemoContent && (
               <p className="text-xs text-amber-400 mb-4">
-                This chapter was produced in demo mode because no usable text provider was configured for this run. Configure HF_TOKEN for Hugging Face (set AI_BACKEND=huggingface or auto), or configure OPENAI_API_KEY with AI_BACKEND=openai, then retry generation.
+                This chapter was produced in demo mode because no usable text provider was configured for this run. Configure AGNES_API_KEY for Agnes AI (the primary provider), HF_TOKEN for Hugging Face, or OPENAI_API_KEY with AI_BACKEND=openai, then retry generation.
               </p>
             )}
 

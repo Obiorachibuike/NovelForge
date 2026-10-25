@@ -2,26 +2,28 @@ import { z, type ZodType, type ZodTypeDef } from 'zod';
 import {
   getOpenAI, aiConfig, withTimeout, recordUsage, assertAiBudget, clampCompletionTokens, estimateCostUsd,
 } from './provider';
-import { aiBackend } from './config';
+import { aiBackend, agnesConfigured, huggingFaceConfigured, isExplicitAgnesModel, isExplicitHuggingFaceModel } from './config';
 import { generateStructuredHuggingFace, generateTextHuggingFace } from './hf-text-generation';
+import { generateStructuredAgnes, generateTextAgnes } from './agnes-generation';
 import type { ChatMessage } from '@/types';
 import 'server-only';
 
 /**
  * Where a piece of generated output actually came from.
  *
- * - `openai`      — a real OpenAI response.
+ * - `agnes`       — a real Agnes AI response (the primary provider).
  * - `huggingface` — a real response from a Hugging Face hosted model (possibly
  *                   a different model than requested: `actualModel` records it,
  *                   and `fallbackUsed` distinguishes that from a stub).
+ * - `openai`      — a real OpenAI response.
  * - `demo`        — deliberate demo mode (no API key, or AI_DEMO_MODE=true).
  * - `fallback`    — a real request was attempted and the stub was substituted
- *                   because the provider failed or the structured output could
+ *                   because every provider failed or the structured output could
  *                   not be parsed. `fallbackReason` explains why, and callers
  *                   are expected to surface/log it rather than treat the output
  *                   as real. Chapter generation refuses this substitution.
  */
-export type GenerationSource = 'openai' | 'huggingface' | 'demo' | 'fallback';
+export type GenerationSource = 'agnes' | 'huggingface' | 'openai' | 'demo' | 'fallback';
 
 export interface GenerationMeta {
   source: GenerationSource;
@@ -41,6 +43,27 @@ export interface GenerationMeta {
 /** True when hosted Hugging Face inference should serve this request. */
 export function huggingFaceBackendActive(): boolean {
   return aiBackend() === 'huggingface';
+}
+
+/** True when Agnes AI (the primary provider) should serve this request. */
+export function agnesBackendActive(): boolean {
+  return aiBackend() === 'agnes';
+}
+
+/**
+ * True when a real hosted provider (Agnes primary, Hugging Face fallback) can
+ * serve hosted inference. The direct generation endpoints gate on this.
+ */
+export function hostedBackendActive(): boolean {
+  return agnesBackendActive() || huggingFaceBackendActive();
+}
+
+/**
+ * True when the Hugging Face fallback chain is reachable: either it is the
+ * active backend or it is configured as the fallback behind Agnes.
+ */
+function huggingFaceFallbackAvailable(): boolean {
+  return huggingFaceConfigured();
 }
 
 export interface TextResult { text: string; meta: GenerationMeta }
@@ -87,10 +110,71 @@ async function sleepWithJitter(attempt: number, baseMs = 250): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, exp + jitter));
 }
 
+export { isExplicitAgnesModel, isExplicitHuggingFaceModel };
+
 /** Chat completion that returns plain text plus provenance. */
 export async function generateTextDetailed(input: GenerateTextInput): Promise<TextResult> {
-  // Hugging Face hosted inference (with automatic, task-compatible fallback).
-  if (huggingFaceBackendActive()) {
+  // ── Agnes AI: the primary provider ────────────────────────────────────────
+  // An explicit Hugging Face repo id overrides the default provider (the user
+  // chose that model on purpose); everything else goes to Agnes first.
+  const explicitHfModel = isExplicitHuggingFaceModel(input.model);
+  let agnesFailure: string | undefined;
+  let hfChainRequested = huggingFaceBackendActive() || (huggingFaceFallbackAvailable() && explicitHfModel);
+
+  if (agnesBackendActive() && !explicitHfModel) {
+    try {
+      const result = await generateTextAgnes({
+        messages: input.messages,
+        ...(isExplicitAgnesModel(input.model) ? { model: input.model } : {}),
+        temperature: input.temperature ?? 0.8,
+        maxTokens: input.maxTokens,
+        userId: input.userId,
+        novelId: input.novelId,
+        chapterId: input.chapterId,
+        jobId: input.jobId,
+        taskType: input.taskType,
+        signal: input.signal,
+      });
+      return {
+        text: result.text,
+        meta: {
+          source: 'agnes',
+          model: result.model,
+          usedFallback: false,
+          actualModel: result.model,
+          provider: result.provider,
+          attempts: result.attempts,
+          latencyMs: result.latencyMs,
+        },
+      };
+    } catch (err) {
+      agnesFailure = errorMessage(err);
+      if (!huggingFaceFallbackAvailable()) {
+        // No Hugging Face token configured: the caller decides (labelled
+        // fallback for tolerant callers, a real error for chapters etc.).
+        if (input.allowFallbackOnError) {
+          console.warn(`[ai] ${input.taskType}: Agnes AI generation failed, using labelled fallback — ${agnesFailure}`);
+          return {
+            text: input.fallbackText ?? demoTextResponse(input.messages),
+            meta: {
+              source: 'fallback',
+              model: input.model || 'auto',
+              usedFallback: true,
+              fallbackReason: agnesFailure,
+            },
+          };
+        }
+        throw err;
+      }
+      if (input.allowModelFallback !== false) hfChainRequested = true;
+      console.warn(`[ai] ${input.taskType}: Agnes AI generation failed, falling back to Hugging Face — ${agnesFailure}`);
+    }
+  }
+
+  // ── Hugging Face hosted inference (with task-compatible fallback) ─────────
+  // Either the active backend, an explicitly requested HF model, or the
+  // fallback chain behind Agnes.
+  if (hfChainRequested) {
     try {
       const result = await generateTextHuggingFace({
         messages: input.messages,
@@ -124,8 +208,8 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
       // Interactive editing and chapters must never silently receive stub
       // prose: a real failure is reported so the caller can retry.
       if (input.allowFallbackOnError) {
-        const reason = errorMessage(err);
-        console.warn(`[ai] ${input.taskType}: Hugging Face generation failed, using labelled fallback — ${reason}`);
+        const reason = agnesFailure ? `Agnes AI: ${agnesFailure}; Hugging Face: ${errorMessage(err)}` : errorMessage(err);
+        console.warn(`[ai] ${input.taskType}: hosted generation failed, using labelled fallback — ${reason}`);
         return {
           text: input.fallbackText ?? demoTextResponse(input.messages),
           meta: {
@@ -249,8 +333,57 @@ export async function generateStructuredDetailed<T>(
   schema: ZodType<T, ZodTypeDef, unknown>,
   input: GenerateStructuredInput<T>,
 ): Promise<StructuredResult<T>> {
-  // Hugging Face hosted inference (with automatic, task-compatible fallback).
-  if (huggingFaceBackendActive()) {
+  // ── Agnes AI: the primary provider ────────────────────────────────────────
+  const explicitHfModel = isExplicitHuggingFaceModel(input.model);
+  let agnesFailure: string | undefined;
+  let hfChainRequested = huggingFaceBackendActive() || (huggingFaceFallbackAvailable() && explicitHfModel);
+
+  if (agnesBackendActive() && !explicitHfModel) {
+    try {
+      const { data, meta } = await generateStructuredAgnes<T>({
+        schema,
+        messages: input.messages,
+        ...(isExplicitAgnesModel(input.model) ? { model: input.model } : {}),
+        temperature: input.temperature ?? 0.4,
+        maxTokens: 4_096,
+        userId: input.userId,
+        novelId: input.novelId,
+        chapterId: input.chapterId,
+        jobId: input.jobId,
+        taskType: input.taskType,
+        signal: input.signal,
+      });
+      return {
+        data,
+        meta: {
+          source: 'agnes',
+          model: meta.model,
+          usedFallback: false,
+          actualModel: meta.model,
+          provider: meta.provider,
+          attempts: meta.attempts,
+          latencyMs: meta.latencyMs,
+        },
+      };
+    } catch (err) {
+      agnesFailure = errorMessage(err);
+      if (!huggingFaceFallbackAvailable()) {
+        // Structured output is never invented: an unusable response is a
+        // failure and the caller decides (outline/premise generation aborts,
+        // so no placeholder content is written into the author's story).
+        console.warn(`[ai] ${input.taskType}: Agnes AI structured generation failed — ${agnesFailure}`);
+        return {
+          data: input.fallback,
+          meta: { source: 'fallback', model: input.model || 'auto', usedFallback: true, fallbackReason: agnesFailure },
+        };
+      }
+      if (input.allowModelFallback !== false) hfChainRequested = true;
+      console.warn(`[ai] ${input.taskType}: Agnes AI structured generation failed, falling back to Hugging Face — ${agnesFailure}`);
+    }
+  }
+
+  // ── Hugging Face hosted inference (with task-compatible fallback) ─────────
+  if (hfChainRequested) {
     try {
       const { data, meta } = await generateStructuredHuggingFace<T>({
         schema,
@@ -279,11 +412,11 @@ export async function generateStructuredDetailed<T>(
         },
       };
     } catch (err) {
-      const reason = errorMessage(err);
+      const reason = agnesFailure ? `Agnes AI: ${agnesFailure}; Hugging Face: ${errorMessage(err)}` : errorMessage(err);
       // Structured output is never invented: an unusable response is a failure
       // and the caller decides (outline/premise generation aborts, so no
       // placeholder content is written into the author's story).
-      console.warn(`[ai] ${input.taskType}: Hugging Face structured generation failed — ${reason}`);
+      console.warn(`[ai] ${input.taskType}: hosted structured generation failed — ${reason}`);
       return {
         data: input.fallback,
         meta: { source: 'fallback', model: input.model || 'auto', usedFallback: true, fallbackReason: reason },

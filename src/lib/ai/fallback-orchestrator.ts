@@ -325,13 +325,14 @@ export function toImageResult(
   };
 }
 
-/** True when Hugging Face hosted generation is usable at all right now. */
+/** True when hosted generation is usable at all right now. */
 export function hostedGenerationAvailable(): { available: boolean; reason?: string } {
   const policy = aiPolicy();
-  if (policy.backend !== 'huggingface') {
-    return { available: false, reason: 'The Hugging Face backend is not active (no HF_TOKEN configured).' };
+  if (policy.backend !== 'huggingface' && policy.backend !== 'agnes') {
+    return {
+      available: false,
+      reason: 'No hosted backend is active (set AGNES_API_KEY for Agnes AI, or HF_TOKEN for Hugging Face).',
+    };
   }
-  const rows = getModelRow ? undefined : undefined;
-  void rows;
   return { available: true };
 }

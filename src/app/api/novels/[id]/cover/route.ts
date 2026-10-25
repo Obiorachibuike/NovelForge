@@ -5,7 +5,7 @@ import { coverGenerateSchema, coverSelectSchema } from '@/types';
 import { apiHandler, readJsonBody } from '@/lib/api/http';
 import { enforceRateLimit } from '@/lib/security/rate-limit';
 import { enforceAiRateLimit } from '@/lib/ai/rate-limit';
-import { assertRegisteredModel } from '@/lib/ai/model-selection';
+import { assertRegisteredModelOrAgnes } from '@/lib/ai/model-selection';
 
 export const GET = apiHandler(async (_req: Request, ctx: { params: { id: string } }) => {
   const user = await requireUser();
@@ -19,9 +19,9 @@ export const POST = apiHandler(async (req: Request, ctx: { params: { id: string 
   enforceRateLimit('aiImage', user.id);
   enforceAiRateLimit('image', user.id);
   const body = await readJsonBody(req, v => coverGenerateSchema.parse(v));
-  // Rejects any id that is not in the registry: the endpoint must never proxy
-  // an arbitrary Hugging Face repository.
-  const imageModel = assertRegisteredModel(body.imageModel, 'text-to-image');
+  // Rejects any id that is not an Agnes model or in the registry: the endpoint
+  // must never proxy an arbitrary image repository.
+  const imageModel = assertRegisteredModelOrAgnes(body.imageModel, 'text-to-image');
   const covers = await generateCovers(user.id, ctx.params.id, body.prompt, body.variants, {
     ...(imageModel !== 'auto' ? { imageModel } : {}),
     allowFallback: body.allowFallback,

@@ -2,8 +2,8 @@ import { getDb } from '@/lib/db';
 import { saveFile, storageProviderName } from '@/lib/storage';
 import { saveCandidateCoverPreview } from '@/services/covers/cloudinary-cover-service';
 import { getOpenAI, aiConfig, recordImageUsage } from '@/lib/ai/provider';
-import { huggingFaceBackendActive } from '@/lib/ai/text-generation';
-import { generateImageHuggingFace } from '@/lib/ai/image-generation';
+import { hostedBackendActive } from '@/lib/ai/text-generation';
+import { generateImage } from '@/lib/ai/image-generation';
 import { HttpError } from '@/lib/api/http';
 import { nanoid } from 'nanoid';
 import { coverPrompt } from '@/lib/ai/prompts';
@@ -15,7 +15,7 @@ export interface GeneratedCover {
   url: string;
   provider: string;
   /** Where the image really came from, so the UI can label a substitute honestly. */
-  source: 'openai' | 'huggingface' | 'demo' | 'svg-fallback';
+  source: 'agnes' | 'openai' | 'huggingface' | 'demo' | 'svg-fallback';
   fallbackReason?: string;
   /** The model that produced the image (may differ from the requested one). */
   actualModel?: string;
@@ -66,10 +66,10 @@ export async function generateCovers(
   };
 
   for (let i = 0; i < variants; i++) {
-    // ── Hugging Face hosted inference (with task-compatible fallback) ───────
-    if (huggingFaceBackendActive()) {
+    // ── Hosted inference: Agnes AI primary, Hugging Face fallback ───────────
+    if (hostedBackendActive()) {
       try {
-        const generated = await generateImageHuggingFace({
+        const generated = await generateImage({
           ...(options.imageModel ? { modelId: options.imageModel } : {}),
           prompt,
           width,
@@ -79,25 +79,27 @@ export async function generateCovers(
           taskType: 'cover',
           allowFallback: options.allowFallback !== false,
         });
+        const isAgnes = generated.provider === 'agnes-ai';
         const ext = generated.mimeType === 'image/jpeg' ? 'jpg' : generated.mimeType === 'image/webp' ? 'webp' : 'png';
         const stored = await storeCandidate(generated.image, ext);
         const id = saveImageRecord(db, {
           userId, novelId, url: stored.url, key: stored.key,
           width: generated.width || width, height: generated.height || height, prompt,
-          provider: generated.provider || 'huggingface',
+          provider: generated.provider || (isAgnes ? 'agnes-ai' : 'huggingface'),
           format: ext, bytes: generated.image.length,
           model: generated.actualModelId, requestedModel: generated.requestedModelId,
         });
         results.push({
-          imageId: id, url: stored.url, provider: generated.provider || 'huggingface',
-          source: 'huggingface', actualModel: generated.actualModelId,
+          imageId: id, url: stored.url,
+          provider: generated.provider || (isAgnes ? 'agnes-ai' : 'huggingface'),
+          source: isAgnes ? 'agnes' : 'huggingface', actualModel: generated.actualModelId,
           requestedModel: generated.requestedModelId,
           modelFallbackUsed: generated.fallbackUsed,
         });
         continue;
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
-        console.warn('[images] Hugging Face image generation failed, substituting a labelled SVG concept:', reason);
+        console.warn('[images] hosted image generation failed, substituting a labelled SVG concept:', reason);
         const svg = makeSvgCover(novel, i);
         const stored = await storeCandidate(svg, 'svg');
         const id = saveImageRecord(db, {

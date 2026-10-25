@@ -9,7 +9,7 @@
 import 'server-only';
 import { HttpError } from '@/lib/api/http';
 import { isCircuitClosed } from './circuit-breaker';
-import { aiPolicy, pricingAllowed, type AiPolicyConfig } from './config';
+import { aiPolicy, isExplicitAgnesModel, pricingAllowed, type AiPolicyConfig } from './config';
 import { getModelRow, getPrimaryModel, listModelRows, type ListOptions } from './model-registry';
 import type { ModelAvailability, ModelRow, ModelTask } from './types';
 
@@ -270,6 +270,19 @@ export function assertRegisteredModel(
     throw new HttpError(400, `Model "${modelId}" is a ${row.task} model and cannot be used for ${task}.`, 'model_task_mismatch');
   }
   return modelId;
+}
+
+/**
+ * Like `assertRegisteredModel`, but accepts Agnes AI model ids (e.g.
+ * `agnes-2.5-flash`, `agnes-image-2.5-flash`) which live outside the Hugging
+ * Face registry: Agnes AI is the primary provider, not a registry entry.
+ */
+export function assertRegisteredModelOrAgnes(
+  modelId: string | undefined | null,
+  task: ModelTask,
+): 'auto' | string {
+  if (modelId && isExplicitAgnesModel(modelId)) return modelId;
+  return assertRegisteredModel(modelId, task);
 }
 
 /** Human-readable explanation of why nothing was eligible. */

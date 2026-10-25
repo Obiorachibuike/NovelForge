@@ -1,6 +1,6 @@
 import { isPostgresUrl, parsePostgresConfig } from '@/lib/db/postgres';
 import { isCloudinaryConfigured } from '@/services/covers/cloudinary-cover-service';
-import { aiBackend, huggingFaceConfigured, validateAiConfig } from '@/lib/ai/config';
+import { aiBackend, agnesConfigured, huggingFaceConfigured, validateAiConfig } from '@/lib/ai/config';
 
 export interface ValidatedEnvConfig {
   nodeEnv: 'development' | 'production' | 'test';
@@ -14,7 +14,8 @@ export interface ValidatedEnvConfig {
   hasRedisUrl: boolean;
   hasCloudinary: boolean;
   hasHuggingFaceToken: boolean;
-  aiBackend: 'huggingface' | 'openai' | 'demo';
+  hasAgnesKey: boolean;
+  aiBackend: 'agnes' | 'huggingface' | 'openai' | 'demo';
   allowPaidInference: boolean;
   requireConfirmedPricing: boolean;
   aiProblems: string[];
@@ -137,6 +138,7 @@ export function validateEnvConfig(env: NodeJS.ProcessEnv = process.env): Validat
     hasRedisUrl: Boolean(env.REDIS_URL),
     hasCloudinary: hasFullCloudinary,
     hasHuggingFaceToken: huggingFaceConfigured(),
+    hasAgnesKey: agnesConfigured(),
     aiBackend: aiBackend(),
     allowPaidInference: env.AI_ALLOW_PAID_INFERENCE !== 'false',
     requireConfirmedPricing: env.AI_REQUIRE_CONFIRMED_PRICING !== 'false',

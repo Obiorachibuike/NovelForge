@@ -133,8 +133,8 @@ export interface UsageRecord {
   completionTokens: number;
   /** Pre-call estimated cost in USD (stored separately from actual token-based cost). */
   estimatedCostBeforeUsd?: number;
-  /** 'openai' for real calls, 'demo' for deliberate demo-mode output. */
-  source?: 'openai' | 'demo' | 'stub';
+  /** 'agnes'/'openai'/'huggingface' for real calls, 'demo' for deliberate demo-mode output. */
+  source?: 'agnes' | 'openai' | 'huggingface' | 'demo' | 'stub';
   meta?: Record<string, unknown>;
 }
 
