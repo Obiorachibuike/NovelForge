@@ -189,7 +189,10 @@ describe('end-to-end authoring workflow, production health & config validation',
     expect(body.database.connected).toBe(true);
     expect(body.database.foreignKeysEnabled).toBe(true);
     // Updated by the hosted-inference migrations (0008 model registry, 0009 provenance).
-    expect(body.database.latestMigrationVersion).toBe('0010_auth_recovery_tokens');
+    expect(body.database.latestMigrationVersion).toBe('0011_auth_otp_codes');
+    // Transactional email is Brevo-backed; the test environment has no key, so
+    // the probe must report it as unconfigured rather than claim it works.
+    expect(body.email).toEqual({ provider: 'brevo', configured: false });
     expect(body.queue.status).toBe('healthy');
 
     // Startup config validator rejects weak/default AUTH_SECRET in production

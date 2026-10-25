@@ -1,6 +1,7 @@
 import { isPostgresUrl, parsePostgresConfig } from '@/lib/db/postgres';
 import { isCloudinaryConfigured } from '@/services/covers/cloudinary-cover-service';
 import { aiBackend, agnesConfigured, huggingFaceConfigured, validateAiConfig } from '@/lib/ai/config';
+import { isEmailDeliveryConfigured } from '@/lib/email/brevo';
 
 export interface ValidatedEnvConfig {
   nodeEnv: 'development' | 'production' | 'test';
@@ -15,6 +16,9 @@ export interface ValidatedEnvConfig {
   hasCloudinary: boolean;
   hasHuggingFaceToken: boolean;
   hasAgnesKey: boolean;
+  hasBrevoKey: boolean;
+  /** True when Brevo + a usable sender identity are configured. */
+  emailDeliveryConfigured: boolean;
   aiBackend: 'agnes' | 'huggingface' | 'openai' | 'demo';
   allowPaidInference: boolean;
   requireConfirmedPricing: boolean;
@@ -114,6 +118,31 @@ export function validateEnvConfig(env: NodeJS.ProcessEnv = process.env): Validat
     throw new Error('[config] AI_TIMEOUT_MS must be a number >= 1000.');
   }
 
+  // Transactional email (Brevo) for verification links, one-time passcodes and
+  // password resets. A half-configured provider is a hard error: it would fail
+  // only when a user is mid-registration. A fully missing provider is only a
+  // warning, so a local instance stays usable without an API key — in
+  // production it is loud, because verified e-mail is required to sign in.
+  const hasBrevoKey = Boolean(env.BREVO_API_KEY?.trim());
+  const emailDeliveryConfigured = isEmailDeliveryConfigured(env);
+  if (hasBrevoKey && !emailDeliveryConfigured) {
+    throw new Error(
+      '[config] BREVO_API_KEY is set but no usable sender is configured. Set MAIL_FROM to a verified Brevo sender, for example "NovelForge <no-reply@your-domain.example>".',
+    );
+  }
+  if (!hasBrevoKey && env.RESEND_API_KEY?.trim()) {
+    // Resend support was removed when delivery moved to Brevo; say so instead of
+    // silently leaving an operator to wonder why nothing is sent.
+    console.warn(
+      '[config] RESEND_API_KEY is no longer used: transactional email now goes through Brevo. Set BREVO_API_KEY and MAIL_FROM.',
+    );
+  }
+  if (isProdRuntime && !emailDeliveryConfigured) {
+    console.warn(
+      '[config] Transactional email is not configured (BREVO_API_KEY/MAIL_FROM): verification e-mails, one-time passcodes and password resets cannot be delivered, so new accounts cannot sign in.',
+    );
+  }
+
   const sqlitePath =
     env.SQLITE_PATH ||
     (dbUrl.startsWith('file:') ? dbUrl.replace(/^file:/, '') : '') ||
@@ -139,6 +168,8 @@ export function validateEnvConfig(env: NodeJS.ProcessEnv = process.env): Validat
     hasCloudinary: hasFullCloudinary,
     hasHuggingFaceToken: huggingFaceConfigured(),
     hasAgnesKey: agnesConfigured(),
+    hasBrevoKey,
+    emailDeliveryConfigured,
     aiBackend: aiBackend(),
     allowPaidInference: env.AI_ALLOW_PAID_INFERENCE !== 'false',
     requireConfirmedPricing: env.AI_REQUIRE_CONFIRMED_PRICING !== 'false',

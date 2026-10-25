@@ -18,6 +18,10 @@ process.env.DATA_DIR = path.join(dir, 'data');
 process.env.AUTH_SECRET = 'test-secret-0123456789abcdefghijklmnopqrstuvwxyz';
 process.env.AUTH_TRUST_HOST = 'true';
 process.env.STORAGE_PROVIDER = 'local';
+// No test may reach Brevo. Suites that exercise delivery set a fake key and
+// stub `fetch` themselves; the rest fall back to the console dev path.
+delete process.env.BREVO_API_KEY;
+process.env.MAIL_FROM = 'NovelForge <test@example.com>';
 // Demo mode by default: no test may make a paid provider call.
 process.env.AI_DEMO_MODE = 'true';
 delete process.env.OPENAI_API_KEY;
