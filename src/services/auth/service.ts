@@ -90,7 +90,7 @@ export async function verifyCredentials(emailRaw: string, passwordRaw: string): 
     return null;
   }
   const ok = await bcrypt.compare(password, user.passwordHash);
-  if (!ok) return null;
+  if (!ok || !user.emailVerified) return null;
   return { id: user.id, name: user.name, email: user.email, image: user.image };
 }
 

@@ -36,6 +36,7 @@ export const RATE_LIMITS = {
   export: { limit: envInt('RATE_LIMIT_EXPORT_PER_HOUR', 30), windowMs: HOUR },
   /** Account registration bursts per IP. */
   register: { limit: envInt('RATE_LIMIT_REGISTER_PER_HOUR', 10), windowMs: HOUR },
+  authRecovery: { limit: envInt('RATE_LIMIT_AUTH_RECOVERY_PER_HOUR', 8), windowMs: HOUR },
 } as const satisfies Record<string, RateLimitRule>;
 
 export type RateLimitName = keyof typeof RATE_LIMITS;

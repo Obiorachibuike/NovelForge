@@ -1,5 +1,5 @@
 'use client';
-import { useState, Suspense } from 'react';
+import { useState, Suspense, useEffect } from 'react';
 import { signIn } from 'next-auth/react';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
@@ -29,6 +29,10 @@ function LoginForm({ googleEnabled }: { googleEnabled: boolean }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
+  const [resending,setResending]=useState(false);
+  const requiresVerification=params.get('verification')==='required';
+  useEffect(()=>{const address=params.get('email');if(address)setEmail(address);},[params]);
+  async function resendVerification(){setResending(true);try{await fetch('/api/auth/resend-verification',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email})});toast.success('If the account needs verification, an email will be sent.');}catch{toast.error('Could not send the verification email.');}finally{setResending(false);}}
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault(); setLoading(true);
@@ -72,6 +76,8 @@ function LoginForm({ googleEnabled }: { googleEnabled: boolean }) {
       </p>
     )}
 
+    {requiresVerification && <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-200">Verify your email before signing in. Need another link? <button type="button" className="underline" disabled={resending} onClick={resendVerification}>{resending?'Sending…':'Resend verification email'}</button></div>}
+
     {googleEnabled && (
       <>
         <GoogleSignInButton callbackUrl={callbackUrl} />
@@ -86,6 +92,7 @@ function LoginForm({ googleEnabled }: { googleEnabled: boolean }) {
     </div>
     <div><label className="label block mb-2" htmlFor="login-password">Password</label>
       <input id="login-password" className="input" type="password" value={password} onChange={e=>setPassword(e.target.value)} placeholder="••••••••" autoComplete="current-password" required minLength={8} />
+      <div className="text-right mt-2"><Link className="text-xs text-indigo-400 hover:text-indigo-300" href="/forgot-password">Forgot password?</Link></div>
     </div>
     <button className="btn-primary w-full" disabled={loading}>{loading?<Loader2 className="w-4 h-4 animate-spin"/>:<BookOpen className="w-4 h-4"/>}Sign in</button>
     <div className="text-center text-sm text-slate-400">New to NovelForge? <Link className="text-indigo-400 hover:text-indigo-300 font-medium" href="/register">Create an account</Link></div>

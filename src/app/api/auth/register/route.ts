@@ -1,6 +1,7 @@
 import { apiHandler, readJsonBody } from '@/lib/api/http';
 import { enforceRateLimit, clientIp } from '@/lib/security/rate-limit';
 import { registerUser } from '@/services/auth/service';
+import { createAndSendAuthAction } from '@/services/auth/email-actions';
 
 /**
  * Account creation, kept separate from sign-in.
@@ -17,5 +18,8 @@ export const POST = apiHandler(async (req: Request) => {
     email: String(body?.email ?? ''),
     password: String(body?.password ?? ''),
   });
-  return Response.json({ user }, { status: 201 });
+  let verificationSent = false;
+  try { verificationSent = await createAndSendAuthAction(user.email || '', 'verify-email'); }
+  catch (error) { console.warn('[auth] verification email could not be delivered; user may request another link.'); }
+  return Response.json({ user, verificationRequired: true, verificationSent }, { status: 201 });
 });
