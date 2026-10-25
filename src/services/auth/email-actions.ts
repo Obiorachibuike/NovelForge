@@ -11,7 +11,17 @@ const digest=(token:string)=>createHash('sha256').update(token).digest('hex');
 function appUrl(){return (process.env.NEXT_PUBLIC_APP_URL||process.env.NEXTAUTH_URL||'http://localhost:3000').replace(/\/$/,'');}
 async function deliver(to:string,subject:string,url:string){
   const key=process.env.RESEND_API_KEY, from=process.env.MAIL_FROM;
-  if(!key||!from) throw new Error('Email delivery is not configured. Set RESEND_API_KEY and MAIL_FROM.');
+  if(!key||!from){
+    if(process.env.NODE_ENV!=='production'){
+      // Development fallback: sign-in requires a verified email, so without an
+      // email provider a freshly registered account could never sign in. Emit
+      // the one-time link to the server console instead. Never in production:
+      // there the operator must configure a real provider.
+      console.log(`[auth] Email delivery is not configured (RESEND_API_KEY/MAIL_FROM). Development fallback — ${subject} link for ${to}: ${url}`);
+      return;
+    }
+    throw new Error('Email delivery is not configured. Set RESEND_API_KEY and MAIL_FROM.');
+  }
   const response=await fetch('https://api.resend.com/emails',{method:'POST',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify({from,to,subject,html:`<p>Use the secure link below. It expires in 1 hour and can be used once.</p><p><a href="${url}">${subject}</a></p><p>If you did not request this, you can ignore this message.</p>`})});
   if(!response.ok) throw new Error(`Email delivery failed (${response.status}).`);
 }
