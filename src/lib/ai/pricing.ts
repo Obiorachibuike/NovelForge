@@ -24,6 +24,11 @@ export const MODEL_PRICES: Record<string, ModelPrice> = {
   'text-embedding-3-small': { promptPer1k: 0.00002, completionPer1k: 0 },
   'text-embedding-3-large': { promptPer1k: 0.00013, completionPer1k: 0 },
   'text-embedding-ada-002': { promptPer1k: 0.0001, completionPer1k: 0 },
+  // Agnes AI (primary provider) — published list prices; the current promoted
+  // price is $0 but budgeting uses the list price to stay conservative.
+  'agnes-2.5-flash': { promptPer1k: 0.00005, completionPer1k: 0.00015 },
+  'agnes-3.0-flash': { promptPer1k: 0.00005, completionPer1k: 0.00015 },
+  'agnes-2.5-pro': { promptPer1k: 0.00045, completionPer1k: 0.0009 },
 };
 
 /** Estimated USD per generated image, by model. */
@@ -32,6 +37,10 @@ export const IMAGE_PRICES: Record<string, number> = {
   'gpt-image-1-mini': 0.011,
   'dall-e-3': 0.04,
   'dall-e-2': 0.018,
+  // Agnes AI 1K list price ($10 / 1,000 images); currently promoted to $0.
+  'agnes-image-2.5-flash': 0.01,
+  'agnes-image-2.1-flash': 0.01,
+  'agnes-image-2.0-flash': 0.01,
 };
 
 function envPrice(model: string, kind: 'PROMPT' | 'COMPLETION'): number | null {

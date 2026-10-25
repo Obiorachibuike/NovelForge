@@ -1,20 +1,33 @@
-# Hosted inference (Hugging Face) — architecture, operations and honest status
+# Hosted inference (Agnes AI primary · Hugging Face fallback) — architecture, operations and honest status
 
-This document describes how NovelForge generates text and images through
-Hugging Face hosted inference, how models are verified and selected, what
-happens when a model fails, and what is **not** claimed.
+This document describes how NovelForge generates text and images through hosted
+inference: **Agnes AI is the primary provider for both text and image**, the
+Hugging Face Inference Providers chain is the fallback, and how models are
+verified, selected and recovered when a provider fails. What is **not** claimed
+is stated explicitly.
 
-Status of every model: [`MODEL_STATUS.md`](../MODEL_STATUS.md) (regenerate with
-`npm run ai:models:report`, or after a verification run with `npm run ai:verify`).
+Status of every Hugging Face model: [`MODEL_STATUS.md`](../MODEL_STATUS.md)
+(regenerate with `npm run ai:models:report`, or after a verification run with
+`npm run ai:verify`).
 
 ---
 
 ## 1. What was built
 
-NovelForge now has a provider layer for hosted inference that sits alongside the
-existing OpenAI and demo backends. Nothing that worked before was removed: the
-OpenAI backend, demo mode, the job queue, the editor, the export pipeline and
-the billing gates are unchanged.
+NovelForge has a provider layer with three real backends and a deliberate order:
+
+```
+Agnes AI (AGNES_API_KEY)      → primary for text AND images
+   └── fails → Hugging Face (HF_TOKEN) hosted models, task-compatible chain
+                  └── fails → labelled fallback / demo / OpenAI (unchanged)
+```
+
+Nothing that worked before was removed: the Hugging Face chain, the OpenAI
+backend, demo mode, the job queue, the editor, the export pipeline and the
+billing gates are unchanged. Agnes AI is attempted first whenever
+`AGNES_API_KEY` is set; a failed Agnes call automatically continues on the
+Hugging Face chain, and the response metadata (`source`, `provider`,
+`actualModelId`) always records where the output really came from.
 
 ```
 UI (ModelSelector)                 Admin console (/admin/ai)
@@ -23,17 +36,17 @@ UI (ModelSelector)                 Admin console (/admin/ai)
 /api/ai/models/*   /api/ai/generate/*   /api/admin/ai/*
         │                                   │
         ▼                                   ▼
- hf-text-generation.ts      image-generation.ts      model-verification.ts
-        └──────────────┬──────────────┘              │
-                       ▼                             ▼
-            fallback-orchestrator.ts          model-registry.ts (SQLite/PostgreSQL)
-              · selection (model-selection.ts)        · ai_model_registry
-              · retries + backoff (retry-policy.ts)   · ai_model_events
-              · circuit breakers (circuit-breaker.ts)
-              · output validation (output-validation.ts)
-              · usage/cost accounting (usage-tracker.ts)
-                       ▼
-              huggingface-client.ts   ← the only place that holds HF_TOKEN
+ text-generation.ts ──► agnes-generation.ts ──► agnes-client.ts  ← holds AGNES_API_KEY
+        │                   (Agnes primary)        (apihub.agnes-ai.com/v1)
+        └─ failure ──► hf-text-generation.ts  image-generation.ts
+                          └──► fallback-orchestrator.ts   model-verification.ts
+                                 · selection (model-selection.ts)   model-registry.ts
+                                 · retries + backoff (retry-policy.ts)
+                                 · circuit breakers (circuit-breaker.ts)
+                                 · output validation (output-validation.ts)
+                                 · usage/cost accounting (usage-tracker.ts)
+                                        ▼
+                               huggingface-client.ts   ← the only place that holds HF_TOKEN
 ```
 
 Key files:
@@ -41,8 +54,10 @@ Key files:
 | File | Responsibility |
 | --- | --- |
 | `src/lib/ai/config.ts` | Backend resolution and policy (`aiPolicy()`), token access, config validation |
-| `src/lib/ai/models.ts` | The 50 text + 20 image model IDs, categories, static limitations |
-| `src/lib/ai/huggingface-client.ts` | Dependency-free HTTP client (chat, images, Hub metadata, router catalog) |
+| `src/lib/ai/agnes-client.ts` | Agnes AI HTTP client (chat completions, images/generations, tier+ratio sizing) |
+| `src/lib/ai/agnes-generation.ts` | Agnes text / structured / image generation with bounded retries |
+| `src/lib/ai/models.ts` | The 50 text + 20 image Hugging Face model IDs, categories, static limitations |
+| `src/lib/ai/huggingface-client.ts` | Dependency-free HF HTTP client (chat, images, Hub metadata, router catalog) |
 | `src/lib/ai/error-classifier.ts` | Maps every failure to a category, HTTP status and availability verdict |
 | `src/lib/ai/retry-policy.ts` | Bounded retries with exponential backoff and `Retry-After` support |
 | `src/lib/ai/circuit-breaker.ts` | Per-model breakers so a broken model cannot eat the fallback budget |
@@ -55,13 +70,37 @@ Key files:
 | `src/lib/ai/rate-limit.ts` | Per-user hourly budgets for hosted text and image requests |
 | `src/lib/ai/model-report.ts` | `MODEL_STATUS.md` and `docs/model-status.json` generators |
 
+### 1a. Agnes AI specifics
+
+- Endpoint: `https://apihub.agnes-ai.com/v1` (OpenAI-compatible), key from the
+  [Agnes AI console](https://platform.agnes-ai.com).
+- Text model: `agnes-2.5-flash` (chat completions, `response_format` JSON
+  supported; plain-text retry + JSON extraction when a request rejects the
+  parameter).
+- Image model: `agnes-image-2.5-flash` via `POST /v1/images/generations`.
+  Requests use the documented tier + ratio form (`size: "1K"` … `"4K"` with
+  `ratio: "1:1" | "3:4" | "4:3" | "16:9" | "9:16" | "2:3" | "3:2" | "21:9"`);
+  requested pixel dimensions are mapped to the closest documented pair
+  (`nearestAgnesSize`). Base64 output is requested through both documented
+  mechanisms (`return_base64: true` and
+  `extra_body.response_format: "b64_json"` — never a top-level
+  `response_format`, which the docs call out as an error); a URL response is
+  also supported and downloaded. Reference images for image-to-image are passed
+  through `extra_body.image` (public URLs or data URIs).
+- Pricing used for budgeting: the published *list* prices (`agnes-2.5-flash`
+  $0.05/$0.15 per 1M in/out tokens, image 1K $0.01 per image) even though the
+  current promoted price is $0, so cost estimates stay conservative. Override
+  per deployment with `AI_PRICE_*` environment variables.
+
 ---
 
 ## 2. Endpoints used
 
 | Purpose | Endpoint | Notes |
 | --- | --- | --- |
-| Text generation | `POST {HF_ROUTER_BASE_URL}/chat/completions` | OpenAI-compatible chat. Provider auto-selection with automatic failover by the router. |
+| Text generation (Agnes, primary) | `POST {AGNES_BASE_URL}/chat/completions` | OpenAI-compatible chat with `agnes-2.5-flash`. |
+| Image generation (Agnes, primary) | `POST {AGNES_BASE_URL}/images/generations` | `agnes-image-2.5-flash`, tier `size` + `ratio`, Base64 preferred. |
+| Text generation (HF) | `POST {HF_ROUTER_BASE_URL}/chat/completions` | OpenAI-compatible chat. Provider auto-selection with automatic failover by the router. |
 | Image generation | `POST {HF_ROUTER_BASE_URL}/images/generations` | OpenAI-compatible images (`response_format: b64_json`). |
 | Image generation (fallback transport) | `POST {HF_ROUTER_BASE_URL}/{provider}/models/{providerId}` | Provider-native task route, used when the OpenAI-compatible images route is not available for the model. |
 | Repository metadata | `GET {HF_HUB_API_BASE_URL}/models/{id}?expand[]=inferenceProviderMapping&…` | Existence, gating, license, pipeline tag, provider mapping, adapter metadata. |
@@ -81,8 +120,12 @@ Add to `.env.local` (server-side only — never `NEXT_PUBLIC_*`):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `HF_TOKEN` | — | Fine-grained Hugging Face token with **Inference Providers** permission. Placeholder values (`your`, `replace`, `hf_your`, `xxx`) are treated as unset. |
-| `AI_BACKEND` | `auto` | `auto` (HF if token, else OpenAI, else demo) · `huggingface` · `openai` |
+| `AGNES_API_KEY` | — | **Agnes AI API key — the primary text and image provider.** Placeholder values (`your`, `replace`, `agnes_your`, `xxx`) are treated as unset. |
+| `AGNES_BASE_URL` | `https://apihub.agnes-ai.com/v1` | Agnes AI API base URL |
+| `AGNES_TEXT_MODEL` | `agnes-2.5-flash` | Agnes chat model |
+| `AGNES_IMAGE_MODEL` | `agnes-image-2.5-flash` | Agnes image model |
+| `HF_TOKEN` | — | Fine-grained Hugging Face token with **Inference Providers** permission (the fallback chain behind Agnes; the primary backend when Agnes is unset). Placeholder values (`your`, `replace`, `hf_your`, `xxx`) are treated as unset. |
+| `AI_BACKEND` | `auto` | `auto` (Agnes if key, else HF if token, else OpenAI, else demo) · `agnes` · `huggingface` · `openai` |
 | `HF_ROUTER_BASE_URL` | `https://router.huggingface.co/v1` | Router base URL |
 | `HF_HUB_API_BASE_URL` | `https://huggingface.co/api` | Hub metadata base URL |
 | `HF_PROVIDER` | `auto` | Pin a provider (`hf-inference`, `fal-ai`, `together`, …) or let the router choose |

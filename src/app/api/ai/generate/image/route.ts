@@ -1,9 +1,9 @@
 import { requireUser } from '@/lib/db/ownership';
 import { apiHandler, readJsonBody, MAX_JSON_BYTES } from '@/lib/api/http';
 import { enforceAiRateLimit } from '@/lib/ai/rate-limit';
-import { assertRegisteredModel } from '@/lib/ai/model-selection';
-import { generateImageHuggingFace } from '@/lib/ai/image-generation';
-import { aiPolicy } from '@/lib/ai/config';
+import { assertRegisteredModelOrAgnes } from '@/lib/ai/model-selection';
+import { generateImage } from '@/lib/ai/image-generation';
+import { hostedBackendActive } from '@/lib/ai/text-generation';
 import { z } from 'zod';
 
 export const dynamic = 'force-dynamic';
@@ -21,24 +21,28 @@ const bodySchema = z.object({
 /**
  * Direct image generation through the hosted-inference layer.
  *
- * Returns validated image bytes as base64 (never a raw provider error, never
- * an unvalidated payload). Image requests only fall back to other image models.
+ * Agnes AI (`agnes-image-2.5-flash`) is the primary provider; hosted Hugging
+ * Face inference is the fallback chain. Returns validated image bytes as
+ * base64 (never a raw provider error, never an unvalidated payload). Image
+ * requests only fall back to other image models.
  */
 export const POST = apiHandler(async (req: Request) => {
   const user = await requireUser();
-  const policy = aiPolicy();
-  if (policy.backend !== 'huggingface') {
+  if (!hostedBackendActive()) {
     return Response.json(
-      { error: 'Hugging Face hosted inference is not configured. Set HF_TOKEN to enable this endpoint.', code: 'hf_not_configured' },
+      {
+        error: 'Hosted inference is not configured. Set AGNES_API_KEY (primary) or HF_TOKEN (fallback) to enable this endpoint.',
+        code: 'hosted_inference_not_configured',
+      },
       { status: 503 },
     );
   }
 
   enforceAiRateLimit('image', user.id);
   const body = await readJsonBody(req, v => bodySchema.parse(v), MAX_JSON_BYTES.default);
-  const modelId = assertRegisteredModel(body.modelId, 'text-to-image');
+  const modelId = assertRegisteredModelOrAgnes(body.modelId, 'text-to-image');
 
-  const result = await generateImageHuggingFace({
+  const result = await generateImage({
     prompt: body.prompt,
     negativePrompt: body.negativePrompt,
     ...(modelId !== 'auto' ? { modelId } : {}),

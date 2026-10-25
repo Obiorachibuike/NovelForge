@@ -4,7 +4,7 @@ import { outlineSchema } from '@/types';
 import { apiHandler, readJsonBody } from '@/lib/api/http';
 import { enforceRateLimit } from '@/lib/security/rate-limit';
 import { enforceAiRateLimit } from '@/lib/ai/rate-limit';
-import { assertRegisteredModel } from '@/lib/ai/model-selection';
+import { assertRegisteredModelOrAgnes } from '@/lib/ai/model-selection';
 
 export const GET = apiHandler(async (_req: Request, ctx: { params: { id: string } }) => {
   const user = await requireUser();
@@ -18,7 +18,7 @@ export const POST = apiHandler(async (req: Request, ctx: { params: { id: string 
   enforceRateLimit('aiGeneration', user.id);
   enforceAiRateLimit('text', user.id);
   const body = await readJsonBody(req, v => outlineSchema.parse(v));
-  const textModel = assertRegisteredModel(body.textModel, 'text-generation');
+  const textModel = assertRegisteredModelOrAgnes(body.textModel, 'text-generation');
   return Response.json({
     jobId: await enqueueOutline(user.id, ctx.params.id, body.structure, {
       ...(textModel !== 'auto' ? { textModel } : {}),

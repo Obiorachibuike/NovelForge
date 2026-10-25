@@ -8,11 +8,16 @@
  */
 import 'server-only';
 
-export type AiBackend = 'huggingface' | 'openai' | 'demo';
+export type AiBackend = 'agnes' | 'huggingface' | 'openai' | 'demo';
 export type ImageTransport = 'openai-compatible' | 'task-native' | 'auto';
 
 export interface AiPolicyConfig {
   backend: AiBackend;
+  /** Agnes AI (apihub.agnes-ai.com) is the primary text/image provider. */
+  agnesConfigured: boolean;
+  agnesBaseUrl: string;
+  agnesTextModel: string;
+  agnesImageModel: string;
   huggingFaceConfigured: boolean;
   routerBaseUrl: string;
   hubApiBaseUrl: string;
@@ -38,6 +43,9 @@ export interface AiPolicyConfig {
 }
 
 const DEFAULTS = {
+  agnesBaseUrl: 'https://apihub.agnes-ai.com/v1',
+  agnesTextModel: 'agnes-2.5-flash',
+  agnesImageModel: 'agnes-image-2.5-flash',
   routerBaseUrl: 'https://router.huggingface.co/v1',
   hubApiBaseUrl: 'https://huggingface.co/api',
   provider: 'auto',
@@ -86,21 +94,54 @@ export function huggingFaceConfigured(): boolean {
 }
 
 /**
+ * An Agnes AI API key (created in the Agnes AI console at
+ * platform.agnes-ai.com). Agnes AI is the primary text and image provider;
+ * Hugging Face hosted inference is the fallback.
+ */
+export function agnesToken(): string {
+  const raw = process.env.AGNES_API_KEY || '';
+  const trimmed = raw.trim();
+  // Placeholder values from the template must not count as configured.
+  if (!trimmed || /^(replace|your|agnes_your|xxx|sk-your)/i.test(trimmed)) return '';
+  return trimmed;
+}
+
+export function agnesConfigured(): boolean {
+  return agnesToken().length > 0;
+}
+
+/** True when the requested model id explicitly names an Agnes AI model. */
+export function isExplicitAgnesModel(model?: string | null): boolean {
+  return !!model && /^agnes([-.].*)?$/i.test(model.trim());
+}
+
+/** True when the requested model id explicitly names a Hugging Face repo. */
+export function isExplicitHuggingFaceModel(model?: string | null): boolean {
+  return !!model && model.includes('/');
+}
+
+/**
  * Which text backend is active.
  *
- *  - `huggingface` when a HF token is present and the backend is not pinned to
- *    OpenAI (or is explicitly pinned to Hugging Face);
- *  - `openai` when the OpenAI key is used (existing behaviour, unchanged);
- *  - `demo` when no provider credentials exist at all.
+ *  - `agnes`        when an AGNES_API_KEY is present (unless pinned otherwise):
+ *                   Agnes AI serves text and images, Hugging Face falls back;
+ *  - `huggingface`  when a HF token is present and the backend is not pinned to
+ *                   OpenAI (or is explicitly pinned to Hugging Face);
+ *  - `openai`       when the OpenAI key is used (existing behaviour, unchanged);
+ *  - `demo`         when no provider credentials exist at all.
  */
 export function aiBackend(): AiBackend {
   const pinned = (process.env.AI_BACKEND || process.env.AI_PROVIDER || '').toLowerCase();
+  if (pinned === 'agnes') {
+    return agnesConfigured() ? 'agnes' : 'demo';
+  }
   if (pinned === 'huggingface' || pinned === 'hf') {
     return huggingFaceConfigured() ? 'huggingface' : 'demo';
   }
   if (pinned === 'openai') {
     return process.env.OPENAI_API_KEY ? 'openai' : 'demo';
   }
+  if (agnesConfigured()) return 'agnes';
   if (huggingFaceConfigured()) return 'huggingface';
   if (process.env.OPENAI_API_KEY) return 'openai';
   return 'demo';
@@ -113,6 +154,10 @@ export function aiPolicy(): AiPolicyConfig {
 
   return {
     backend: aiBackend(),
+    agnesConfigured: agnesConfigured(),
+    agnesBaseUrl: (process.env.AGNES_BASE_URL || DEFAULTS.agnesBaseUrl).replace(/\/+$/, ''),
+    agnesTextModel: process.env.AGNES_TEXT_MODEL || DEFAULTS.agnesTextModel,
+    agnesImageModel: process.env.AGNES_IMAGE_MODEL || DEFAULTS.agnesImageModel,
     huggingFaceConfigured: huggingFaceConfigured(),
     routerBaseUrl: (process.env.HF_ROUTER_BASE_URL || DEFAULTS.routerBaseUrl).replace(/\/+$/, ''),
     hubApiBaseUrl: (process.env.HF_HUB_API_BASE_URL || DEFAULTS.hubApiBaseUrl).replace(/\/+$/, ''),
@@ -154,6 +199,16 @@ export function validateAiConfig(env: NodeJS.ProcessEnv = process.env): string[]
   }
   if (backend === 'huggingface' && !token) {
     problems.push('AI_BACKEND=huggingface but HF_TOKEN is not set.');
+  }
+
+  const agnesKey = (env.AGNES_API_KEY || '').trim();
+  const pinnedBackend = (env.AI_BACKEND || env.AI_PROVIDER || '').toLowerCase();
+  if (pinnedBackend === 'agnes' && !agnesKey) {
+    problems.push('AI_BACKEND=agnes but AGNES_API_KEY is not set.');
+  }
+  const agnesBase = env.AGNES_BASE_URL;
+  if (agnesBase && !/^https:\/\//.test(agnesBase)) {
+    problems.push('AGNES_BASE_URL must be an https:// URL.');
   }
 
   const numericChecks: Array<[string, number, number]> = [

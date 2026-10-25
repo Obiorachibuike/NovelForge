@@ -5,7 +5,7 @@ import { editorActionSchema } from '@/types';
 import { apiHandler, readJsonBody, HttpError } from '@/lib/api/http';
 import { enforceRateLimit } from '@/lib/security/rate-limit';
 import { enforceAiRateLimit } from '@/lib/ai/rate-limit';
-import { assertRegisteredModel } from '@/lib/ai/model-selection';
+import { assertRegisteredModelOrAgnes } from '@/lib/ai/model-selection';
 
 /**
  * Selection-based AI editing.
@@ -25,7 +25,7 @@ export const POST = apiHandler(async (req: Request) => {
     throw new HttpError(409, 'This chapter is approved. Unlock it for editing before rewriting it.', 'chapter_approved');
   }
 
-  const textModel = assertRegisteredModel(body.textModel, 'text-generation');
+  const textModel = assertRegisteredModelOrAgnes(body.textModel, 'text-generation');
   const prompt = editorActionPrompt(body.action, {
     selection: body.selection || '',
     before: body.before,
