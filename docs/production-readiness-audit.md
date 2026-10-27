@@ -741,3 +741,63 @@ hard-coded one), `README.md`, `.env.example`.
    - Added `GET /api/health`, startup config validation (`validateEnvConfig`), and secret-redacting structured logging (`logger`).
    - Expanded automated test suite from 15 files (171 tests) to **19 files (188 tests)** — all passing alongside `npm run typecheck`, `npm run lint`, and `npm run build`.
 
+## 9.18 Transactional Email via Brevo & One-Time Passcodes
+
+This supersedes the "Not implemented" rows for e-mail in §3/§5/§9.13 (the flow
+was added in §9.16-era work and is now Brevo-only).
+
+1. **One provider, one client (`src/lib/email/brevo.ts`)** — every message is a
+   `POST https://api.brevo.com/v3/smtp/email` with the key in the `api-key`
+   header, a 10 s timeout, and exactly one retry for retryable failures (`408`,
+   `429`, `5xx`, network/timeout). `4xx` validation/auth answers are never
+   retried. `EmailDeliveryError` carries the status and a redacted provider
+   message; the key never leaves the header and never enters logs or responses.
+   The previous Resend integration and `RESEND_API_KEY` are removed.
+
+2. **Sender configuration** — `MAIL_FROM` (`Name <address>` or bare address) is
+   the single sender identity; `BREVO_SENDER_EMAIL` / `BREVO_SENDER_NAME` are
+   fallbacks used only when `MAIL_FROM` is unset. `validateEnvConfig` fails
+   startup when `BREVO_API_KEY` is present but no usable sender exists, and warns
+   loudly in production when nothing is configured. `/api/health` now reports
+   `email: { provider: 'brevo', configured }`.
+
+3. **Templates (`src/lib/email/templates.ts`)** — table-based HTML with inline
+   styles plus a plain-text alternative. Verification and reset messages carry a
+   button, the raw URL, and a spaced six-digit code; user names and the app name
+   are HTML-escaped.
+
+4. **One-time passcodes (migration `0011_auth_otp_codes`)** — the e-mailed
+   action row now stores `codeHash` (bcrypt), `codeExpiresAt` and
+   `failedAttempts` next to the existing SHA-256 link hash. Codes are six digits
+   from `crypto.randomInt`, valid for ten minutes, accepted with spaces/hyphens,
+   and limited to five attempts; the counter is incremented **before** the bcrypt
+   comparison so parallel guessing cannot exceed the allowance, and the action is
+   destroyed at the limit. Redeeming either half invalidates the other, and a new
+   message replaces the previous row. An expired code leaves the still-valid link
+   intact.
+
+5. **Endpoints** — `POST /api/auth/verify-email` and
+   `POST /api/auth/reset-password` accept either `{ token }` /
+   `{ token, password }` or `{ email, code }` / `{ email, code, password }`.
+   Code submissions are rate limited per IP
+   (`RATE_LIMIT_AUTH_VERIFICATION_PER_HOUR`, default 20/h) on top of the per-row
+   attempt counter. Response bodies use distinct machine-readable codes
+   (`invalid_verification_token`, `invalid_verification_code`,
+   `invalid_reset_token`, `invalid_reset_code`) without revealing whether an
+   address exists.
+
+6. **UI** — `/verify-email` auto-redeems a link token and always offers the
+   code form; `/reset-password` shows the token form with a "use the code
+   instead" switch and the email+code+password form; `/forgot-password` links
+   directly to code entry; the sign-in verification banner links to the code
+   page; the registration toast mentions both secrets.
+
+7. **Tests** — `tests/security/brevo-email.test.ts` (sender parsing, request
+   shape, retry policy, non-retryable `4xx`, missing configuration, templates)
+   and `tests/security/auth-email-actions.test.ts` (link/code redemption,
+   attempt limit, expiry, replacement, provider failure, dev fallback, route
+   handlers, IP rate limiting). All tests stub `fetch`; none contacts Brevo.
+
+8. **Remaining operational note** — delivery health is only observable through
+   `/api/health` (configuration) and Brevo's own event log; there is no webhook
+   consumer for bounces/complaints yet.

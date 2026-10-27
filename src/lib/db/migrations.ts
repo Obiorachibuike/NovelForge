@@ -479,6 +479,18 @@ export const migrations: Migration[] = [
       `CREATE INDEX IF NOT EXISTS idx_auth_tokens_email_purpose ON auth_action_tokens(email,purpose,expiresAt)`,
     ],
   },
+  {
+    id: '0011_auth_otp_codes',
+    description: 'One-time passcodes alongside e-mailed action links (bcrypt hash, short TTL, attempt counter).',
+    statements: [
+      // Codes are stored only as a bcrypt hash and live for ten minutes, far
+      // shorter than the one-hour link. `failedAttempts` is incremented before
+      // each comparison so parallel guessing cannot multiply the allowance.
+      `ALTER TABLE auth_action_tokens ADD COLUMN codeHash TEXT`,
+      `ALTER TABLE auth_action_tokens ADD COLUMN codeExpiresAt TEXT`,
+      `ALTER TABLE auth_action_tokens ADD COLUMN failedAttempts INTEGER NOT NULL DEFAULT 0`,
+    ],
+  },
 ];
 
 export interface MigrationResult {

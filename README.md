@@ -276,14 +276,35 @@ not by itself enable any adapter — each one either works or refuses loudly.
 
 **The AI prepares the novel, the author controls the story, and NovelForge remembers everything that matters.**
 
-## Email verification and password recovery
+## Email verification, one-time codes and password recovery
 
-Credentials-based sign-up now requires a verified email before password sign-in. Configure the transactional mail sender in the server environment:
+Credentials-based sign-up requires a verified email before password sign-in.
+All transactional email is delivered by **Brevo** through one client
+([`src/lib/email/brevo.ts`](src/lib/email/brevo.ts)); see
+[`docs/email.md`](docs/email.md) for the full contract.
 
-- `RESEND_API_KEY` — server-only Resend API key.
-- `MAIL_FROM` — verified sender identity, for example `NovelForge <no-reply@your-domain.example>`.
-- `NEXT_PUBLIC_APP_URL` (or `NEXTAUTH_URL`) — canonical application URL used to create one-hour action links.
+- `BREVO_API_KEY` — server-only Brevo API key (SMTP & API → API Keys).
+- `MAIL_FROM` — verified Brevo sender, for example `NovelForge <no-reply@your-domain.example>`.
+- `NEXT_PUBLIC_APP_URL` (or `NEXTAUTH_URL`) — canonical application URL used to create action links.
 
-Registration sends an email-verification link. The sign-in page offers verification resend and a forgot-password link. Reset links are single-use, expire after one hour, and password updates revoke the reset token and replace the password hash. Request responses do not reveal whether an account exists. If email delivery is missing or unavailable, registration is retained but sign-in remains blocked until the user requests a new verification email after delivery is configured. Existing unverified password accounts can use the resend flow; OAuth identities remain verified according to the existing Google verification policy.
+Each verification and reset message contains **two** single-use secrets: a secure
+link (one hour) and a **six-digit one-time code** (ten minutes, five attempts).
+The link is consumed by `/verify-email` or `/reset-password`; the code works from
+any device via `POST /api/auth/verify-email` (`{ email, code }`) or
+`POST /api/auth/reset-password` (`{ email, code, password }`). Only hashes are
+stored — SHA-256 for link tokens, bcrypt for codes — and the attempt counter is
+incremented before each comparison, so codes cannot be brute-forced in parallel.
 
-The additive database migration `0010_auth_recovery_tokens` stores only SHA-256 hashes of random action tokens. Run the normal migration procedure (`npm run db:migrate`) before deploying the new code. Do not log or expose raw links or email-provider credentials.
+Registration sends the verification message. The sign-in page offers verification
+resend, the code entry page and a forgot-password link. Request responses do not
+reveal whether an account exists. If email delivery is missing or unavailable,
+registration is retained but sign-in stays blocked until the user requests a new
+verification email after delivery is configured. Without `BREVO_API_KEY` in
+development, the link and code are printed to the server console instead of being
+sent. `GET /api/health` reports `email.configured`; setting `BREVO_API_KEY`
+without a usable `MAIL_FROM` fails startup validation immediately.
+
+The additive migrations `0010_auth_recovery_tokens` and `0011_auth_otp_codes`
+store only hashes of link tokens and codes. Run the normal migration procedure
+(`npm run db:migrate`) before deploying. Do not log or expose raw links, codes or
+email-provider credentials.

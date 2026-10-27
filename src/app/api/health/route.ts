@@ -60,6 +60,12 @@ export async function GET() {
         ai: {
           mode: config.hasOpenAiKey ? 'openai' : 'deterministic-demo',
         },
+        // Transactional e-mail (Brevo): registration and password recovery
+        // depend on it, so a probe should say whether it is usable.
+        email: {
+          provider: 'brevo',
+          configured: config.emailDeliveryConfigured,
+        },
       },
       { status: 200, headers: { 'Cache-Control': 'no-store' } },
     );

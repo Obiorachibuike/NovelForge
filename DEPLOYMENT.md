@@ -40,9 +40,28 @@ Minimum: **Node.js 22.x**.
 | `ADMIN_EMAILS` | Comma-separated emails promoted to administrator on sign-in |
 | `BILLING_REQUIRED` | `true` unless you intentionally bypass subscriptions |
 | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_*` | Billing (see [`docs/billing.md`](docs/billing.md)) |
+| `BREVO_API_KEY` | Brevo transactional-email API key (SMTP & API → API Keys) |
+| `MAIL_FROM` | Verified Brevo sender, e.g. `NovelForge <no-reply@your-domain.example>` |
 
 Storage, Redis/queue and Google sign-in are optional; each adapter either works
 or refuses loudly — setting a variable alone never enables an adapter.
+
+### Transactional email (Brevo)
+
+Sign-up requires a verified address, so email delivery is **required in
+production**. Add a Brevo API key, verify your sending domain/address under
+*Senders* in Brevo, and set `MAIL_FROM` to that sender.
+
+- Every message is sent through `POST https://api.brevo.com/v3/smtp/email`
+  (`api-key` header) — see [`docs/email.md`](docs/email.md).
+- Verification and password-reset messages carry **both** a one-hour, single-use
+  link and a **six-digit one-time code valid for ten minutes** (five attempts).
+- Only hashes are stored: SHA-256 for link tokens, bcrypt for codes.
+- `GET /api/health` reports `email.configured`. If `BREVO_API_KEY` is set but
+  `MAIL_FROM` is not a valid address, startup validation fails immediately
+  instead of failing mid-registration.
+- `BREVO_SENDER_EMAIL` / `BREVO_SENDER_NAME` are optional fallbacks used only
+  when `MAIL_FROM` is unset.
 
 ---
 
