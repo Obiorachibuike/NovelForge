@@ -1,4 +1,6 @@
 import { auth } from '@/lib/auth/config';
+import Link from 'next/link';
+import { AlertTriangle } from 'lucide-react';
 import SignOutButton from '@/components/auth/SignOutButton';
 import { databaseStatus } from '@/lib/db';
 import { queueInfo } from '@/lib/queue';
@@ -6,7 +8,7 @@ import { storageInfo } from '@/lib/storage';
 import { getAiBudget } from '@/lib/ai/provider';
 import { aiPolicy } from '@/lib/ai/config';
 import { usageSummary } from '@/lib/ai/usage';
-import { listLinkedProviders } from '@/services/auth/service';
+import { listLinkedProviders, emailVerificationStatus } from '@/services/auth/service';
 import { entitlementSummary, resolveEntitlement } from '@/services/billing/service';
 import BillingCard from '@/components/billing/BillingCard';
 import { stripeConfigured, webhookConfigured } from '@/lib/billing/stripe';
@@ -31,6 +33,12 @@ export default async function SettingsPage() {
       : 'Demo mode — configure HF_TOKEN (Hugging Face) or OPENAI_API_KEY';
   const usage = session?.user?.id ? usageSummary(session.user.id, 24) : null;
   const linkedProviders = session?.user?.id ? listLinkedProviders(session.user.id) : [];
+  // Read fresh from the database so the warning vanishes the moment the
+  // verification completes, without waiting for the session JWT to rotate.
+  const emailVerified = session?.user?.id ? emailVerificationStatus(session.user.id) : true;
+  const verifyHref = session?.user?.email
+    ? `/verify-email?email=${encodeURIComponent(session.user.email)}&callbackUrl=${encodeURIComponent('/settings')}`
+    : '/verify-email';
   const entitlement = session?.user?.id ? resolveEntitlement(session.user.id) : null;
   const billingSummary = session?.user?.id ? entitlementSummary(session.user.id) : null;
 
@@ -45,6 +53,18 @@ export default async function SettingsPage() {
           <div className="mt-2 flex items-center gap-2">
             {Providers({ linked: linkedProviders })}
           </div>
+          {!emailVerified && (
+            <div role="alert" className="mt-3 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-200">
+              <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" aria-hidden="true" />
+              <div>
+                Your email address is not verified yet.{' '}
+                <Link className="underline font-medium text-amber-100 hover:text-amber-50" href={verifyHref}>
+                  Verify it now
+                </Link>{' '}
+                — this takes you to the verification process (the emailed link or the 6-digit code).
+              </div>
+            </div>
+          )}
         </div>
       </div>
       <div className="surface p-6">

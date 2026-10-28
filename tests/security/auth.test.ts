@@ -77,10 +77,23 @@ describe('login is login-only', () => {
   it('rejects a wrong password and accepts the right one', async () => {
     const created = await registerUser({ name: 'Ada', email: 'ada@example.com', password: 'correct horse battery' });
     expect(await verifyCredentials('ada@example.com', 'wrong password')).toBeNull();
-    expect(await verifyCredentials('ADA@example.com', 'correct horse battery')).toBeNull();
-    db().prepare('UPDATE users SET emailVerified=? WHERE id=?').run(new Date().toISOString(), created.id);
     const ok = await verifyCredentials('ADA@example.com', 'correct horse battery');
     expect(ok?.id).toBe(created.id);
+  });
+
+  it('accepts sign-in before email verification and reports the unverified state', async () => {
+    const created = await registerUser({ name: 'Ada', email: 'ada@example.com', password: 'correct horse battery' });
+
+    // An unverified email no longer blocks sign-in: the profile page shows a
+    // warning linking to the verification flow instead.
+    const unverified = await verifyCredentials('ada@example.com', 'correct horse battery');
+    expect(unverified?.id).toBe(created.id);
+    expect(unverified?.emailVerified ?? null).toBeNull();
+
+    db().prepare('UPDATE users SET emailVerified=? WHERE id=?').run(new Date().toISOString(), created.id);
+    const verified = await verifyCredentials('ada@example.com', 'correct horse battery');
+    expect(verified?.id).toBe(created.id);
+    expect(verified?.emailVerified).toBeTruthy();
   });
 
   it('does not reveal whether an OAuth-only account exists', async () => {

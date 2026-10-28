@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState, Suspense } from 'react';
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
+import { toast } from 'sonner';
 
 /**
  * Verify-email page.
@@ -10,7 +11,18 @@ import { useSearchParams } from 'next/navigation';
  * with `?token=…` and verification happens automatically; typing the code is
  * the fallback for when the message is opened on a different device (or a mail
  * scanner consumed the link).
+ *
+ * Reachable both signed-out (from the e-mail) and signed-in (from the warning
+ * on the profile page, which passes `?email=…&callbackUrl=…` so the user lands
+ * back where they started once the code is confirmed).
  */
+
+/** Only same-site paths may be used as a return target (no open redirects). */
+function safeCallbackUrl(raw: string | null): string | null {
+  if (!raw) return null;
+  return raw.startsWith('/') && !raw.startsWith('//') ? raw : null;
+}
+
 function Verify() {
   const params = useSearchParams();
   const token = params.get('token') || '';
@@ -20,6 +32,8 @@ function Verify() {
   const [codeError, setCodeError] = useState('');
   const [codeOk, setCodeOk] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [resending, setResending] = useState(false);
+  const callbackUrl = safeCallbackUrl(params.get('callbackUrl'));
   const started = useRef(false);
 
   useEffect(() => {
@@ -63,6 +77,23 @@ function Verify() {
     }
   }
 
+  async function resendVerification() {
+    setResending(true);
+    try {
+      const response = await fetch('/api/auth/resend-verification', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email }),
+      });
+      if (!response.ok) throw new Error();
+      toast.success('If the account needs verification, a new email has been sent.');
+    } catch {
+      toast.error('Could not send the verification email.');
+    } finally {
+      setResending(false);
+    }
+  }
+
   return (
     <main className="min-h-screen bg-[#05070D] flex items-center justify-center p-6 text-white">
       <section className="w-full max-w-md space-y-5">
@@ -71,10 +102,10 @@ function Verify() {
         {verified ? (
           <>
             <p role="status" className="text-emerald-300">
-              Email verified. You can now sign in.
+              Email verified. Your account is now fully active.
             </p>
-            <Link className="text-indigo-400" href="/login">
-              Continue to sign in
+            <Link className="text-indigo-400" href={callbackUrl || '/login'}>
+              {callbackUrl ? 'Continue' : 'Continue to sign in'}
             </Link>
           </>
         ) : (
@@ -132,7 +163,16 @@ function Verify() {
             </form>
 
             <p className="text-sm text-slate-400">
-              Need a new email? <Link className="text-indigo-400" href="/login?verification=required">Resend it from the sign-in page</Link>.
+              Need a new email?{' '}
+              <button
+                type="button"
+                className="text-indigo-400 underline disabled:opacity-50"
+                disabled={resending || !email}
+                onClick={resendVerification}
+              >
+                {resending ? 'Sending…' : 'Resend verification email'}
+              </button>
+              .
             </p>
           </>
         )}
