@@ -36,6 +36,13 @@ export const RATE_LIMITS = {
   export: { limit: envInt('RATE_LIMIT_EXPORT_PER_HOUR', 30), windowMs: HOUR },
   /** Account registration bursts per IP. */
   register: { limit: envInt('RATE_LIMIT_REGISTER_PER_HOUR', 10), windowMs: HOUR },
+  /**
+   * Sign-in attempts per IP — a brute-force brake for POST /api/auth/login
+   * (Auth.js's own callback route applies no limiter). Counts every attempt,
+   * successful or not, so password guessing cannot run unbounded; raise the env
+   * var for deployments behind a shared NAT.
+   */
+  login: { limit: envInt('RATE_LIMIT_LOGIN_PER_HOUR', 30), windowMs: HOUR },
   authRecovery: { limit: envInt('RATE_LIMIT_AUTH_RECOVERY_PER_HOUR', 8), windowMs: HOUR },
   /** One-time passcode submissions (verification codes, reset codes). */
   authVerification: { limit: envInt('RATE_LIMIT_AUTH_VERIFICATION_PER_HOUR', 20), windowMs: HOUR },
