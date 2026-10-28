@@ -2,7 +2,11 @@ import { NextResponse } from 'next/server';
 import NextAuth from 'next-auth';
 import { edgeAuthConfig } from '@/lib/auth/edge-config';
 const { auth } = NextAuth(edgeAuthConfig);
-const PUBLIC_ONLY = new Set(['/login','/register','/forgot-password','/reset-password','/verify-email']);
+const PUBLIC_ONLY = new Set(['/login','/register','/forgot-password','/reset-password']);
+// `/verify-email` is deliberately NOT public-only: a signed-in but unverified
+// user reaches it from the profile-page warning, and an e-mailed token link
+// must be allowed to actually run the verification instead of bouncing to the
+// dashboard with the token unprocessed.
 const PROTECTED_PREFIXES = ['/dashboard','/novels','/settings','/admin','/api/novels','/api/jobs','/api/ai','/api/usage','/api/files','/api/settings','/api/admin','/api/billing'];
 export default auth((req) => {
   const { nextUrl } = req;

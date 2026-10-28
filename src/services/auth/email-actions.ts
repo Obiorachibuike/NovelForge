@@ -88,10 +88,11 @@ function renderMessage(purpose: AuthAction, input: { name?: string | null; url: 
 async function deliver(to: string, purpose: AuthAction, rendered: RenderedEmail, fallbackDetail: string) {
   if (!isEmailDeliveryConfigured()) {
     if (process.env.NODE_ENV !== 'production') {
-      // Development/test fallback: sign-in requires a verified email, so
-      // without a provider a freshly registered account could never sign in.
-      // Emit the one-time material to the server console instead — never in
-      // production, where the operator must configure a real provider.
+      // Development/test fallback: without a delivery provider the user could
+      // never receive the link or code, which would strand a fresh account
+      // before its first sign-in. Emit the one-time material to the server
+      // console instead — never in production, where the operator must
+      // configure a real provider.
       console.log(
         `[auth] Email delivery is not configured (BREVO_API_KEY/MAIL_FROM). Development fallback — ${rendered.subject} for ${to}: ${fallbackDetail}`,
       );

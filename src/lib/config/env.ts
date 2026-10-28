@@ -139,7 +139,7 @@ export function validateEnvConfig(env: NodeJS.ProcessEnv = process.env): Validat
   }
   if (isProdRuntime && !emailDeliveryConfigured) {
     console.warn(
-      '[config] Transactional email is not configured (BREVO_API_KEY/MAIL_FROM): verification e-mails, one-time passcodes and password resets cannot be delivered, so new accounts cannot sign in.',
+      '[config] Transactional email is not configured (BREVO_API_KEY/MAIL_FROM): verification e-mails, one-time passcodes and password resets cannot be delivered, so new accounts stay unverified and cannot receive recovery codes.',
     );
   }
 

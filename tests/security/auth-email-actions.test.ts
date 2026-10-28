@@ -99,10 +99,16 @@ describe('verification email through Brevo', () => {
     await createAndSendAuthAction('ada@example.com', 'verify-email');
     const token = decodeURIComponent(tokenFrom(sent[0]) as string);
 
-    expect(await verifyCredentials('ada@example.com', 'old password 123')).toBeNull();
+    // Sign-in works before verification — the account is merely flagged.
+    const before = await verifyCredentials('ada@example.com', 'old password 123');
+    expect(before?.email).toBe('ada@example.com');
+    expect(before?.emailVerified ?? null).toBeNull();
+
     expect(await consumeEmailVerification(token)).toBe(true);
     expect(await consumeEmailVerification(token)).toBe(false);
-    expect((await verifyCredentials('ada@example.com', 'old password 123'))?.email).toBe('ada@example.com');
+    const after = await verifyCredentials('ada@example.com', 'old password 123');
+    expect(after?.email).toBe('ada@example.com');
+    expect(after?.emailVerified).toBeTruthy();
   });
 
   it('accepts the six-digit code once, and the code dies with the link', async () => {

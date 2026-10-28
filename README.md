@@ -278,8 +278,9 @@ not by itself enable any adapter — each one either works or refuses loudly.
 
 ## Email verification, one-time codes and password recovery
 
-Credentials-based sign-up requires a verified email before password sign-in.
-All transactional email is delivered by **Brevo** through one client
+Sign-in is allowed even before the e-mail is verified: an unverified account
+logs in normally and its profile page (Settings) shows a warning that links
+into the verification flow. All transactional email is delivered by **Brevo** through one client
 ([`src/lib/email/brevo.ts`](src/lib/email/brevo.ts)); see
 [`docs/email.md`](docs/email.md) for the full contract.
 
@@ -298,8 +299,9 @@ incremented before each comparison, so codes cannot be brute-forced in parallel.
 Registration sends the verification message. The sign-in page offers verification
 resend, the code entry page and a forgot-password link. Request responses do not
 reveal whether an account exists. If email delivery is missing or unavailable,
-registration is retained but sign-in stays blocked until the user requests a new
-verification email after delivery is configured. Without `BREVO_API_KEY` in
+registration is retained and sign-in still works — the profile page keeps
+showing the unverified warning until the user requests a new verification
+email after delivery is configured. Without `BREVO_API_KEY` in
 development, the link and code are printed to the server console instead of being
 sent. `GET /api/health` reports `email.configured`; setting `BREVO_API_KEY`
 without a usable `MAIL_FROM` fails startup validation immediately.

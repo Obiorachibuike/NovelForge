@@ -76,7 +76,7 @@ function LoginForm({ googleEnabled }: { googleEnabled: boolean }) {
       </p>
     )}
 
-    {requiresVerification && <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-200">Verify your email before signing in. The email contains a link and a 6-digit code — <Link className="underline" href="/verify-email">enter the code</Link>. Need another message? <button type="button" className="underline" disabled={resending} onClick={resendVerification}>{resending?'Sending…':'Resend verification email'}</button></div>}
+    {requiresVerification && <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-200">Your email hasn't been verified yet — you can sign in now and verify any time (the warning appears on your profile page). The email contains a link and a 6-digit code — <Link className="underline" href={`/verify-email${email ? `?email=${encodeURIComponent(email)}` : ''}`}>enter the code</Link>. Need another message? <button type="button" className="underline" disabled={resending} onClick={resendVerification}>{resending?'Sending…':'Resend verification email'}</button></div>}
 
     {googleEnabled && (
       <>

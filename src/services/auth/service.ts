@@ -20,6 +20,8 @@ export interface PublicUser {
   name: string | null;
   email: string | null;
   image: string | null;
+  /** ISO timestamp of the e-mail verification, or null when still unverified. */
+  emailVerified?: string | null;
 }
 
 export function normalizeEmail(email: string): string {
@@ -70,6 +72,10 @@ export async function registerUser(input: RegisterInput): Promise<PublicUser> {
  * The same generic error is returned for "no such user" and "wrong password",
  * and a dummy bcrypt comparison runs for unknown e-mails so response timing
  * does not reveal which addresses are registered.
+ *
+ * An unverified e-mail does **not** block sign-in: the account still proves
+ * ownership of the password, so the session is issued and the profile page
+ * shows a warning that links to the verification flow instead.
  */
 export async function verifyCredentials(emailRaw: string, passwordRaw: string): Promise<PublicUser | null> {
   const email = normalizeEmail(emailRaw);
@@ -90,8 +96,14 @@ export async function verifyCredentials(emailRaw: string, passwordRaw: string): 
     return null;
   }
   const ok = await bcrypt.compare(password, user.passwordHash);
-  if (!ok || !user.emailVerified) return null;
-  return { id: user.id, name: user.name, email: user.email, image: user.image };
+  if (!ok) return null;
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    image: user.image,
+    emailVerified: user.emailVerified ?? null,
+  };
 }
 
 export type GoogleLinkDecision =
@@ -218,8 +230,20 @@ export function listLinkedProviders(userId: string): string[] {
 
 export function findUserById(id: string): PublicUser | null {
   const db = getDb();
-  const row = db.prepare('SELECT id, name, email, image FROM users WHERE id = ?').get(id) as any;
+  const row = db.prepare('SELECT id, name, email, image, emailVerified FROM users WHERE id = ?').get(id) as any;
   return row ?? null;
+}
+
+/**
+ * Whether a user's e-mail address has been verified. Read fresh from the
+ * database (not the session) so the profile warning disappears as soon as the
+ * verification completes, without waiting for the JWT to rotate.
+ */
+export function emailVerificationStatus(userId: string): boolean {
+  const row = getDb().prepare('SELECT emailVerified FROM users WHERE id = ?').get(userId) as
+    | { emailVerified: string | null }
+    | undefined;
+  return Boolean(row?.emailVerified);
 }
 
 /**
