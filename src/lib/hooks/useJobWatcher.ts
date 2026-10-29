@@ -8,7 +8,7 @@ export interface WatchedJob {
   error?: string | null;
   errorCode?: string | null;
   retryable?: number | null;
-  result?: string | null;
+  result?: { partialText?: string; [key: string]: unknown } | null;
   progress?: number | null;
 }
 

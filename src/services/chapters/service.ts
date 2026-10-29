@@ -1,6 +1,8 @@
 import { getDb } from '@/lib/db';
 import { nanoid } from 'nanoid';
 import { generateTextDetailed, generateStructuredDetailed } from '@/lib/ai/text-generation';
+import { aiBackend } from '@/lib/ai/config';
+import { aiConfig } from '@/lib/ai/provider';
 import { chapterPrompt, chapterSummaryPrompt } from '@/lib/ai/prompts';
 import { embed, serialize, deserialize } from '@/lib/ai/embeddings';
 import { registerHandler } from '@/lib/queue';
@@ -123,6 +125,12 @@ export async function enqueueChapterGeneration(
     );
   }
 
+  if (aiConfig.forcedDemo || aiBackend() === 'demo') {
+    throw new HttpError(503,
+      'Story generation needs a configured AI provider. Add AGNES_API_KEY, HF_TOKEN, or OPENAI_API_KEY to the server environment, disable AI_DEMO_MODE, and redeploy. No demo chapter was created.',
+      'text_provider_unavailable');
+  }
+
   const { enqueue } = await import('@/lib/queue');
   return enqueue({
     type: 'chapter',
@@ -193,12 +201,22 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
     previousChapter?.summary
   );
 
+  let lastPreviewAt = 0;
+  const onText = (text: string) => {
+    if (isCancelled?.()) throw new Error('Job was cancelled before completion.');
+    if (!jobId || (text && Date.now() - lastPreviewAt < 350)) return;
+    lastPreviewAt = Date.now();
+    db.prepare("UPDATE generation_jobs SET result=?, updatedAt=? WHERE id=? AND status='processing'")
+      .run(JSON.stringify({ partialText: text }), new Date().toISOString(), jobId);
+  };
+
   // No silent fabrication: in demo mode the caller gets clearly-labelled demo
   // prose; if a real provider call fails the job fails and retries instead of
   // saving mock text as if it were generated.
   const generated = await generateTextDetailed({
     messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: prompt.user }],
     temperature: 0.85,
+    onText,
     maxTokens: Math.min(4500, Math.max(1500, Math.round(outline.targetWords * 1.6))),
     userId, novelId,
     chapterId: existing?.id || undefined,
@@ -210,6 +228,9 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
   });
   // A model-level fallback is a real generation by another eligible model, not
   // a stub: it is recorded in meta.actualModel and surfaced to the author.
+  if (generated.meta.source === 'demo' || generated.meta.source === 'fallback') {
+    throw new Error('A real AI provider is required to generate a chapter. Configure a provider and retry.');
+  }
   if (!generated.text.trim()) throw new Error('Provider returned an empty chapter.');
 
   // Guard against a job that was cancelled while the AI request was in flight:
@@ -290,7 +311,7 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
     chapterNumber,
     wordCount: words,
     source: generated.meta.source,
-    demo: generated.meta.source === 'demo',
+    demo: false,
   };
 }
 

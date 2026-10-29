@@ -49,6 +49,7 @@ export default function WritingWorkspace({
   previousSummary,
   memories,
   initialVersions = [],
+  autoGenerate = false,
 }: any) {
   const router = useRouter();
   const qc = useQueryClient();
@@ -57,6 +58,7 @@ export default function WritingWorkspace({
   const [versions, setVersions] = useState<any[]>(initialVersions);
   const [showCompareRecovery, setShowCompareRecovery] = useState(false);
   const [recoveredDraft, setRecoveredDraft] = useState<DraftRecoveryEntry | null>(null);
+  const [readingGeneration, setReadingGeneration] = useState(chapter?.status === 'generated' && chapter?.generationSource !== 'demo');
   const [previewVersion, setPreviewVersion] = useState<any | null>(null);
 
   const chapterNum = chapter?.chapterNumber || outline?.chapterNumber || 1;
@@ -291,6 +293,7 @@ export default function WritingWorkspace({
       return res.json();
     },
     onSuccess: (data: any) => {
+      setReadingGeneration(true);
       toast.success('Chapter generation queued');
       if (data?.jobId) watch(data.jobId);
       else pollForChapter();
@@ -305,7 +308,8 @@ export default function WritingWorkspace({
       if (!chapter) return;
       // Ensure any pending edits are saved before approving.
       if (controllerRef.current?.hasUnsavedChanges()) {
-        await controllerRef.current.saveNow();
+        const saved = await controllerRef.current.saveNow();
+        if (!saved) throw new Error('Save your changes before continuing.');
       }
       const res = await fetch(`/api/novels/${novel.id}/chapters/${chapter.id}/approve`, { method: 'POST' });
       if (!res.ok) throw new Error((await res.json()).error || 'Failed');
@@ -313,7 +317,7 @@ export default function WritingWorkspace({
     },
     onSuccess: () => {
       toast.success('Chapter approved — next unlocked.');
-      router.push(`/novels/${novel.id}/write/${chapterNum + 1}`);
+      router.push(`/novels/${novel.id}/write/${chapterNum + 1}?generate=1`);
       qc.invalidateQueries();
     },
     onError: (e: any) => toast.error(e.message),
@@ -351,7 +355,7 @@ export default function WritingWorkspace({
       toast.success('Chapter ready');
       router.refresh();
     },
-    onFail: (job) => toast.error(`Generation failed: ${job.error || 'unknown error'}`),
+    onFail: (job) => { setReadingGeneration(false); toast.error(`Generation failed: ${job.error || 'unknown error'}`); },
   });
   // The durable job row is the truth: the button stays busy while it runs, even
   // across a page refresh.
@@ -374,6 +378,14 @@ export default function WritingWorkspace({
       if (tries > 60) clearInterval(tick);
     }, 1500);
   }
+
+  const autoStarted = useRef(false);
+  useEffect(() => {
+    if (autoGenerate && !chapter && !isLocked && !autoStarted.current) {
+      autoStarted.current = true;
+      generateChapter.mutate();
+    }
+  }, [autoGenerate, chapter, isLocked, generateChapter]);
 
   const wordCount = editor?.storage.characterCount?.words?.() ?? chapter?.wordCount ?? 0;
   const pages = Math.max(1, Math.round(wordCount / 320));
@@ -577,7 +589,27 @@ export default function WritingWorkspace({
               </div>
             )}
 
-            {!chapter ? (
+            {(readingGeneration || isWritingJob) ? (
+              <section className="surface p-6 md:p-10" aria-label="Chapter generation">
+                <div className="flex items-center gap-2 text-sm text-muted-foreground mb-6" role="status">
+                  {isWritingJob ? <><Loader2 className="w-4 h-4 animate-spin" /> Writing your chapter…</> : 'Chapter complete'}
+                </div>
+                <div className="whitespace-pre-wrap font-serif text-lg leading-relaxed">
+                  {isWritingJob ? (generationJob?.result?.partialText || 'Preparing your story context…') : chapter?.plainText || generationJob?.result?.partialText || 'Loading your saved chapter…'}
+                </div>
+                {!isWritingJob && chapter && (
+                  <div className="flex flex-wrap gap-3 mt-8 border-t border-border pt-6">
+                    <button className="btn-outline" onClick={() => { setReadingGeneration(false); editor?.commands.setContent(initialContent); }}>Open in editor</button>
+                    {navigation?.some((n: any) => n.chapterNumber > chapterNum) && (
+                      <button className="btn-primary" onClick={() => approve.mutate()} disabled={approve.isPending || isDemoContent}>
+                        {approve.isPending && <Loader2 className="w-4 h-4 animate-spin" />} Continue next chapter
+                      </button>
+                    )}
+                    <p className="text-xs text-muted-foreground w-full">Continuing approves this chapter and unlocks the next one.</p>
+                  </div>
+                )}
+              </section>
+            ) : !chapter ? (
               <div className="surface p-12 text-center">
                 <Wand2 className="w-10 h-10 text-primary/60 mx-auto mb-4" />
                 <h3 className="font-serif text-2xl mb-2">Ready to write</h3>
@@ -607,7 +639,7 @@ export default function WritingWorkspace({
 
             {isDemoContent && (
               <p className="text-xs text-amber-400 mb-4">
-                This chapter was produced in demo mode because no usable text provider was configured for this run. Configure AGNES_API_KEY for Agnes AI (the primary provider), HF_TOKEN for Hugging Face, or OPENAI_API_KEY with AI_BACKEND=openai, then retry generation.
+                This is an older demo draft, not an AI-generated chapter. Use Regenerate to replace it with a real story from an available configured provider.
               </p>
             )}
 
@@ -617,7 +649,7 @@ export default function WritingWorkspace({
               </div>
             )}
 
-            {chapter && !isLocked && !isApproved && (
+            {chapter && !isLocked && !isApproved && !readingGeneration && !isWritingJob && (
               <div className="mt-10 pt-6 border-t border-border flex items-center justify-between flex-wrap gap-3">
                 <div className="flex items-center gap-4 text-sm text-muted-foreground">
                   <span>{Math.round(wordCount).toLocaleString()} words</span>

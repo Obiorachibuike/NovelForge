@@ -28,6 +28,7 @@ import { assertAiBudget, clampCompletionTokens, estimateCostUsd, estimateImageCo
 export type AgnesGenerationCost = { amount?: number; currency?: string; status: 'confirmed' | 'estimated' | 'unknown' };
 
 export interface AgnesTextInput {
+  onText?: (text: string) => void;
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
   model?: string;
   temperature?: number;
@@ -134,6 +135,7 @@ export async function generateTextAgnes(input: AgnesTextInput): Promise<AgnesTex
         maxNewTokens: maxTokens,
         ...(typeof input.topP === 'number' ? { topP: input.topP } : {}),
         signal: input.signal,
+        onText: input.onText,
       });
       const check = validateTextOutput(completion.text, { minChars: 1 });
       if (!check.ok) throw Object.assign(new Error(check.reason || 'The model returned no text.'), { status: 502 });
