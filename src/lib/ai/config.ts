@@ -184,6 +184,90 @@ export function aiPolicy(): AiPolicyConfig {
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Provider status (secret-free)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface AiProviderStatus {
+  name: 'agnes' | 'huggingface' | 'openai';
+  /** Where the provider sits in the chain: primary, fallback or legacy backend. */
+  role: 'primary' | 'fallback' | 'legacy';
+  /** Whether the credential this provider needs is present in this runtime. */
+  configured: boolean;
+  /** Model ids the provider will be asked for (not secrets). */
+  models?: { text?: string; image?: string };
+  endpoint?: string;
+}
+
+export interface AiProviderSummary {
+  /** The backend the next generation request will actually use. */
+  backend: AiBackend;
+  /** Backends in the order they are attempted when fallback is enabled. */
+  providerOrder: Array<'agnes' | 'huggingface' | 'openai'>;
+  /** `AI_BACKEND` when an operator pinned one explicitly. */
+  pinnedBackend: 'agnes' | 'huggingface' | 'openai' | null;
+  providers: AiProviderStatus[];
+  /** Configuration problems by variable *name* only — never a value. */
+  problems: string[];
+}
+
+/**
+ * Describes which hosted-inference provider is live and which credentials are
+ * present, without ever reading a secret back out.
+ *
+ * This exists because "I set the API key in the host" and "the running
+ * deployment is calling that provider" are different facts: a deployment made
+ * before the variable was added, or a variable scoped to the wrong environment,
+ * still reports a working demo backend. `backend` is the honest answer for the
+ * process answering the request.
+ */
+export function aiProviderSummary(): AiProviderSummary {
+  const pinnedRaw = (process.env.AI_BACKEND || process.env.AI_PROVIDER || '').toLowerCase();
+  const pinnedBackend =
+    pinnedRaw === 'agnes' || pinnedRaw === 'openai'
+      ? pinnedRaw
+      : pinnedRaw === 'huggingface' || pinnedRaw === 'hf'
+        ? 'huggingface'
+        : null;
+
+  const policy = aiPolicy();
+  const providers: AiProviderStatus[] = [
+    {
+      name: 'agnes',
+      role: 'primary',
+      configured: policy.agnesConfigured,
+      models: { text: policy.agnesTextModel, image: policy.agnesImageModel },
+      endpoint: policy.agnesBaseUrl,
+    },
+    {
+      name: 'huggingface',
+      role: 'fallback',
+      configured: policy.huggingFaceConfigured,
+      models: { text: policy.defaultTextModel, image: policy.defaultImageModel },
+      endpoint: policy.routerBaseUrl,
+    },
+    {
+      name: 'openai',
+      role: 'legacy',
+      configured: Boolean((process.env.OPENAI_API_KEY || '').trim()),
+      models: {
+        text: process.env.AI_TEXT_MODEL || 'gpt-4o-mini',
+        image: process.env.AI_IMAGE_MODEL || 'dall-e-3',
+      },
+      // Whether an OpenAI fallback is reached depends on the backend policy.
+      endpoint: 'https://api.openai.com/v1',
+    },
+  ];
+
+  return {
+    backend: policy.backend,
+    providerOrder: ['agnes', 'huggingface', 'openai'],
+    pinnedBackend,
+    providers,
+    problems: validateAiConfig(process.env),
+  };
+}
+
 /**
  * Validates the AI configuration. Called by the environment validator at
  * startup so a misconfiguration is reported once, clearly, instead of surfacing

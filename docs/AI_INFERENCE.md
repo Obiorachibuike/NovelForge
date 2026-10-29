@@ -94,6 +94,36 @@ Key files:
 
 ---
 
+### 1b. Proving a provider is live (deployment-level diagnostics)
+
+Configuration is not evidence. Two surfaces report what the *running* process
+actually sees, and both are secret-free:
+
+| Surface | What it answers |
+| --- | --- |
+| `GET /api/health` → `ai` | Which backend the next request uses (`backend`), whether each credential is present (`providers.agnes` / `.huggingface` / `.openai`), and configuration problems by variable **name** only (`problems`). |
+| `POST /api/admin/ai/providers/test` (admin only) | Makes one real, minimal Agnes AI request (`{"provider":"agnes","kind":"text" \| "image"}`) and returns `ok`, `model`, `latencyMs`, a short `sample` (text) or `imageBytes`, or a classified `error.category`. |
+
+`src/lib/ai/config.ts#aiProviderSummary()` is the single source for the provider
+order (`agnes → huggingface → openai`), the pinned backend and the per-provider
+status; `src/lib/ai/provider-diagnostics.ts#testAgnesProvider()` performs the
+live test. Neither function returns a key, a `Bearer` header or a raw provider
+error body.
+
+Failure categories worth knowing:
+
+- `not_configured` — `AGNES_API_KEY` is not visible to this deployment: wrong
+  environment scope, or the deployment predates the variable (variables are
+  captured at build time — redeploy).
+- `authentication_failed` — the key reached Agnes AI and was rejected (revoked,
+  mistyped, or from another account).
+- `model_not_found` — the account cannot use `AGNES_TEXT_MODEL` /
+  `AGNES_IMAGE_MODEL`; override the model id.
+- `disabled` — an image test was requested without
+  `AI_ALLOW_LIVE_IMAGE_HEALTH_CHECKS=true`.
+
+---
+
 ## 2. Endpoints used
 
 | Purpose | Endpoint | Notes |

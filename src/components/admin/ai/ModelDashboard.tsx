@@ -66,6 +66,14 @@ interface EventRow {
 
 interface Configuration {
   backend: string;
+  /** Agnes AI is the primary provider; optional so an older API still renders. */
+  agnesConfigured?: boolean;
+  agnesTextModel?: string;
+  agnesImageModel?: string;
+  agnesBaseUrl?: string;
+  providerOrder?: string[];
+  pinnedBackend?: string | null;
+  providerProblems?: string[];
   huggingFaceConfigured: boolean;
   allowPaidInference: boolean;
   requireConfirmedPricing: boolean;
@@ -438,6 +446,109 @@ function ModelRow({
   );
 }
 
+interface ProviderTestResponse {
+  ok: boolean;
+  kind: 'text' | 'image';
+  model: string;
+  endpoint: string;
+  latencyMs: number;
+  testedAt: string;
+  sample?: string;
+  imageBytes?: number;
+  backend?: string;
+  configured?: boolean;
+  error?: { category: string; status?: number; message: string };
+}
+
+/**
+ * Runs one real Agnes AI request so "the key is set" becomes "the key works".
+ *
+ * Kept in the console because the failure modes it distinguishes — missing in
+ * this deployment, revoked key, no account access, wrong model id — all look
+ * identical from a dashboard environment-variable list.
+ */
+function AgnesProviderTest({ configured, backend }: { configured: boolean; backend: string }) {
+  const [busy, setBusy] = useState<'text' | 'image' | null>(null);
+  const [result, setResult] = useState<ProviderTestResponse | null>(null);
+
+  const run = useCallback(async (kind: 'text' | 'image') => {
+    setBusy(kind);
+    setResult(null);
+    try {
+      const res = await fetch('/api/admin/ai/providers/test', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ provider: 'agnes', kind }),
+      });
+      const json = (await res.json()) as ProviderTestResponse;
+      setResult(json);
+      if (json.ok) toast.success(`Agnes AI answered in ${Math.round(json.latencyMs)} ms`);
+      else toast.error(json.error?.message || 'The Agnes AI test failed.');
+    } catch (err: any) {
+      toast.error(err?.message || 'The Agnes AI test could not be started.');
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  return (
+    <div className="mt-5 pt-4 border-t border-border/60">
+      <div className="flex flex-wrap items-center gap-2 justify-between">
+        <div className="text-xs">
+          <span className="label mr-2">Live provider test</span>
+          <span className="text-muted-foreground">
+            Sends one tiny, real request to Agnes AI. Current backend: <code className="text-foreground">{backend}</code>
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          <button className="btn-outline text-[11px] px-2 py-1" disabled={busy !== null} onClick={() => void run('text')}>
+            {busy === 'text' ? <Loader2 className="w-3 h-3 animate-spin inline" /> : null} Test text
+          </button>
+          <button
+            className="btn-outline text-[11px] px-2 py-1"
+            disabled={busy !== null}
+            title="Spends provider credits; requires AI_ALLOW_LIVE_IMAGE_HEALTH_CHECKS=true"
+            onClick={() => void run('image')}
+          >
+            {busy === 'image' ? <Loader2 className="w-3 h-3 animate-spin inline" /> : null} Test image
+          </button>
+        </div>
+      </div>
+
+      {!configured && (
+        <p className="text-[11px] text-muted-foreground mt-2">
+          No key in this deployment, so a test will report the credential as missing rather than a provider error.
+        </p>
+      )}
+
+      {result && (
+        <div className={cn('mt-3 text-xs', result.ok ? 'text-emerald-400' : 'text-amber-400')}>
+          <div className="flex items-start gap-2">
+            {result.ok ? <CheckCircle2 className="w-3.5 h-3.5 mt-0.5" /> : <AlertTriangle className="w-3.5 h-3.5 mt-0.5" />}
+            <div className="space-y-1">
+              <div>
+                {result.ok
+                  ? `Answered by ${result.model} in ${Math.round(result.latencyMs)} ms`
+                  : `Failed (${result.error?.category ?? 'unknown'}${result.error?.status ? ` · HTTP ${result.error.status}` : ''}): ${result.error?.message ?? 'no detail'}`}
+              </div>
+              <div className="text-muted-foreground">
+                {result.endpoint}
+                {result.imageBytes ? ` · ${result.imageBytes.toLocaleString()} bytes` : ''}
+              </div>
+              {result.sample && <div className="text-foreground/80">“{result.sample}”</div>}
+              {result.configured === false && (
+                <div className="text-muted-foreground">
+                  The key is still missing from this deployment, so generations will use the fallback chain.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function OverviewTab({ overview, configuration, usage }: { overview: Overview; configuration: Configuration | null; usage: any }) {
   const cards = [
     { label: 'Configured models', value: overview.configured.total, hint: `${overview.configured.text} text · ${overview.configured.image} image`, icon: Cpu },
@@ -473,7 +584,20 @@ function OverviewTab({ overview, configuration, usage }: { overview: Overview; c
           <div className="label mb-3">Active policy</div>
           <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
             <PolicyRow label="Backend" value={configuration.backend} />
-            <PolicyRow label="Hugging Face token" value={configuration.huggingFaceConfigured ? 'configured' : 'missing'} />
+            <PolicyRow
+              label="Agnes AI key (primary)"
+              value={configuration.agnesConfigured ? 'configured' : 'missing'}
+            />
+            <PolicyRow label="Agnes text model" value={configuration.agnesTextModel ?? 'agnes-2.5-flash'} />
+            <PolicyRow label="Agnes image model" value={configuration.agnesImageModel ?? 'agnes-image-2.5-flash'} />
+            <PolicyRow
+              label="Hugging Face token (fallback)"
+              value={configuration.huggingFaceConfigured ? 'configured' : 'missing'}
+            />
+            <PolicyRow
+              label="Provider order"
+              value={configuration.pinnedBackend ? `pinned: ${configuration.pinnedBackend}` : (configuration.providerOrder ?? ['agnes', 'huggingface', 'openai']).join(' → ')}
+            />
             <PolicyRow label="Paid inference" value={configuration.allowPaidInference ? 'allowed' : 'blocked (free-only)'} />
             <PolicyRow label="Confirmed pricing required" value={configuration.requireConfirmedPricing ? 'yes' : 'no'} />
             <PolicyRow label="Automatic fallback" value={configuration.fallbackEnabled ? `yes (max ${configuration.maxFallbackAttempts})` : 'no'} />
@@ -484,13 +608,34 @@ function OverviewTab({ overview, configuration, usage }: { overview: Overview; c
             <PolicyRow label="Primary text model" value={overview.primary.text ?? 'none'} />
             <PolicyRow label="Primary image model" value={overview.primary.image ?? 'none'} />
           </div>
+          {!configuration.agnesConfigured && (
+            <p className="text-xs text-amber-400 mt-4 flex items-start gap-2">
+              <AlertTriangle className="w-3.5 h-3.5 mt-0.5" />
+              AGNES_API_KEY is not visible to this deployment, so text and cover generation run on the fallback chain
+              (Hugging Face, then OpenAI, then demo). Add the key in the host with the Production scope and redeploy —
+              variables are captured when a deployment is built, so an existing deployment will not pick it up.
+            </p>
+          )}
           {!configuration.huggingFaceConfigured && (
             <p className="text-xs text-amber-400 mt-4 flex items-start gap-2">
               <AlertTriangle className="w-3.5 h-3.5 mt-0.5" />
-              HF_TOKEN is not configured, so no model can be verified or called. Set it in the environment, then run verification to
+              HF_TOKEN is not configured, so no hosted model can be verified or called as a fallback. Set it in the environment, then run verification to
               populate real availability and pricing.
             </p>
           )}
+          {configuration.providerProblems?.length ? (
+            <div className="text-xs text-amber-400 mt-4">
+              <div className="flex items-center gap-2 mb-1">
+                <AlertTriangle className="w-3.5 h-3.5" /> Configuration problems
+              </div>
+              <ul className="list-disc pl-5 space-y-1">
+                {configuration.providerProblems.map(problem => (
+                  <li key={problem}>{problem}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          <AgnesProviderTest configured={Boolean(configuration.agnesConfigured)} backend={configuration.backend} />
         </div>
       )}
 
