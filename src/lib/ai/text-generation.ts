@@ -70,6 +70,7 @@ export interface TextResult { text: string; meta: GenerationMeta }
 export interface StructuredResult<T> { data: T; meta: GenerationMeta }
 
 export interface GenerateTextInput {
+  onText?: (text: string) => void;
   messages: ChatMessage[];
   model?: string;
   temperature?: number;
@@ -134,6 +135,7 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
         jobId: input.jobId,
         taskType: input.taskType,
         signal: input.signal,
+        onText: input.onText,
       });
       return {
         text: result.text,
@@ -187,7 +189,8 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
         jobId: input.jobId,
         taskType: input.taskType,
         signal: input.signal,
-        allowFallback: input.allowModelFallback !== false && input.allowFallbackOnError !== false,
+        onText: input.onText,
+        allowFallback: input.allowModelFallback !== false,
         deduplicate: true,
       });
       if (!result.text.trim()) throw new Error('The model returned an empty response.');
@@ -227,6 +230,7 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
   const client = getOpenAI();
   const model = input.model || aiConfig.textModel;
   if (!client) {
+    if (input.taskType === 'chapter') throw new Error('No text AI provider is available. Configure AGNES_API_KEY, HF_TOKEN, or OPENAI_API_KEY on the server and redeploy.');
     return {
       text: input.fallbackText ?? demoTextResponse(input.messages),
       meta: { source: 'demo', model, usedFallback: false },
@@ -243,7 +247,21 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
       if (input.signal?.aborted) throw new Error('Generation request was cancelled.');
-      const resp = await withTimeout(
+      input.onText?.('');
+      const resp = input.onText ? await (async () => {
+        const stream = await client.chat.completions.create({
+          model, messages: input.messages, temperature: input.temperature ?? 0.8,
+          max_tokens: maxTokens, stream: true, stream_options: { include_usage: true },
+        }, { timeout: aiConfig.timeoutMs, signal: input.signal });
+        let text = '';
+        let usage;
+        for await (const part of stream) {
+          if (part.usage) usage = part.usage;
+          const delta = part.choices[0]?.delta?.content;
+          if (delta) { text += delta; input.onText?.(text); }
+        }
+        return { choices: [{ message: { content: text } }], usage };
+      })() : await withTimeout(
         client.chat.completions.create({
           model,
           messages: input.messages,

@@ -15,6 +15,7 @@ import { hfChatCompletion, type HfChatCompletionResult } from './huggingface-cli
 import { deduplicateParagraphs, extractJsonObject, validateTextOutput } from './output-validation';
 
 export interface HfTextInput {
+  onText?: (text: string) => void;
   /** Chat messages (system + user) in NovelForge's existing format. */
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
   model?: string;
@@ -73,6 +74,7 @@ export async function generateTextHuggingFace(input: HfTextInput): Promise<HfTex
     requestedModelId: input.model && input.model !== 'auto' ? input.model : 'auto',
     allowFallback: input.allowFallback,
     signal: input.signal,
+
     requiredContextTokens,
     context: {
       userId: input.userId ?? null,
@@ -88,6 +90,7 @@ export async function generateTextHuggingFace(input: HfTextInput): Promise<HfTex
       maxNewTokens: input.maxTokens ?? 2_048,
       temperature: input.temperature ?? 0.8,
       signal: input.signal,
+      onText: input.onText,
     }),
     validate: value => {
       const check = validateTextOutput(value.text, { minChars: 1, rejectPromptEcho: true, prompt });

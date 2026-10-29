@@ -17,6 +17,7 @@
  * value. Error bodies are redacted before they leave this module.
  */
 import 'server-only';
+import { readChatStream } from './chat-stream';
 import { huggingFaceToken, aiPolicy, type ImageTransport } from './config';
 import type { AiErrorCategory } from './types';
 
@@ -165,6 +166,7 @@ function routedModelId(modelId: string, provider?: string): string {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface HfChatRequest extends HfRequestOptions {
+  onText?: (text: string) => void;
   modelId: string;
   systemPrompt?: string;
   prompt: string;
@@ -184,7 +186,7 @@ export async function hfChatCompletion(req: HfChatRequest): Promise<HfChatComple
   const body: Record<string, unknown> = {
     model: routedModelId(req.modelId, req.provider),
     messages,
-    stream: false,
+    stream: !!req.onText,
     max_tokens: Math.max(1, Math.min(req.maxNewTokens ?? 2_048, policy.maxOutputTokens)),
     temperature: req.temperature ?? 0.8,
   };
@@ -203,7 +205,9 @@ export async function hfChatCompletion(req: HfChatRequest): Promise<HfChatComple
     throw new HfHttpError(res.status, await readErrorBody(res), res.headers);
   }
 
-  const json = (await res.json().catch(() => ({}))) as any;
+  const json = req.onText
+    ? await readChatStream(res, req.onText, req.timeoutMs ?? policy.requestTimeoutMs)
+    : (await res.json().catch(() => ({}))) as any;
   const text: string = json?.choices?.[0]?.message?.content ?? '';
   const provider = res.headers.get('x-inference-provider') ?? json?.provider ?? undefined;
   const usage = json?.usage

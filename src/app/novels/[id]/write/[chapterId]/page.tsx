@@ -5,7 +5,7 @@ import WritingWorkspace from '@/components/editor/WritingWorkspace';
 import { getNavigation, listVersions } from '@/services/chapters/service';
 import { notFound } from 'next/navigation';
 
-export default async function WritePage({ params }: any) {
+export default async function WritePage({ params, searchParams }: any) {
   const session = (await auth()) as any;
   await requireNovel(params.id, session.user.id);
   const db = getDb();
@@ -30,7 +30,8 @@ export default async function WritePage({ params }: any) {
 
   return (
     <WritingWorkspace
-      key={chapter?.id || `chapter-${params.chapterId}`}
+      key={`chapter-${params.chapterId}`}
+      autoGenerate={searchParams?.generate === '1'}
       novel={novel}
       chapter={chapter}
       outline={outline}

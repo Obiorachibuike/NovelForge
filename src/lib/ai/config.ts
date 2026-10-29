@@ -132,13 +132,13 @@ export function isExplicitHuggingFaceModel(model?: string | null): boolean {
  */
 export function aiBackend(): AiBackend {
   const pinned = (process.env.AI_BACKEND || process.env.AI_PROVIDER || '').toLowerCase();
-  if (pinned === 'agnes') {
+  if (pinned === 'agnes' && agnesConfigured()) {
     return agnesConfigured() ? 'agnes' : 'demo';
   }
-  if (pinned === 'huggingface' || pinned === 'hf') {
+  if ((pinned === 'huggingface' || pinned === 'hf') && huggingFaceConfigured()) {
     return huggingFaceConfigured() ? 'huggingface' : 'demo';
   }
-  if (pinned === 'openai') {
+  if (pinned === 'openai' && process.env.OPENAI_API_KEY) {
     return process.env.OPENAI_API_KEY ? 'openai' : 'demo';
   }
   if (agnesConfigured()) return 'agnes';
