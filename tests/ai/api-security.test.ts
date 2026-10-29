@@ -96,7 +96,7 @@ describe('authentication and authorisation', () => {
     const res = await adminOverviewRoute(jsonRequest('/api/admin/ai/overview'));
     expect(res.status).toBe(200);
     const body = await readJson(res);
-    expect(body.overview.configured).toEqual({ text: 50, image: 20, total: 70 });
+    expect(body.overview.configured).toEqual({ text: 55, image: 23, total: 78 });
     expect(body.configuration.huggingFaceConfigured).toBe(true);
     expect(body.configuration.routerBaseUrl).toContain('router.huggingface.co');
     assertNoSecret(body);
@@ -220,7 +220,7 @@ describe('catalogue endpoints', () => {
     const res = await listModels(jsonRequest('/api/ai/models?limit=200&overview=true'));
     expect(res.status).toBe(200);
     const body = await readJson(res);
-    expect(body.models.length).toBe(70);
+    expect(body.models.length).toBe(78);
     expect(body.models.every((m: any) => m.availability === 'Unverified' || m.availability === 'Not verified')).toBeFalsy;
     expect(body.models.filter((m: any) => m.task === 'text-generation')).toHaveLength(50);
     expect(body.models.filter((m: any) => m.task === 'text-to-image')).toHaveLength(20);
@@ -235,8 +235,8 @@ describe('catalogue endpoints', () => {
     const image = await readJson(await imageModelsRoute(jsonRequest('/api/ai/models/image')));
     expect(text.models.every((m: any) => m.task === 'text-generation')).toBe(true);
     expect(image.models.every((m: any) => m.task === 'text-to-image')).toBe(true);
-    expect(text.count).toBe(50);
-    expect(image.count).toBe(20);
+    expect(text.count).toBe(55);
+    expect(image.count).toBe(23);
   });
 
   it('does not call the provider when serving the catalogue', async () => {

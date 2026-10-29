@@ -62,6 +62,7 @@ describe('aiProviderSummary', () => {
   it('surfaces a pinned backend and its misconfiguration by name only', () => {
     process.env.AI_BACKEND = 'agnes';
     delete process.env.AGNES_API_KEY;
+    delete process.env.HF_TOKEN;
     const summary = aiProviderSummary();
     expect(summary.pinnedBackend).toBe('agnes');
     expect(summary.backend).toBe('demo');

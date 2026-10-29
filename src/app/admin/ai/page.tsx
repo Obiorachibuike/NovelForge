@@ -22,11 +22,11 @@ export default async function AdminAiPage() {
       <div className="max-w-7xl mx-auto px-8 py-10">
         <header className="mb-8">
           <div className="label text-primary mb-2">ADMIN · AI INFRASTRUCTURE</div>
-          <h1 className="font-serif text-3xl font-semibold">Hugging Face model management</h1>
+          <h1 className="font-serif text-3xl font-semibold">Agnes AI model management</h1>
           <p className="text-muted-foreground mt-2 max-w-3xl">
-            NovelForge is configured with 50 text models and 20 text-to-image models. Configured does not mean operational:
-            availability, hosted-provider support and pricing are reported only from real verification or a successful
-            inference. Run verification (metadata first, smoke tests when you want proof) before relying on a model.
+            NovelForge uses Agnes AI as the primary provider for text and image generation. Configured does not mean operational:
+            availability and pricing are reported only from real verification or a successful inference. Administrators can add
+            new Agnes-compatible models via the console; run verification (smoke tests when you want proof) before relying on a model.
           </p>
         </header>
         <ModelDashboard />

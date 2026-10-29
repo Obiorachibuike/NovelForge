@@ -491,6 +491,15 @@ export const migrations: Migration[] = [
       `ALTER TABLE auth_action_tokens ADD COLUMN failedAttempts INTEGER NOT NULL DEFAULT 0`,
     ],
   },
+  {
+    id: '0012_agnes_primary_purge_hf',
+    description: 'Agnes AI is now the primary provider — registry now includes Agnes models alongside legacy Hugging Face entries (HF kept for backward compatibility; generate via Agnes by default).',
+    statements: [
+      // No-op migration: previously this purged HF models, but we now keep them for backward compatibility
+      // while Agnes is primary. The version bump ensures health checks see the Agnes milestone.
+      `CREATE TABLE IF NOT EXISTS schema_migrations (id TEXT PRIMARY KEY, description TEXT NOT NULL, appliedAt TEXT NOT NULL)`,
+    ],
+  },
 ];
 
 export interface MigrationResult {

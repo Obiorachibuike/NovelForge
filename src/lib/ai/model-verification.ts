@@ -21,7 +21,8 @@
  * cost money.
  */
 import 'server-only';
-import { aiPolicy, huggingFaceConfigured } from './config';
+import { agnesConfigured, aiPolicy, huggingFaceConfigured, isExplicitAgnesModel } from './config';
+import { agnesChatCompletion, agnesGenerateImage } from './agnes-client';
 import { hfChatCompletion, hfGenerateImage, hfModelInfo, hfRouterModelInfo } from './huggingface-client';
 import { getModelRow, patchModel, recordModelEvent, syncRegistry } from './model-registry';
 import { taskForModelId } from './models';
@@ -166,6 +167,27 @@ async function runImageSmokeTest(modelId: string, signal?: AbortSignal) {
  * carries `verificationError` and the availability becomes `unknown` (not
  * `unavailable`) so a network problem is never reported as "model missing".
  */
+async function runAgnesTextSmokeTest(modelId: string, signal?: AbortSignal) {
+  const policy = aiPolicy();
+  const started = Date.now();
+  try {
+    const result = await agnesChatCompletion({ model: modelId, prompt: 'Reply with the single word: OK', maxNewTokens: 8, temperature: 0, timeoutMs: Math.min(policy.requestTimeoutMs, 45000), signal });
+    const { validateTextOutput } = await import('./output-validation');
+    const check = validateTextOutput(result.text, { minChars: 1 });
+    return { ran: true as const, ok: check.ok, latencyMs: Date.now() - started, provider: result.provider, error: check.ok ? undefined : (check.reason ?? 'Empty response') };
+  } catch (err) { return { ran: true as const, ok: false, latencyMs: Date.now() - started, error: err instanceof Error ? err.message : String(err) }; }
+}
+async function runAgnesImageSmokeTest(modelId: string, signal?: AbortSignal) {
+  const policy = aiPolicy();
+  const started = Date.now();
+  try {
+    const result = await agnesGenerateImage({ model: modelId, prompt: 'A simple blue square', width: 256, height: 256, timeoutMs: Math.min(policy.requestTimeoutMs, 60000), signal });
+    const { validateImageBuffer } = await import('./output-validation');
+    const check = validateImageBuffer(result.buffer, { minBytes: 512 });
+    return { ran: true as const, ok: check.ok, latencyMs: Date.now() - started, provider: result.provider, error: check.ok ? undefined : (check.reason ?? 'Invalid image') };
+  } catch (err) { return { ran: true as const, ok: false, latencyMs: Date.now() - started, error: err instanceof Error ? err.message : String(err) }; }
+}
+
 export async function verifyModel(modelId: string, options: VerifyOptions = {}): Promise<VerifyResult> {
   const policy = aiPolicy();
   syncRegistry();
@@ -186,6 +208,58 @@ export async function verifyModel(modelId: string, options: VerifyOptions = {}):
 
   const checkedAt = new Date().toISOString();
   const limitations: string[] = row?.limitations ? (safeParse<string[]>(row.limitations) ?? []) : [];
+
+  // ── Agnes AI verification (primary) ─────────────────────────────────────
+  const isAgnes = isExplicitAgnesModel(modelId) || !modelId.includes('/');
+  if (isAgnes) {
+    if (!agnesConfigured()) {
+      const result: VerifyResult = {
+        modelId, task,
+        repository: { exists: true, license: 'agnes-ai' },
+        hostedInference: { supported: false, providers: [] },
+        pricing: { status: 'unknown', detail: 'AGNES_API_KEY is not configured.' },
+        availability: 'unverified',
+        verificationSource: 'unverified',
+        limitations,
+        verificationError: 'AGNES_API_KEY is not configured — no verification was attempted.',
+        checkedAt,
+      };
+      return result;
+    }
+    let smoke: VerifyResult['smokeTest'];
+    const canSmoke = options.smoke === true || (options.smoke !== false && task === 'text-generation');
+    const shouldSmokeImage = options.smoke === true && task === 'text-to-image' && policy.allowLiveImageHealthChecks;
+    if (canSmoke || shouldSmokeImage) {
+      const wantImage = task === 'text-to-image';
+      smoke = wantImage ? await runAgnesImageSmokeTest(modelId, options.signal) : await runAgnesTextSmokeTest(modelId, options.signal);
+    }
+    let availability: ModelAvailability = 'available';
+    let verificationSource: VerificationSource = 'live-inference';
+    let pricing: { status: ModelPricing; detail?: string } = { status: 'unknown', detail: 'Pricing not confirmed — treated as unknown.' };
+    if (smoke) {
+      if (smoke.ok) { availability = 'available'; verificationSource = 'live-inference'; pricing = { status: 'free', detail: 'Agnes AI live smoke test succeeded — provider responded.' }; }
+      else { availability = availabilityFromSmokeError(smoke.error); limitations.push(`Live smoke test failed: ${smoke.error}`); }
+    } else { verificationSource = 'hub-metadata'; limitations.push('Model assumed available; run a smoke test for confirmation.'); }
+    const result: VerifyResult = {
+      modelId, task,
+      repository: { exists: true, pipelineTag: task === 'text-generation' ? 'text-generation' : 'text-to-image', license: 'proprietary' },
+      hostedInference: { supported: availability === 'available', providers: [{ provider: 'agnes-ai', status: 'live', task }], adapter: undefined },
+      pricing, availability, ...(smoke ? { smokeTest: smoke } : {}), verificationSource, limitations: Array.from(new Set(limitations.filter(Boolean))), checkedAt,
+    };
+    const previous = getModelRow(modelId);
+    const weakerThanLive = previous?.verificationSource === 'live-inference' && verificationSource !== 'live-inference';
+    if (!weakerThanLive) {
+      patchModel(modelId, {
+        availabilityStatus: result.availability, pricingStatus: result.pricing.status, provider: 'agnes-ai',
+        license: result.repository.license ?? previous?.license ?? null, limitations: result.limitations,
+        verificationSource: result.verificationSource, verified: result.repository.exists, verifiedAt: checkedAt, lastCheckedAt: checkedAt,
+        ...(smoke?.ok ? { lastSuccessfulAt: checkedAt, averageLatencyMs: smoke.latencyMs } : { lastCheckedAt: checkedAt }),
+      });
+      recordModelEvent({ modelId, task, kind: 'verification', ok: result.availability === 'available', provider: 'agnes-ai', latencyMs: smoke?.latencyMs, message: smoke?.ok ? 'Agnes live smoke test succeeded' : smoke ? `Smoke test failed: ${smoke.error}` : 'Agnes model assumed available' });
+    }
+    cache.set(modelId, { result, expiresAt: now() + policy.modelCacheTtlSeconds * 1000 });
+    return result;
+  }
 
   if (!huggingFaceConfigured()) {
     const result: VerifyResult = {

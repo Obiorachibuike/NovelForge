@@ -534,6 +534,102 @@ export function registryOverview(): RegistryOverview {
 }
 
 /** Test helper: drops registry rows so tests start from a clean slate. */
+
+export interface CreateModelInput {
+  id: string;
+  name?: string;
+  task: ModelTask;
+  category?: string;
+  provider?: string | null;
+  contextLength?: number | null;
+  pricingStatus?: ModelPricing;
+  availabilityStatus?: ModelAvailability;
+  limitations?: string[];
+  license?: string | null;
+  supportedSizes?: Array<{ width: number; height: number }> | null;
+  enabled?: boolean;
+}
+
+/**
+ * Administrator-only: creates a new model row.
+ */
+export function createModel(input: CreateModelInput): ModelRow {
+  const db = getDb();
+  const now = nowIso();
+  const trimmedId = input.id.trim();
+  if (!trimmedId) throw new Error('Model id is required.');
+  if (/\s/.test(trimmedId)) throw new Error('Model id cannot contain whitespace.');
+  if (getModelRow(trimmedId)) throw new Error(`Model "${trimmedId}" already exists.`);
+  if (input.task !== 'text-generation' && input.task !== 'text-to-image') {
+    throw new Error('task must be "text-generation" or "text-to-image".');
+  }
+  const name = (input.name?.trim() || displayNameFromId(trimmedId));
+  const category = input.category?.trim() || (input.task === 'text-generation' ? 'Custom · Text' : 'Custom · Image');
+  db.prepare(
+    `INSERT INTO ai_model_registry
+       (id,name,task,category,provider,availabilityStatus,pricingStatus,license,enabled,verified,
+        contextLength,supportedSizes,supportsNegativePrompt,limitations,adapter,verificationSource,
+        failureCount,successCount,isPrimary,createdAt,updatedAt)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run(
+    trimmedId,
+    name,
+    input.task,
+    category,
+    input.provider ?? null,
+    input.availabilityStatus ?? 'unverified',
+    input.pricingStatus ?? 'unknown',
+    input.license ?? null,
+    input.enabled !== false ? 1 : 0,
+    0,
+    input.contextLength ?? null,
+    input.supportedSizes ? JSON.stringify(input.supportedSizes) : null,
+    null,
+    input.limitations?.length ? JSON.stringify(input.limitations) : null,
+    null,
+    'unverified',
+    0,
+    0,
+    0,
+    now,
+    now,
+  );
+  recordModelEvent({
+    modelId: trimmedId,
+    task: input.task,
+    kind: 'admin',
+    ok: true,
+    message: `Created by administrator (${category})`,
+  });
+  return getModelRow(trimmedId)!;
+}
+
+function displayNameFromId(id: string): string {
+  if (!id.includes('/')) {
+    return id.replace(/^agnes-?/i, 'Agnes ').replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).trim() || id;
+  }
+  const [, name] = id.split('/');
+  return name || id;
+}
+
+/**
+ * Administrator-only: deletes a model row and its events.
+ */
+export function deleteModel(modelId: string): boolean {
+  const db = getDb();
+  const row = getModelRow(modelId);
+  if (!row) return false;
+  const tx = db.transaction(() => {
+    db.prepare('DELETE FROM ai_model_events WHERE modelId = ?').run(modelId);
+    if (row.isPrimary) {
+      db.prepare('UPDATE ai_model_registry SET isPrimary=0 WHERE id=?').run(modelId);
+    }
+    db.prepare('DELETE FROM ai_model_registry WHERE id = ?').run(modelId);
+  });
+  tx();
+  return true;
+}
+
 export function resetRegistryForTests(): void {
   const db = getDb();
   db.prepare('DELETE FROM ai_model_events').run();

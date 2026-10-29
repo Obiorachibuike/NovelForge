@@ -31,16 +31,21 @@ import {
 describe('model registry (configuration)', () => {
   it('contains exactly the 50 requested text model IDs, in order, with no duplicates', () => {
     expect(textToTextModels).toHaveLength(EXPECTED_TEXT_MODEL_COUNT);
+    expect(EXPECTED_TEXT_MODEL_COUNT).toBe(55);
     expect(new Set(textToTextModels).size).toBe(EXPECTED_TEXT_MODEL_COUNT);
   });
 
   it('contains exactly the 20 requested image model IDs, in order, with no duplicates', () => {
     expect(textToImageModels).toHaveLength(EXPECTED_IMAGE_MODEL_COUNT);
+    expect(EXPECTED_IMAGE_MODEL_COUNT).toBe(23);
     expect(new Set(textToImageModels).size).toBe(EXPECTED_IMAGE_MODEL_COUNT);
   });
 
   it('preserves the exact supplied identifiers', () => {
     const requiredText = [
+      'agnes-2.5-flash',
+      'agnes-2.5-pro-alpha',
+      'agnes-1.5-flash',
       'deepseek-ai/DeepSeek-V3',
       'Qwen/Qwen2.5-72B-Instruct',
       'meta-llama/Llama-3.1-70B-Instruct',
@@ -58,6 +63,8 @@ describe('model registry (configuration)', () => {
       'epfl-llm/meditron-70b',
     ];
     const requiredImage = [
+      'agnes-image-2.5-flash',
+      'agnes-image-2.1-flash',
       'black-forest-labs/FLUX.1-dev',
       'black-forest-labs/FLUX.1-schnell',
       'black-forest-labs/flux-3-image-klein',
@@ -90,8 +97,8 @@ describe('model registry (configuration)', () => {
       expect(model.category).not.toBe('Uncategorised');
       expect(model.task).toBe('text-to-image');
     }
-    expect(Object.keys(TEXT_MODEL_CATEGORIES)).toHaveLength(7);
-    expect(Object.keys(IMAGE_MODEL_CATEGORIES)).toHaveLength(5);
+    expect(Object.keys(TEXT_MODEL_CATEGORIES)).toHaveLength(8);
+    expect(Object.keys(IMAGE_MODEL_CATEGORIES)).toHaveLength(6);
   });
 
   it('resolves task membership and rejects unknown ids', () => {
@@ -117,12 +124,12 @@ describe('model registry (persistence)', () => {
 
   it('seeds all 70 configured models exactly once', () => {
     const first = syncRegistry();
-    expect(first.added).toHaveLength(70);
+    expect(first.added).toHaveLength(78);
     const second = syncRegistry();
     expect(second.added).toHaveLength(0);
-    expect(listModelRows({ limit: 500 })).toHaveLength(70);
-    expect(listModelRows({ task: 'text-generation', limit: 500 })).toHaveLength(50);
-    expect(listModelRows({ task: 'text-to-image', limit: 500 })).toHaveLength(20);
+    expect(listModelRows({ limit: 500 })).toHaveLength(78);
+    expect(listModelRows({ task: 'text-generation', limit: 500 })).toHaveLength(55);
+    expect(listModelRows({ task: 'text-to-image', limit: 500 })).toHaveLength(23);
   });
 
   it('never overwrites verification data when re-seeding', () => {
@@ -183,11 +190,11 @@ describe('model registry (persistence)', () => {
   it('computes dashboard counts from persisted evidence only', () => {
     syncRegistry();
     let overview = registryOverview();
-    expect(overview.configured).toEqual({ text: 50, image: 20, total: 70 });
+    expect(overview.configured).toEqual({ text: 55, image: 23, total: 78 });
     expect(overview.successfullyTested).toBe(0);
     expect(overview.hostedInferenceSupported).toBe(0);
-    expect(overview.byPricing.unknown).toBe(70);
-    expect(overview.enabled).toBe(70);
+    expect(overview.byPricing.unknown).toBe(78);
+    expect(overview.enabled).toBe(78);
 
     patchModel('Qwen/Qwen2.5-7B-Instruct', { availabilityStatus: 'available', pricingStatus: 'free', provider: 'together' });
     patchModel('black-forest-labs/FLUX.1-schnell', { availabilityStatus: 'available', pricingStatus: 'free', provider: 'fal-ai' });
@@ -196,7 +203,7 @@ describe('model registry (persistence)', () => {
     expect(overview.hostedInferenceSupported).toBe(2);
     expect(overview.byPricing.free).toBe(2);
     expect(overview.disabled).toBe(1);
-    expect(overview.enabled).toBe(69);
+    expect(overview.enabled).toBe(77);
   });
 
   it('filters by search, category, availability and pricing', () => {
@@ -219,6 +226,6 @@ describe('model registry (persistence)', () => {
     const row = getModelRow('XLabs-AI/flux-RealismLora')!;
     expect(JSON.parse(row.adapter!)).toMatchObject({ kind: 'lora' });
     expect(row.availabilityStatus).toBe('unsupported');
-    expect(db().prepare('SELECT COUNT(*) AS c FROM ai_model_registry WHERE task = ?').get('text-to-image')).toEqual({ c: 20 });
+    expect(db().prepare('SELECT COUNT(*) AS c FROM ai_model_registry WHERE task = ?').get('text-to-image')).toEqual({ c: 23 });
   });
 });

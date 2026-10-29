@@ -19,6 +19,13 @@ import type { ImageModelMetadata, TextModelMetadata } from './types';
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const TEXT_MODEL_CATEGORIES = {
+  'Agnes AI · Primary (Flagship)': [
+    'agnes-2.5-flash',
+    'agnes-3.0-flash',
+    'agnes-2.5-pro-alpha',
+    'agnes-2.0-flash',
+    'agnes-1.5-flash',
+  ],
   'Tier 1: Frontier / Ultra-Large Scale Models': [
     'deepseek-ai/DeepSeek-V3',
     'Qwen/Qwen2.5-72B-Instruct',
@@ -86,6 +93,13 @@ export const TEXT_MODEL_CATEGORIES = {
 } as const;
 
 export const textToTextModels = [
+  // Agnes AI: Primary provider (NovelForge main models)
+  'agnes-2.5-flash',
+  'agnes-3.0-flash',
+  'agnes-2.5-pro-alpha',
+  'agnes-2.0-flash',
+  'agnes-1.5-flash',
+
   // Tier 1: Frontier / Ultra-Large Scale Models
   'deepseek-ai/DeepSeek-V3',
   'Qwen/Qwen2.5-72B-Instruct',
@@ -156,6 +170,11 @@ export const textToTextModels = [
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const IMAGE_MODEL_CATEGORIES = {
+  'Agnes Image · Primary': [
+    'agnes-image-2.5-flash',
+    'agnes-image-2.1-flash',
+    'agnes-image-2.0-flash',
+  ],
   'Tier 1: FLUX Architecture Family': [
     'black-forest-labs/FLUX.1-dev',
     'black-forest-labs/FLUX.1-schnell',
@@ -189,6 +208,11 @@ export const IMAGE_MODEL_CATEGORIES = {
 } as const;
 
 export const textToImageModels = [
+  // Agnes AI: Primary image models
+  'agnes-image-2.5-flash',
+  'agnes-image-2.1-flash',
+  'agnes-image-2.0-flash',
+
   // Tier 1: FLUX Architecture Family
   'black-forest-labs/FLUX.1-dev',
   'black-forest-labs/FLUX.1-schnell',
@@ -220,8 +244,8 @@ export const textToImageModels = [
   'DeepFloyd/IF-I-XL-v1.0',
 ] as const;
 
-export const EXPECTED_TEXT_MODEL_COUNT = 50;
-export const EXPECTED_IMAGE_MODEL_COUNT = 20;
+export const EXPECTED_TEXT_MODEL_COUNT = 55;
+export const EXPECTED_IMAGE_MODEL_COUNT = 23;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Static, honest per-model notes.
@@ -233,6 +257,15 @@ export const EXPECTED_IMAGE_MODEL_COUNT = 20;
 // ─────────────────────────────────────────────────────────────────────────────
 
 const STATIC_LIMITATIONS: Record<string, string[]> = {
+  // Agnes AI — primary provider
+  'agnes-2.5-flash': ['512K context, 65.5K max output. Primary Agnes model for prose, agents and vision input.'],
+  'agnes-3.0-flash': ['512K context, 65.5K max output. Next-generation Agnes flagship; verify account access.'],
+  'agnes-2.5-pro-alpha': ['1M context, 65.5K max output. Higher list price than flash models; requires confirmed access.'],
+  'agnes-2.0-flash': ['256K context, 64K max output. Previous-generation Agnes flagship for compatibility fallback.'],
+  'agnes-1.5-flash': ['256K context, 64K max output. Low-latency model for high-throughput content workflows.'],
+  'agnes-image-2.5-flash': ['Agnes image generation with tier+ratio sizing (1K–4K). Base64 or URL output.'],
+  'agnes-image-2.1-flash': ['High-density visual generation and editing with flexible sizes.'],
+  'agnes-image-2.0-flash': ['Fast image generation variant for low-latency cover previews.'],
   // Adapter / LoRA weights — not a standalone text-to-image pipeline.
   'XLabs-AI/flux-RealismLora': [
     'Publishes LoRA adapter weights for a FLUX base model, not a standalone text-to-image pipeline.',
@@ -305,6 +338,12 @@ const STATIC_LIMITATIONS: Record<string, string[]> = {
 
 /** Human-friendly display name derived from the exact model id. */
 export function displayNameFor(modelId: string): string {
+  // Agnes ids are kebab-case without slashes, e.g. agnes-2.5-flash → Agnes 2.5 Flash.
+  if (!modelId.includes('/')) {
+    const parts = modelId.replace(/^agnes-?/i, '').trim();
+    const nice = modelId.toLowerCase().includes('agnes') ? `Agnes ${parts.replace(/-/g, ' ')}` : modelId;
+    return nice.replace(/\b\w/g, c => c.toUpperCase()).replace(/\s+/g, ' ').trim() || modelId;
+  }
   const [, name] = modelId.split('/');
   return name || modelId;
 }
@@ -392,7 +431,8 @@ export function validateRegistries(): string[] {
   const overlap = text.filter(id => IMAGE_IDS.has(id));
   if (overlap.length) problems.push(`Model IDs present in both registries: ${overlap.join(', ')}.`);
   for (const id of [...text, ...image]) {
-    if (!/^[^/]+\/[^/]+$/.test(id)) problems.push(`Model ID "${id}" is not in "owner/name" form.`);
+    // Agnes ids are like agnes-2.5-flash; HF ids are owner/name. Accept both, but require non-empty.
+    if (!id || !id.trim() || /\s/.test(id)) problems.push(`Model ID "${id}" is empty or contains whitespace.`);
   }
   const categorisedText: string[] = Object.values(TEXT_MODEL_CATEGORIES).flat().map(String);
   const categorisedImage: string[] = Object.values(IMAGE_MODEL_CATEGORIES).flat().map(String);
