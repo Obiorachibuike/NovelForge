@@ -208,8 +208,8 @@ describe('PostgreSQL database layer & SQLite-to-PostgreSQL migration', () => {
 
     const health = await checkPostgresHealth(backend.asyncPool);
     expect(health.connected).toBe(true);
-    // Updated by the hosted-inference migrations (0008 model registry, 0009 provenance).
-    expect(health.latestMigrationVersion).toBe('0011_auth_otp_codes');
+    // Updated by the hosted-inference migrations (0008 model registry, 0009 provenance, 0012 agnes purge).
+    expect(health.latestMigrationVersion).toBe('0012_agnes_primary_purge_hf');
     expect(health.pendingMigrations).toBe(0);
 
     // Verify withPgTransaction commits on success and rolls back on error

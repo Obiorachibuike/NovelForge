@@ -1,7 +1,8 @@
 import { requireUser } from '@/lib/db/ownership';
-import { apiHandler } from '@/lib/api/http';
+import { apiHandler, readJsonBody } from '@/lib/api/http';
 import { aiPolicy } from '@/lib/ai/config';
-import { listModelRows, syncRegistry, registryOverview } from '@/lib/ai/model-registry';
+import { createModel, listModelRows, syncRegistry, registryOverview } from '@/lib/ai/model-registry';
+import { requireAdmin } from '@/services/billing/service';
 import type { ModelAvailability, ModelPricing, ModelTask } from '@/lib/ai/types';
 import { z } from 'zod';
 
@@ -72,4 +73,48 @@ export const GET = apiHandler(async (req: Request) => {
     },
     viewer: { userId: user.id },
   });
+});
+
+const createSchema = z.object({
+  id: z.string().min(1).max(120).trim(),
+  name: z.string().max(120).optional(),
+  task: z.enum(['text-generation', 'text-to-image']),
+  category: z.string().max(120).optional(),
+  provider: z.string().max(64).optional().nullable(),
+  contextLength: z.number().int().min(256).max(2_000_000).optional().nullable(),
+  pricingStatus: z.enum(['free', 'paid', 'unknown']).optional(),
+  availabilityStatus: z.enum(['unverified','available','unavailable','unsupported','authentication_required','rate_limited','temporarily_unavailable','paid_only','unknown']).optional(),
+  limitations: z.array(z.string().max(500)).max(10).optional(),
+  enabled: z.boolean().optional(),
+});
+
+/**
+ * Administrator-only: registers a new model in the registry.
+ * Agnes AI is the primary provider, so new ids typically start with `agnes-`
+ * but any non-empty, whitespace-free id is accepted for custom integrations.
+ */
+export const POST = apiHandler(async (req: Request) => {
+  const user = await requireUser();
+  requireAdmin(user.id);
+  syncRegistry();
+  const body = await readJsonBody(req, v => createSchema.parse(v));
+  try {
+    const model = createModel({
+      id: body.id,
+      name: body.name,
+      task: body.task,
+      category: body.category,
+      provider: body.provider ?? null,
+      contextLength: body.contextLength ?? null,
+      pricingStatus: body.pricingStatus,
+      availabilityStatus: body.availabilityStatus,
+      limitations: body.limitations,
+      enabled: body.enabled,
+    });
+    return Response.json({ model }, { status: 201 });
+  } catch (err: any) {
+    const message = err instanceof Error ? err.message : String(err);
+    const status = message.includes('already exists') ? 409 : 400;
+    return Response.json({ error: message, code: status === 409 ? 'model_conflict' : 'validation_failed' }, { status });
+  }
 });

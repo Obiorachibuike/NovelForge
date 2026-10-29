@@ -1,10 +1,13 @@
 /**
- * Hugging Face + AI policy configuration.
+ * Agnes AI + fallback policy configuration.
  *
- * Everything here is server-side. The token is read from `process.env` at call
- * time (never at module load) so it is never captured in a module-level
- * constant that could be serialised into a client bundle, and it is excluded
- * from every object this module returns.
+ * Agnes AI is NovelForge's primary text/image provider. OpenAI remains as an
+ * optional secondary fallback; Hugging Face support is deprecated and only kept
+ * for backward compatibility with existing deployments.
+ *
+ * Everything here is server-side. Tokens are read at call time (never at module
+ * load) so they never leak into client bundles, and are excluded from returned
+ * objects.
  */
 import 'server-only';
 
@@ -18,6 +21,7 @@ export interface AiPolicyConfig {
   agnesBaseUrl: string;
   agnesTextModel: string;
   agnesImageModel: string;
+  /** Deprecated: Hugging Face Inference Providers (kept for migration). */
   huggingFaceConfigured: boolean;
   routerBaseUrl: string;
   hubApiBaseUrl: string;
@@ -49,8 +53,8 @@ const DEFAULTS = {
   routerBaseUrl: 'https://router.huggingface.co/v1',
   hubApiBaseUrl: 'https://huggingface.co/api',
   provider: 'auto',
-  defaultTextModel: 'Qwen/Qwen2.5-7B-Instruct',
-  defaultImageModel: 'black-forest-labs/FLUX.1-schnell',
+  defaultTextModel: 'agnes-2.5-flash',
+  defaultImageModel: 'agnes-image-2.5-flash',
   imageTransport: 'auto' as ImageTransport,
   fallbackEnabled: true,
   maxFallbackAttempts: 4,
@@ -80,11 +84,10 @@ function envBool(name: string, fallback: boolean): boolean {
   return raw === 'true' || raw === '1';
 }
 
-/** A Hugging Face token (fine-grained, "Make calls to Inference Providers"). */
+/** A Hugging Face token (deprecated — kept for backward compat). */
 export function huggingFaceToken(): string {
   const raw = process.env.HF_TOKEN || process.env.HUGGINGFACEHUB_API_TOKEN || '';
   const trimmed = raw.trim();
-  // Placeholder values from the template must not count as configured.
   if (!trimmed || /^(replace|your|hf_your|xxx)/i.test(trimmed)) return '';
   return trimmed;
 }
@@ -95,13 +98,11 @@ export function huggingFaceConfigured(): boolean {
 
 /**
  * An Agnes AI API key (created in the Agnes AI console at
- * platform.agnes-ai.com). Agnes AI is the primary text and image provider;
- * Hugging Face hosted inference is the fallback.
+ * platform.agnes-ai.com). Agnes AI is the primary text and image provider.
  */
 export function agnesToken(): string {
   const raw = process.env.AGNES_API_KEY || '';
   const trimmed = raw.trim();
-  // Placeholder values from the template must not count as configured.
   if (!trimmed || /^(replace|your|agnes_your|xxx|sk-your)/i.test(trimmed)) return '';
   return trimmed;
 }
@@ -115,31 +116,28 @@ export function isExplicitAgnesModel(model?: string | null): boolean {
   return !!model && /^agnes([-.].*)?$/i.test(model.trim());
 }
 
-/** True when the requested model id explicitly names a Hugging Face repo. */
+/** Deprecated: True when model id looks like a Hugging Face repo (owner/name). */
 export function isExplicitHuggingFaceModel(model?: string | null): boolean {
   return !!model && model.includes('/');
 }
 
 /**
- * Which text backend is active.
- *
- *  - `agnes`        when an AGNES_API_KEY is present (unless pinned otherwise):
- *                   Agnes AI serves text and images, Hugging Face falls back;
- *  - `huggingface`  when a HF token is present and the backend is not pinned to
- *                   OpenAI (or is explicitly pinned to Hugging Face);
- *  - `openai`       when the OpenAI key is used (existing behaviour, unchanged);
- *  - `demo`         when no provider credentials exist at all.
+ * Which backend is active.
+ *  - `agnes`  when AGNES_API_KEY is present (unless pinned otherwise)
+ *  - `openai` when OpenAI key is present
+ *  - `demo`   when no credentials exist
+ * Hugging Face is deprecated: it only activates when explicitly pinned and a token exists.
  */
 export function aiBackend(): AiBackend {
   const pinned = (process.env.AI_BACKEND || process.env.AI_PROVIDER || '').toLowerCase();
   if (pinned === 'agnes' && agnesConfigured()) {
-    return agnesConfigured() ? 'agnes' : 'demo';
+    return 'agnes';
   }
   if ((pinned === 'huggingface' || pinned === 'hf') && huggingFaceConfigured()) {
-    return huggingFaceConfigured() ? 'huggingface' : 'demo';
+    return 'huggingface';
   }
   if (pinned === 'openai' && process.env.OPENAI_API_KEY) {
-    return process.env.OPENAI_API_KEY ? 'openai' : 'demo';
+    return 'openai';
   }
   if (agnesConfigured()) return 'agnes';
   if (huggingFaceConfigured()) return 'huggingface';
@@ -177,7 +175,6 @@ export function aiPolicy(): AiPolicyConfig {
     maxTextRequestsPerUserPerHour: envNumber('AI_MAX_TEXT_REQUESTS_PER_USER_PER_HOUR', DEFAULTS.maxTextRequestsPerUserPerHour, 0),
     maxImageRequestsPerUserPerHour: envNumber('AI_MAX_IMAGE_REQUESTS_PER_USER_PER_HOUR', DEFAULTS.maxImageRequestsPerUserPerHour, 0),
     maxConcurrentRequests: envNumber('AI_MAX_CONCURRENT_REQUESTS', DEFAULTS.maxConcurrentRequests, 1),
-    // Expensive: image smoke tests only run when explicitly enabled.
     allowLiveImageHealthChecks: envBool('AI_ALLOW_LIVE_IMAGE_HEALTH_CHECKS', false),
     maxImageEdge: envNumber('AI_MAX_IMAGE_EDGE', DEFAULTS.maxImageEdge, 256),
     maxOutputTokens: envNumber('AI_MAX_COMPLETION_TOKENS', DEFAULTS.maxOutputTokens, 256),
@@ -190,37 +187,20 @@ export function aiPolicy(): AiPolicyConfig {
 
 export interface AiProviderStatus {
   name: 'agnes' | 'huggingface' | 'openai';
-  /** Where the provider sits in the chain: primary, fallback or legacy backend. */
   role: 'primary' | 'fallback' | 'legacy';
-  /** Whether the credential this provider needs is present in this runtime. */
   configured: boolean;
-  /** Model ids the provider will be asked for (not secrets). */
   models?: { text?: string; image?: string };
   endpoint?: string;
 }
 
 export interface AiProviderSummary {
-  /** The backend the next generation request will actually use. */
   backend: AiBackend;
-  /** Backends in the order they are attempted when fallback is enabled. */
   providerOrder: Array<'agnes' | 'huggingface' | 'openai'>;
-  /** `AI_BACKEND` when an operator pinned one explicitly. */
   pinnedBackend: 'agnes' | 'huggingface' | 'openai' | null;
   providers: AiProviderStatus[];
-  /** Configuration problems by variable *name* only — never a value. */
   problems: string[];
 }
 
-/**
- * Describes which hosted-inference provider is live and which credentials are
- * present, without ever reading a secret back out.
- *
- * This exists because "I set the API key in the host" and "the running
- * deployment is calling that provider" are different facts: a deployment made
- * before the variable was added, or a variable scoped to the wrong environment,
- * still reports a working demo backend. `backend` is the honest answer for the
- * process answering the request.
- */
 export function aiProviderSummary(): AiProviderSummary {
   const pinnedRaw = (process.env.AI_BACKEND || process.env.AI_PROVIDER || '').toLowerCase();
   const pinnedBackend =
@@ -254,7 +234,6 @@ export function aiProviderSummary(): AiProviderSummary {
         text: process.env.AI_TEXT_MODEL || 'gpt-4o-mini',
         image: process.env.AI_IMAGE_MODEL || 'dall-e-3',
       },
-      // Whether an OpenAI fallback is reached depends on the backend policy.
       endpoint: 'https://api.openai.com/v1',
     },
   ];
@@ -268,11 +247,6 @@ export function aiProviderSummary(): AiProviderSummary {
   };
 }
 
-/**
- * Validates the AI configuration. Called by the environment validator at
- * startup so a misconfiguration is reported once, clearly, instead of surfacing
- * as a confusing runtime failure on the first generation.
- */
 export function validateAiConfig(env: NodeJS.ProcessEnv = process.env): string[] {
   const problems: string[] = [];
   const backend = aiBackend();
@@ -306,10 +280,6 @@ export function validateAiConfig(env: NodeJS.ProcessEnv = process.env): string[]
     if (value < min) problems.push(`${name} must be >= ${min} (got ${value}).`);
   }
 
-  const router = env.HF_ROUTER_BASE_URL;
-  if (router && !/^https:\/\//.test(router)) {
-    problems.push('HF_ROUTER_BASE_URL must be an https:// URL.');
-  }
   const transport = (env.AI_IMAGE_TRANSPORT || 'auto').toLowerCase();
   if (!['auto', 'openai-compatible', 'task-native'].includes(transport)) {
     problems.push('AI_IMAGE_TRANSPORT must be "auto", "openai-compatible" or "task-native".');
@@ -317,15 +287,6 @@ export function validateAiConfig(env: NodeJS.ProcessEnv = process.env): string[]
   return problems;
 }
 
-/**
- * Free-only policy: whether a model's pricing status makes it eligible.
- *
- * Rules (strict by default):
- *  - paid inference disabled → `paid` models are skipped;
- *  - `unknown` pricing is skipped when confirmed pricing is required, and
- *    allowed (at the operator's risk) only when `AI_REQUIRE_CONFIRMED_PRICING`
- *    is explicitly turned off.
- */
 export function pricingAllowed(
   pricingStatus: 'free' | 'paid' | 'unknown',
   policy: Pick<AiPolicyConfig, 'allowPaidInference' | 'requireConfirmedPricing'> = aiPolicy(),

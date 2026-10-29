@@ -1,6 +1,7 @@
 import { requireUser } from '@/lib/db/ownership';
 import { apiHandler, HttpError } from '@/lib/api/http';
-import { getModelRow, recentModelEvents, syncRegistry } from '@/lib/ai/model-registry';
+import { deleteModel, getModelRow, recentModelEvents, syncRegistry } from '@/lib/ai/model-registry';
+import { requireAdmin } from '@/services/billing/service';
 
 export const dynamic = 'force-dynamic';
 
@@ -20,6 +21,19 @@ export const GET = apiHandler(async (_req: Request, ctx: { params: { id: string 
     adapter: model.adapter ? safeParse(model.adapter) : null,
     supportedSizes: model.supportedSizes ? safeParse(model.supportedSizes) : [],
   });
+});
+
+/** Administrator-only: deletes a custom or registry model. */
+export const DELETE = apiHandler(async (_req: Request, ctx: { params: { id: string } }) => {
+  const user = await requireUser();
+  requireAdmin(user.id);
+  const id = decodeURIComponent(ctx.params.id);
+  syncRegistry();
+  const model = getModelRow(id);
+  if (!model) throw new HttpError(404, `Model "${id}" is not registered.`, 'model_not_found');
+  const ok = deleteModel(id);
+  if (!ok) throw new HttpError(500, 'Could not delete model.', 'delete_failed');
+  return Response.json({ ok: true, deletedId: id });
 });
 
 function safeParse<T>(raw: string): T | null {

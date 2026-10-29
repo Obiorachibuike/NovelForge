@@ -188,8 +188,8 @@ describe('end-to-end authoring workflow, production health & config validation',
     expect(body.status).toBe('ok');
     expect(body.database.connected).toBe(true);
     expect(body.database.foreignKeysEnabled).toBe(true);
-    // Updated by the hosted-inference migrations (0008 model registry, 0009 provenance).
-    expect(body.database.latestMigrationVersion).toBe('0011_auth_otp_codes');
+    // Updated by the hosted-inference migrations (0008 model registry, 0009 provenance, 0012 agnes purge).
+    expect(body.database.latestMigrationVersion).toBe('0012_agnes_primary_purge_hf');
     // Transactional email is Brevo-backed; the test environment has no key, so
     // the probe must report it as unconfigured rather than claim it works.
     expect(body.email).toEqual({ provider: 'brevo', configured: false });

@@ -281,10 +281,10 @@ describe('model verification', () => {
     __setFetchForTests(fetchMock as unknown as typeof fetch);
 
     const results = await verifyAllModels({ task: 'text-to-image', smoke: false, force: true, concurrency: 4 });
-    expect(results).toHaveLength(20);
+    expect(results).toHaveLength(23);
     expect(new Set(results.map(r => r.task)).size).toBe(1);
     expect(results.every(r => r.task === 'text-to-image')).toBe(true);
-    expect(registryOverview().configured.image).toBe(20);
+    expect(registryOverview().configured.image).toBe(23);
     expect(recentModelEvents({ limit: 200 }).length).toBeGreaterThanOrEqual(20);
   });
 
@@ -299,6 +299,6 @@ describe('model verification', () => {
     expect(result.verificationError).toMatch(/HF_TOKEN/);
     expect(fetchMock.calls).toHaveLength(0);
     // The registry still says "unverified" rather than claiming anything.
-    expect(db().prepare('SELECT COUNT(*) AS c FROM ai_model_registry WHERE availabilityStatus = ?').get('unverified')).toEqual({ c: 70 });
+    expect(db().prepare('SELECT COUNT(*) AS c FROM ai_model_registry WHERE availabilityStatus = ?').get('unverified')).toEqual({ c: 78 });
   });
 });

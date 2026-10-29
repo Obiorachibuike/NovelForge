@@ -3,7 +3,7 @@
  *
  * The report is produced from persisted registry state, so it can only ever say
  * what has actually been observed. Anything not verified is reported as
- * unverified — including, before a verification run, all 70 models.
+ * unverified — including, before a verification run, all models.
  */
 import 'server-only';
 import { getDb } from '@/lib/db';
@@ -66,14 +66,14 @@ export function renderModelStatus(report: ModelStatusReport): string {
   lines.push('');
   lines.push(
     '> This report is generated from NovelForge\'s persisted model registry. "Configured" means the model ID is part of the ' +
-      'requested registry; it does **not** mean the model is served by a hosted provider, reachable by this account, or free. ' +
+      'requested registry; it does **not** mean the model is served by Agnes AI or reachable by this account. ' +
       'Regenerate it after a verification run with `npm run ai:models:report`.',
   );
   lines.push('');
   if (!report.tokenConfigured) {
     lines.push(
-      '> **No Hugging Face token was configured when this report was generated.** Every model below is therefore unverified: ' +
-        'no repository check, provider lookup or live inference was performed. Set `HF_TOKEN` and run `npm run ai:verify` to ' +
+      '> **No Agnes AI key was configured when this report was generated.** Every model below is therefore unverified: ' +
+        'no live inference was performed. Set `AGNES_API_KEY` and run `npm run ai:verify` to ' +
         'populate real statuses.',
     );
     lines.push('');
@@ -86,7 +86,6 @@ export function renderModelStatus(report: ModelStatusReport): string {
   lines.push(`| Configured text models | ${EXPECTED_TEXT_MODEL_COUNT} |`);
   lines.push(`| Configured image models | ${EXPECTED_IMAGE_MODEL_COUNT} |`);
   lines.push(`| Registered rows | ${rows.length} |`);
-  lines.push(`| Repositories verified on the Hub | ${overview.verifiedRepositories} |`);
   lines.push(`| Hosted inference supported | ${overview.hostedInferenceSupported} |`);
   lines.push(`| Successfully live-tested | ${overview.successfullyTested} |`);
   lines.push(`| Unavailable | ${availabilityCount('unavailable')} |`);
@@ -103,9 +102,9 @@ export function renderModelStatus(report: ModelStatusReport): string {
 
   lines.push('## How to read the columns');
   lines.push('');
-  lines.push('- **Repository** — the Hub repository was found (metadata check).');
-  lines.push('- **Hosted** — a provider is mapped to the model for the required task (provider-mapping/router-catalog check).');
-  lines.push('- **Live test** — an actual inference request completed successfully. This is the only column that proves end-to-end operation.');
+  lines.push('- **Repository** — the provider registry confirmed the model.');
+  lines.push('- **Hosted** — Agnes AI serves the model for the required task.');
+  lines.push('- **Live test** — an actual inference request completed successfully.');
   lines.push('- **Pricing** — `free`/`paid` come from provider pricing data; `unknown` is never treated as free.');
   lines.push('');
 
@@ -115,32 +114,21 @@ export function renderModelStatus(report: ModelStatusReport): string {
   ] as Array<[string, ModelRow[]]>) {
     lines.push(`## ${title} (${list.length})`);
     lines.push('');
-    lines.push('| # | Model ID | Category | Repository | Hosted | Live test | Pricing | License | Last verified | Limitations |');
-    lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+    lines.push('| # | Model ID | Category | Hosted | Live test | Pricing | License | Last verified | Limitations |');
+    lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- |');
     list.forEach((row, index) => {
-      const repository = row.verified ? 'yes' : row.verificationSource === 'unverified' ? 'not checked' : 'no';
       const hosted = row.provider ? `yes (${row.provider})` : row.availabilityStatus === 'available' ? 'yes' : row.availabilityStatus === 'unverified' ? 'not checked' : 'no';
       const live = row.verificationSource === 'live-inference' || row.successCount > 0 ? 'passed' : 'not run';
       lines.push(
-        `| ${index + 1} | \`${row.id}\` | ${cell(row.category)} | ${repository} | ${hosted} | ${live} | ${MODEL_PRICING_LABELS[row.pricingStatus]} | ${cell(row.license)} | ${cell(row.lastCheckedAt)} | ${limitationsCell(row)} |`,
+        `| ${index + 1} | \`${row.id}\` | ${cell(row.category)} | ${hosted} | ${live} | ${MODEL_PRICING_LABELS[row.pricingStatus]} | ${cell(row.license)} | ${cell(row.lastCheckedAt)} | ${limitationsCell(row)} |`,
       );
     });
     lines.push('');
   }
 
-  lines.push('## Notes on specific model architectures');
+  lines.push('## Notes');
   lines.push('');
-  lines.push(
-    '- **Adapters / LoRA weights** (for example `XLabs-AI/flux-RealismLora`) are not standalone text-to-image models. NovelForge keeps ' +
-      'the requested ID, records the adapter metadata reported by the provider mapping, and marks the model as needing a base model. ' +
-      'Adapter composition is only attempted when the hosted provider actually supports it.',
-  );
-  lines.push(
-    '- **Cascaded pipelines** (for example `DeepFloyd/IF-I-XL-v1.0`) return a low-resolution stage-I image from a single hosted call.',
-  );
-  lines.push(
-    '- **Gated repositories** (Llama, Gemma, FLUX.1-dev, SD3.5) require the account to accept the model terms before inference is possible.',
-  );
+  lines.push('- Agnes AI models are the primary provider. Custom models added by an administrator are verified the same way.');
   lines.push('');
 
   return lines.join('\n');

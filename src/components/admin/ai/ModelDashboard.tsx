@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { toast } from 'sonner';
 import {
   Activity, AlertTriangle, CheckCircle2, CircleDollarSign, Clock, Cpu, Eye, HelpCircle,
-  Image as ImageIcon, Loader2, RefreshCw, Search, ShieldAlert, Sparkles, Star, Type, XCircle,
+  Image as ImageIcon, Loader2, Plus, RefreshCw, Search, ShieldAlert, Sparkles, Star, Type, XCircle, Trash2,
 } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 
@@ -66,7 +66,6 @@ interface EventRow {
 
 interface Configuration {
   backend: string;
-  /** Agnes AI is the primary provider; optional so an older API still renders. */
   agnesConfigured?: boolean;
   agnesTextModel?: string;
   agnesImageModel?: string;
@@ -121,6 +120,9 @@ export default function ModelDashboard({ initial }: { initial?: any }) {
   const [pricing, setPricing] = useState('');
   const [onlyEnabled, setOnlyEnabled] = useState(false);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [showAdd, setShowAdd] = useState(false);
+  const [addForm, setAddForm] = useState({ id: '', name: '', task: 'text-generation' as 'text-generation' | 'text-to-image', category: '', provider: '' });
+  const [adding, setAdding] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -146,12 +148,57 @@ export default function ModelDashboard({ initial }: { initial?: any }) {
     if (!initial) void refresh();
   }, [initial, refresh]);
 
+  const handleAdd = useCallback(async () => {
+    if (!addForm.id.trim()) { toast.error('Model ID is required.'); return; }
+    setAdding(true);
+    try {
+      const res = await fetch('/api/ai/models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: addForm.id.trim(),
+          name: addForm.name.trim() || undefined,
+          task: addForm.task,
+          category: addForm.category.trim() || undefined,
+          provider: addForm.provider.trim() || undefined,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Failed to add model.');
+      toast.success(`Added ${data.model.id}`);
+      setShowAdd(false);
+      setAddForm({ id: '', name: '', task: 'text-generation', category: '', provider: '' });
+      await refresh();
+    } catch (err: any) {
+      toast.error(err?.message || 'Failed to add model.');
+    } finally {
+      setAdding(false);
+    }
+  }, [addForm, refresh]);
+
+  const handleDelete = useCallback(async (modelId: string) => {
+    if (!confirm(`Delete model "${modelId}"? This cannot be undone. Custom models will be removed permanently.`)) return;
+    setBusyId(modelId);
+    try {
+      const res = await fetch(`/api/ai/models/${encodeURIComponent(modelId)}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Failed to delete model.');
+      toast.success(`Deleted ${modelId}`);
+      await refresh();
+    } catch (err: any) {
+      toast.error(err?.message || 'Failed to delete model.');
+    } finally {
+      setBusyId(null);
+    }
+  }, [refresh]);
+
   const action = useCallback(
-    async (modelId: string, kind: 'verify' | 'verify-smoke' | 'enable' | 'disable' | 'primary') => {
+    async (modelId: string, kind: 'verify' | 'verify-smoke' | 'enable' | 'disable' | 'primary' | 'delete') => {
+      if (kind === 'delete') return handleDelete(modelId);
       setBusyId(modelId);
       try {
         const encoded = encodeURIComponent(modelId);
-        const paths: Record<typeof kind, string> = {
+        const paths: Record<string, string> = {
           verify: `/api/ai/models/${encoded}/verify`,
           'verify-smoke': `/api/ai/models/${encoded}/verify`,
           enable: `/api/ai/models/${encoded}/enable`,
@@ -161,7 +208,7 @@ export default function ModelDashboard({ initial }: { initial?: any }) {
         const body =
           kind === 'verify' ? { smoke: false, force: true } : kind === 'verify-smoke' ? { smoke: true, force: true } : {};
         const res = await fetch(paths[kind], {
-          method: kind === 'primary' ? 'POST' : 'POST',
+          method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
@@ -185,7 +232,7 @@ export default function ModelDashboard({ initial }: { initial?: any }) {
         setBusyId(null);
       }
     },
-    [refresh],
+    [refresh, handleDelete],
   );
 
   const filtered = useMemo(() => {
@@ -213,14 +260,55 @@ export default function ModelDashboard({ initial }: { initial?: any }) {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap gap-1 p-1 rounded-lg bg-[hsl(var(--surface-secondary))] border border-border">
           <TabButton active={tab === 'overview'} onClick={() => setTab('overview')} icon={Activity} label="Overview" />
-          <TabButton active={tab === 'text'} onClick={() => setTab('text')} icon={Type} label={`Text models (${overview?.configured.text ?? 50})`} />
-          <TabButton active={tab === 'image'} onClick={() => setTab('image')} icon={ImageIcon} label={`Image models (${overview?.configured.image ?? 20})`} />
+          <TabButton active={tab === 'text'} onClick={() => setTab('text')} icon={Type} label={`Text models (${overview?.registered?.text ?? overview?.configured.text ?? 5})`} />
+          <TabButton active={tab === 'image'} onClick={() => setTab('image')} icon={ImageIcon} label={`Image models (${overview?.registered?.image ?? overview?.configured.image ?? 3})`} />
           <TabButton active={tab === 'monitoring'} onClick={() => setTab('monitoring')} icon={Eye} label="Monitoring" />
         </div>
-        <button className="btn-secondary text-xs" onClick={() => void refresh()} disabled={loading}>
-          {loading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />} Refresh
-        </button>
+        <div className="flex items-center gap-2">
+          <button className="btn-primary text-xs inline-flex items-center gap-1.5" onClick={() => setShowAdd(true)}>
+            <Plus className="w-3.5 h-3.5" /> Add model
+          </button>
+          <button className="btn-secondary text-xs" onClick={() => void refresh()} disabled={loading}>
+            {loading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />} Refresh
+          </button>
+        </div>
       </div>
+
+      {showAdd && (
+        <div className="surface p-5 border border-primary/30">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="font-semibold text-sm">Add new Agnes model</h3>
+            <button className="btn-outline text-xs" onClick={() => setShowAdd(false)}>Close</button>
+          </div>
+          <div className="grid md:grid-cols-4 gap-3">
+            <div className="md:col-span-2">
+              <label className="label block mb-1">Model ID *</label>
+              <input className="input" placeholder="e.g. agnes-2.5-flash or agnes-custom-xyz" value={addForm.id} onChange={e => setAddForm(v => ({ ...v, id: e.target.value }))} />
+              <p className="text-[11px] text-muted-foreground mt-1">Whitespace-free unique ID. For Agnes models use agnes-* prefix.</p>
+            </div>
+            <div>
+              <label className="label block mb-1">Task</label>
+              <select className="input" value={addForm.task} onChange={e => setAddForm(v => ({ ...v, task: e.target.value as any }))}>
+                <option value="text-generation">text-generation</option>
+                <option value="text-to-image">text-to-image</option>
+              </select>
+            </div>
+            <div>
+              <label className="label block mb-1">Category</label>
+              <input className="input" placeholder="Custom · Text" value={addForm.category} onChange={e => setAddForm(v => ({ ...v, category: e.target.value }))} />
+            </div>
+            <div>
+              <label className="label block mb-1">Display name</label>
+              <input className="input" placeholder="Optional, auto-derived" value={addForm.name} onChange={e => setAddForm(v => ({ ...v, name: e.target.value }))} />
+            </div>
+            <div className="flex items-end">
+              <button className="btn-primary text-xs w-full" disabled={adding} onClick={() => void handleAdd()}>
+                {adding ? <Loader2 className="w-3 h-3 animate-spin inline" /> : <Plus className="w-3 h-3 inline" />} {adding ? 'Adding…' : 'Create model'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {tab === 'overview' && overview && (
         <OverviewTab overview={overview} configuration={configuration} usage={usage} />
@@ -275,7 +363,7 @@ export default function ModelDashboard({ initial }: { initial?: any }) {
           </div>
 
           <div className="text-xs text-muted-foreground">
-            Showing {filtered.length} of {models.filter(m => (tab === 'text' ? m.task === 'text-generation' : m.task === 'text-to-image')).length} configured models.
+            Showing {filtered.length} of {models.filter(m => (tab === 'text' ? m.task === 'text-generation' : m.task === 'text-to-image')).length} models.
           </div>
 
           <div className="surface overflow-hidden">
@@ -342,7 +430,7 @@ function ModelRow({
   busy: boolean;
   expanded: boolean;
   onToggle: () => void;
-  onAction: (id: string, kind: 'verify' | 'verify-smoke' | 'enable' | 'disable' | 'primary') => void;
+  onAction: (id: string, kind: 'verify' | 'verify-smoke' | 'enable' | 'disable' | 'primary' | 'delete') => void;
 }) {
   const availability = AVAILABILITY_META[model.availabilityStatus] ?? AVAILABILITY_META.unknown;
   const pricing = PRICING_META[model.pricingStatus] ?? PRICING_META.unknown;
@@ -387,13 +475,16 @@ function ModelRow({
               {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Search className="w-3 h-3" />} Verify
             </button>
             <button className="btn-outline text-[11px] px-2 py-1" disabled={busy} onClick={() => onAction(model.id, 'verify-smoke')}>
-              <Sparkles className="w-3 h-3" /> Smoke test
+              <Sparkles className="w-3 h-3" /> Smoke
             </button>
             <button className="btn-outline text-[11px] px-2 py-1" disabled={busy} onClick={() => onAction(model.id, model.enabled ? 'disable' : 'enable')}>
               {model.enabled ? 'Disable' : 'Enable'}
             </button>
             <button className="btn-outline text-[11px] px-2 py-1" disabled={busy || model.isPrimary} onClick={() => onAction(model.id, 'primary')}>
               <Star className="w-3 h-3" /> Primary
+            </button>
+            <button className="btn-outline text-[11px] px-2 py-1 border-destructive/40 text-destructive hover:bg-destructive hover:text-destructive-foreground" disabled={busy} onClick={() => onAction(model.id, 'delete')}>
+              <Trash2 className="w-3 h-3" /> Delete
             </button>
           </div>
         </td>
@@ -460,13 +551,6 @@ interface ProviderTestResponse {
   error?: { category: string; status?: number; message: string };
 }
 
-/**
- * Runs one real Agnes AI request so "the key is set" becomes "the key works".
- *
- * Kept in the console because the failure modes it distinguishes — missing in
- * this deployment, revoked key, no account access, wrong model id — all look
- * identical from a dashboard environment-variable list.
- */
 function AgnesProviderTest({ configured, backend }: { configured: boolean; backend: string }) {
   const [busy, setBusy] = useState<'text' | 'image' | null>(null);
   const [result, setResult] = useState<ProviderTestResponse | null>(null);
@@ -552,12 +636,12 @@ function AgnesProviderTest({ configured, backend }: { configured: boolean; backe
 function OverviewTab({ overview, configuration, usage }: { overview: Overview; configuration: Configuration | null; usage: any }) {
   const cards = [
     { label: 'Configured models', value: overview.configured.total, hint: `${overview.configured.text} text · ${overview.configured.image} image`, icon: Cpu },
-    { label: 'Verified repositories', value: overview.verifiedRepositories, hint: 'Repository confirmed to exist on the Hub', icon: CheckCircle2 },
-    { label: 'Hosted inference supported', value: overview.hostedInferenceSupported, hint: 'A provider is mapped or a call succeeded', icon: Sparkles },
+    { label: 'Registered models', value: overview.registered.total, hint: `${overview.registered.text} text · ${overview.registered.image} image in DB`, icon: CheckCircle2 },
+    { label: 'Hosted inference ready', value: overview.hostedInferenceSupported, hint: 'Provider confirmed or live test passed', icon: Sparkles },
     { label: 'Live-inference tested', value: overview.successfullyTested, hint: 'Completed a real inference request', icon: Activity },
     { label: 'Unavailable', value: overview.unavailable, hint: 'No provider serves the model', icon: XCircle },
     { label: 'Unsupported', value: overview.unsupported, hint: 'Architecture/task unsupported', icon: AlertTriangle },
-    { label: 'Access required', value: overview.authenticationRequired, hint: 'Gated or not granted to this account', icon: ShieldAlert },
+    { label: 'Access required', value: overview.authenticationRequired, hint: 'Auth / gated', icon: ShieldAlert },
     { label: 'Unknown pricing', value: overview.byPricing.unknown ?? 0, hint: 'Never treated as free', icon: HelpCircle },
     { label: 'Confirmed free', value: overview.byPricing.free ?? 0, hint: 'Provider reports no charge', icon: CircleDollarSign },
     { label: 'Paid', value: overview.byPricing.paid ?? 0, hint: 'Skipped when paid inference is disabled', icon: CircleDollarSign },
@@ -591,12 +675,12 @@ function OverviewTab({ overview, configuration, usage }: { overview: Overview; c
             <PolicyRow label="Agnes text model" value={configuration.agnesTextModel ?? 'agnes-2.5-flash'} />
             <PolicyRow label="Agnes image model" value={configuration.agnesImageModel ?? 'agnes-image-2.5-flash'} />
             <PolicyRow
-              label="Hugging Face token (fallback)"
-              value={configuration.huggingFaceConfigured ? 'configured' : 'missing'}
+              label="Legacy HF token (deprecated)"
+              value={configuration.huggingFaceConfigured ? 'configured (unused)' : 'not set'}
             />
             <PolicyRow
               label="Provider order"
-              value={configuration.pinnedBackend ? `pinned: ${configuration.pinnedBackend}` : (configuration.providerOrder ?? ['agnes', 'huggingface', 'openai']).join(' → ')}
+              value={configuration.pinnedBackend ? `pinned: ${configuration.pinnedBackend}` : (configuration.providerOrder ?? ['agnes', 'openai']).join(' → ')}
             />
             <PolicyRow label="Paid inference" value={configuration.allowPaidInference ? 'allowed' : 'blocked (free-only)'} />
             <PolicyRow label="Confirmed pricing required" value={configuration.requireConfirmedPricing ? 'yes' : 'no'} />
@@ -604,23 +688,13 @@ function OverviewTab({ overview, configuration, usage }: { overview: Overview; c
             <PolicyRow label="Request timeout" value={`${Math.round(configuration.requestTimeoutMs / 1000)}s`} />
             <PolicyRow label="Health-check interval" value={`${configuration.healthCheckIntervalHours}h`} />
             <PolicyRow label="Per-user limits" value={`${configuration.maxTextRequestsPerUserPerHour} text/h · ${configuration.maxImageRequestsPerUserPerHour} image/h`} />
-            <PolicyRow label="Router" value={configuration.routerBaseUrl} />
             <PolicyRow label="Primary text model" value={overview.primary.text ?? 'none'} />
             <PolicyRow label="Primary image model" value={overview.primary.image ?? 'none'} />
           </div>
           {!configuration.agnesConfigured && (
             <p className="text-xs text-amber-400 mt-4 flex items-start gap-2">
               <AlertTriangle className="w-3.5 h-3.5 mt-0.5" />
-              AGNES_API_KEY is not visible to this deployment, so text and cover generation run on the fallback chain
-              (Hugging Face, then OpenAI, then demo). Add the key in the host with the Production scope and redeploy —
-              variables are captured when a deployment is built, so an existing deployment will not pick it up.
-            </p>
-          )}
-          {!configuration.huggingFaceConfigured && (
-            <p className="text-xs text-amber-400 mt-4 flex items-start gap-2">
-              <AlertTriangle className="w-3.5 h-3.5 mt-0.5" />
-              HF_TOKEN is not configured, so no hosted model can be verified or called as a fallback. Set it in the environment, then run verification to
-              populate real availability and pricing.
+              AGNES_API_KEY is not visible to this deployment, so text and cover generation run on demo fallbacks. Add the key in the host with the Production scope and redeploy.
             </p>
           )}
           {configuration.providerProblems?.length ? (
@@ -729,8 +803,7 @@ function MonitoringTab({ events, usage }: { events: EventRow[]; usage: any }) {
         <div className="surface p-5">
           <div className="label mb-3">Usage by model (last {usage.windowHours}h)</div>
           <p className="text-xs text-muted-foreground">
-            Costs are labelled confirmed (provider-reported), estimated (computed from published prices) or unknown. Unknown is never
-            shown as zero.
+            Costs are labelled confirmed, estimated or unknown. Unknown is never shown as zero.
           </p>
         </div>
       ) : null}
