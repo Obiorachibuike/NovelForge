@@ -244,6 +244,23 @@ verified; the database constraint is documented in
 been exercised against a live Redis here. Setting an environment variable does
 not by itself enable any adapter — each one either works or refuses loudly.
 
+### Verifying the AI provider after deploying
+
+Adding `AGNES_API_KEY` in the hosting dashboard does not change a deployment that
+already exists: variables are captured when a deployment is built, so redeploy
+first. Then:
+
+- `GET /api/health` → `ai.backend` is the backend that will serve the next
+  request, and `ai.providers` says whether each credential is present in that
+  process (`"missing"` there means the wrong environment scope or a stale
+  deployment).
+- `/admin/ai` → **Overview** → **Live provider test** makes one real, tiny Agnes
+  AI request and reports the model, the latency and a classified failure reason
+  (`not_configured`, `authentication_failed`, `model_not_found`, `disabled`).
+
+Full detail: [`docs/AI_INFERENCE.md` § 1b](docs/AI_INFERENCE.md) and
+[`DEPLOYMENT.md` § 3.1a](DEPLOYMENT.md).
+
 ### Vercel build configuration
 
 - Select **Next.js** as the framework, repository root as the root directory,

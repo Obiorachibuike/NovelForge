@@ -2,7 +2,7 @@ import { requireUser } from '@/lib/db/ownership';
 import { apiHandler } from '@/lib/api/http';
 import { requireAdmin } from '@/services/billing/service';
 import { registryOverview, recentModelEvents, syncRegistry } from '@/lib/ai/model-registry';
-import { aiPolicy, huggingFaceConfigured } from '@/lib/ai/config';
+import { aiPolicy, aiProviderSummary, huggingFaceConfigured } from '@/lib/ai/config';
 
 export const dynamic = 'force-dynamic';
 
@@ -18,6 +18,7 @@ export const GET = apiHandler(async (_req: Request) => {
   syncRegistry();
 
   const policy = aiPolicy();
+  const summary = aiProviderSummary();
   const overview = registryOverview();
   return Response.json({
     overview,
@@ -25,6 +26,15 @@ export const GET = apiHandler(async (_req: Request) => {
     recentFailures: recentModelEvents({ limit: 25, onlyFailures: true }),
     configuration: {
       backend: policy.backend,
+      // Agnes AI is the primary provider, so its state belongs next to the
+      // Hugging Face fallback in the console instead of being invisible.
+      agnesConfigured: policy.agnesConfigured,
+      agnesTextModel: policy.agnesTextModel,
+      agnesImageModel: policy.agnesImageModel,
+      agnesBaseUrl: policy.agnesBaseUrl,
+      providerOrder: summary.providerOrder,
+      pinnedBackend: summary.pinnedBackend,
+      providerProblems: summary.problems,
       huggingFaceConfigured: huggingFaceConfigured(),
       allowPaidInference: policy.allowPaidInference,
       requireConfirmedPricing: policy.requireConfirmedPricing,

@@ -103,10 +103,52 @@ Rules that the code enforces:
   `/admin/ai` is reported as **Unverified** — which is the truth, because nothing
   has been checked.
 
+### 3.1a Verifying the key in the running deployment
+
+A variable in the hosting dashboard and a variable the running code can see are
+two different facts. Environment variables are captured when a deployment is
+**built**, so adding `AGNES_API_KEY` does not change a deployment that already
+exists — redeploy (or push to the production branch) first. Then check, in this
+order:
+
+1. `GET /api/health` → the `ai` block names the backend that will serve the next
+   request and whether each credential is present in *this* process:
+
+   ```json
+   "ai": {
+     "backend": "agnes",
+     "mode": "agnes",
+     "providers": { "agnes": "configured", "huggingface": "missing", "openai": "missing" },
+     "problems": []
+   }
+   ```
+
+   `backend: "demo"` with `providers.agnes: "missing"` means the key is not in
+   this environment (wrong scope, or a deployment built before it was added).
+   `backend: "huggingface"` can only happen when `AGNES_API_KEY` is unset or the
+   placeholder guard rejected it.
+
+2. `/admin/ai` → **Overview** → **Live provider test** → *Test text*. This makes
+   one real, tiny request and reports the model, the latency and, on failure,
+   the classified reason (`authentication_failed` = key rejected,
+   `not_configured` = key absent from this deployment, `model_not_found` =
+   model id not available to the account, `disabled` = live image tests are off).
+   *Test image* additionally requires `AI_ALLOW_LIVE_IMAGE_HEALTH_CHECKS=true`
+   because it spends credits.
+
+3. Generate one chapter. Every response carries `source` / `provider` /
+   `actualModelId`, so the provenance says whether Agnes answered or the
+   fallback chain did.
+
+`AGNES_API_KEY` should be scoped to **Production, Preview and Development**
+unless you deliberately want previews on the fallback chain.
+
 ### 3.2 Network egress
 
 The server needs outbound HTTPS access to:
 
+- `apihub.agnes-ai.com` — Agnes AI text and image generation
+  (`/v1/chat/completions`, `/v1/images/generations`)
 - `router.huggingface.co` — generation (`/v1/chat/completions`,
   `/v1/images/generations`, provider-native task routes, `/v1/models/{id}`)
 - `huggingface.co` — repository metadata (`/api/models/{id}`)

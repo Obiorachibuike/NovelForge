@@ -58,7 +58,19 @@ export async function GET() {
           counts: queueCounts,
         },
         ai: {
-          mode: config.hasOpenAiKey ? 'openai' : 'deterministic-demo',
+          // The backend that will serve the next generation request. Reported
+          // from this process's own environment, because a key added in the
+          // hosting dashboard only takes effect in a deployment built after it.
+          backend: config.aiBackend,
+          // Kept for probes written against the previous shape.
+          mode: config.aiBackend === 'demo' ? 'deterministic-demo' : config.aiBackend,
+          providers: {
+            agnes: config.hasAgnesKey ? 'configured' : 'missing',
+            huggingface: config.hasHuggingFaceToken ? 'configured' : 'missing',
+            openai: config.hasOpenAiKey ? 'configured' : 'missing',
+          },
+          // Names only, never values.
+          problems: config.aiProblems,
         },
         // Transactional e-mail (Brevo): registration and password recovery
         // depend on it, so a probe should say whether it is usable.
