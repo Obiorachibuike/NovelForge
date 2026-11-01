@@ -369,7 +369,7 @@ function JobRow({
 }
 
 function formatGenerationType(value: string): string {
-  return value.replace(/[_-]+/g, ' ').replace(/\\b\\w/g, char => char.toUpperCase());
+  return value.replace(/[_-]+/g, ' ').replace(/\b\w/g, char => char.toUpperCase());
 }
 
 function formatRelative(iso?: string | null): string {
