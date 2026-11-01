@@ -73,7 +73,7 @@ export function GenerationDock() {
           )}
           aria-label={
             active
-              ? `${active} background chapter generation${active === 1 ? '' : 's'} in progress. Open the AI generation panel.`
+              ? `${active} background AI generation${active === 1 ? '' : 's'} in progress. Open the AI generation panel.`
               : 'Open the AI generation activity panel'
           }
         >
@@ -338,7 +338,7 @@ function JobRow({
               href={href}
               className="text-[11px] inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 hover:border-primary/40 hover:text-primary"
             >
-              <ExternalLink className="w-3 h-3" aria-hidden="true" /> View chapter
+              <ExternalLink className="w-3 h-3" aria-hidden="true" /> {job.chapterId ? 'View chapter' : 'View novel'}
             </Link>
           )}
           {active && (
