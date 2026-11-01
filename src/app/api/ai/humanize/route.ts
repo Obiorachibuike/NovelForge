@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { apiHandler, readJsonBody, HttpError, MAX_JSON_BYTES } from '@/lib/api/http';
+import { apiHandler, readJsonBody, MAX_JSON_BYTES } from '@/lib/api/http';
 import { requireUser, requireNovel } from '@/lib/db/ownership';
 import { getDb } from '@/lib/db';
 import { enforceRateLimit } from '@/lib/security/rate-limit';
