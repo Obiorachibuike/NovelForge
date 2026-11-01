@@ -29,6 +29,8 @@ export async function runUniversalTextGeneration(job: JobHandlerContext) {
   if (job.isCancelled()) throw Object.assign(new Error('Generation was cancelled.'), { retryable: false, code: 'cancelled' });
 
   let accumulated = '';
+  let lastPublishedText = '';
+  let lastPublishedAt = 0;
   const result = await generateTextDetailed({
     messages: [
       ...(payload.systemPrompt ? [{ role: 'system' as const, content: payload.systemPrompt }] : []),
@@ -57,7 +59,13 @@ export async function runUniversalTextGeneration(job: JobHandlerContext) {
       }
       if (!chunk) return;
       accumulated = snapshot;
-      job.onContent(chunk, accumulated);
+      // Batch rapid provider deltas into modest durable chunks. The final
+      // flush below guarantees that no text is lost between batches.
+      if (Date.now() - lastPublishedAt >= 150) {
+        job.onContent(chunk, accumulated);
+        lastPublishedText = accumulated;
+        lastPublishedAt = Date.now();
+      }
     },
   });
 
@@ -65,6 +73,12 @@ export async function runUniversalTextGeneration(job: JobHandlerContext) {
     throw Object.assign(new Error('Generation was cancelled.'), { retryable: false, code: 'cancelled' });
   }
   if (!result.text.trim()) throw new Error('The AI provider returned an empty response.');
+  if (result.text !== lastPublishedText) {
+    const finalChunk = result.text.startsWith(lastPublishedText)
+      ? result.text.slice(lastPublishedText.length)
+      : result.text;
+    if (finalChunk) job.onContent(finalChunk, result.text);
+  }
 
   // Keep partialText in the final result so the existing generation serializer
   // can restore the content after refresh, even after the job is complete.
