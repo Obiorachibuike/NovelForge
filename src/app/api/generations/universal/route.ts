@@ -4,15 +4,9 @@ import { apiHandler, readJsonBody, HttpError } from '@/lib/api/http';
 import { requireUser, requireNovel } from '@/lib/db/ownership';
 import { enforceRateLimit } from '@/lib/security/rate-limit';
 import { enforceAiRateLimit } from '@/lib/ai/rate-limit';
-import { assertRegisteredModelOrAgnes } from '@/lib/ai/model-selection';
 
-import {
-  GenerationRegistry,
-  GenerationRequest,
-  GenerationRequestSchema,
-} from '@/lib/ai/generation/generation-types';
+import { validateGenerationInput } from '@/lib/ai/generation/generation-validation';
 import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
-import { serializeJob } from '@/lib/queue';
 import { getGenerationForUser, serializeGeneration } from '@/lib/jobs/generation-jobs';
 
 export const dynamic = 'force-dynamic';
@@ -29,28 +23,13 @@ export const POST = apiHandler(async (req: Request) => {
   enforceRateLimit('aiGeneration', user.id);
   enforceAiRateLimit('text', user.id);
 
-  const body = await readJsonBody(req, v => GenerationRequestSchema.parse(v));
+  const body = await readJsonBody(req, v => validateGenerationInput(v, user.id));
   
   // Project ownership check (novelId is projectId)
-  if (body.projectId) {
-    await requireNovel(body.projectId, user.id);
-  }
+  await requireNovel(body.projectId, user.id);
 
   // Create Universal Job
-  const jobId = await UniversalGenerationService.createJob({
-    ...body,
-    userId: user.id,
-    projectId: body.projectId,
-    targetId: body.targetId,
-    generationType: body.generationType,
-    prompt: body.prompt,
-    context: body.context,
-    provider: body.provider,
-    model: body.model,
-    stream: body.stream ?? false,
-    metadata: body.metadata,
-    idempotencyKey: body.idempotencyKey,
-  });
+  const jobId = await UniversalGenerationService.createJob(body);
 
   // Fetch serialized job for response
   const job = getGenerationForUser(user.id, jobId);

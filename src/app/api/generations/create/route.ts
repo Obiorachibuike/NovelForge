@@ -1,10 +1,10 @@
 import 'server-only';
-import { z } from 'zod';
 import { apiHandler, readJsonBody, HttpError } from '@/lib/api/http';
 import { requireUser, requireNovel } from '@/lib/db/ownership';
-import { GenerationRegistry } from '@/lib/ai/generation/generation-registry';
 import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
-import { GenerationRequestSchema } from '@/lib/ai/generation/generation-types';
+import { validateGenerationInput } from '@/lib/ai/generation/generation-validation';
+import { enforceRateLimit } from '@/lib/security/rate-limit';
+import { enforceAiRateLimit } from '@/lib/ai/rate-limit';
 import { getGenerationForUser, serializeGeneration } from '@/lib/jobs/generation-jobs';
 
 export const dynamic = 'force-dynamic';
@@ -18,18 +18,15 @@ export const runtime = 'nodejs';
  */
 export const POST = apiHandler(async (req: Request) => {
   const user = await requireUser();
-  const body = await readJsonBody(req, v => GenerationRequestSchema.parse(v));
+  enforceRateLimit('aiGeneration', user.id);
+  enforceAiRateLimit('text', user.id);
+  const body = await readJsonBody(req, v => validateGenerationInput(v, user.id));
 
   // Project ownership check
-  if (body.projectId) {
-    await requireNovel(body.projectId, user.id);
-  }
+  await requireNovel(body.projectId, user.id);
 
   // Create Universal Job
-  const jobId = await UniversalGenerationService.createJob({
-    ...body,
-    userId: user.id,
-  });
+  const jobId = await UniversalGenerationService.createJob(body);
 
   const job = getGenerationForUser(user.id, jobId);
   if (!job) throw new HttpError(500, 'Job creation failed', 'generation_missing');

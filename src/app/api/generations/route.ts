@@ -6,6 +6,7 @@ import { assertRegisteredModelOrAgnes } from '@/lib/ai/model-selection';
 import {
   createChapterGeneration,
   listGenerations,
+  getGenerationForUser,
   maxActiveGenerationsPerNovel,
   maxActiveGenerationsPerUser,
   serializeGeneration,
@@ -14,7 +15,8 @@ import { z } from 'zod';
 
 // --- UNIVERSAL GENERATION ENGINE INTEGRATION ---
 import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
-import { GenerationRequestSchema, GenerationType } from '@/lib/ai/generation/generation-types';
+import { GenerationType } from '@/lib/ai/generation/generation-types';
+import { validateGenerationInput } from '@/lib/ai/generation/generation-validation';
 import { GenerationRegistry } from '@/lib/ai/generation/generation-registry';
 
 export const dynamic = 'force-dynamic';
@@ -55,18 +57,13 @@ export const POST = apiHandler(async (req: Request) => {
   
   // Check if it's a Universal Generation Request (has generationType)
   if (typeof rawBody.generationType === 'string' && GenerationRegistry.hasHandler(rawBody.generationType as GenerationType)) {
-    const body = GenerationRequestSchema.parse(rawBody);
+    const body = validateGenerationInput(rawBody, user.id);
     
     // Project ownership check
-    if (body.projectId) {
-      await requireNovel(body.projectId, user.id);
-    }
+    await requireNovel(body.projectId, user.id);
 
     // Create Universal Job
-    const jobId = await UniversalGenerationService.createJob({
-      ...body,
-      userId: user.id,
-    });
+    const jobId = await UniversalGenerationService.createJob(body);
 
     const job = getGenerationForUser(user.id, jobId);
     if (!job) throw new HttpError(500, 'Job creation failed', 'generation_missing');
