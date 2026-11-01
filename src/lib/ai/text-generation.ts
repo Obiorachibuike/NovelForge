@@ -333,6 +333,8 @@ export interface GenerateStructuredInput<T> {
   jobId?: string;
   taskType: string;
   signal?: AbortSignal;
+  /** Receives cumulative raw JSON text while a provider streams it. */
+  onText?: (text: string) => void;
   /** Deterministic demo/stub value used in demo mode or after parse failures. */
   fallback: T;
   /** Allow another eligible hosted model to serve the request (HF backend). */
@@ -370,6 +372,7 @@ export async function generateStructuredDetailed<T>(
         jobId: input.jobId,
         taskType: input.taskType,
         signal: input.signal,
+        onText: input.onText,
       });
       return {
         data,
@@ -414,6 +417,7 @@ export async function generateStructuredDetailed<T>(
         jobId: input.jobId,
         taskType: input.taskType,
         signal: input.signal,
+        onText: input.onText,
         allowFallback: input.allowModelFallback !== false,
       });
       return {
@@ -462,18 +466,35 @@ export async function generateStructuredDetailed<T>(
     let raw = '{}';
     try {
       if (input.signal?.aborted) throw new Error('Generation request was cancelled.');
-      const resp = await withTimeout(
-        client.chat.completions.create({
+      let usage: any;
+      if (input.onText) {
+        const stream = await client.chat.completions.create({
           model,
           messages: [systemInject, ...input.messages],
           temperature: input.temperature ?? 0.4,
           response_format: { type: 'json_object' },
-        }, { timeout: aiConfig.timeoutMs, signal: input.signal }),
-        aiConfig.timeoutMs,
-        `structured generation (${input.taskType})`,
-      );
-      raw = resp.choices[0]?.message?.content || '{}';
-      const usage = resp.usage;
+          stream: true,
+          stream_options: { include_usage: true },
+        }, { timeout: aiConfig.timeoutMs, signal: input.signal });
+        for await (const part of stream) {
+          if (part.usage) usage = part.usage;
+          const delta = part.choices[0]?.delta?.content;
+          if (delta) { raw += delta; input.onText(raw); }
+        }
+      } else {
+        const resp = await withTimeout(
+          client.chat.completions.create({
+            model,
+            messages: [systemInject, ...input.messages],
+            temperature: input.temperature ?? 0.4,
+            response_format: { type: 'json_object' },
+          }, { timeout: aiConfig.timeoutMs, signal: input.signal }),
+          aiConfig.timeoutMs,
+          `structured generation (${input.taskType})`,
+        );
+        raw = resp.choices[0]?.message?.content || '{}';
+        usage = resp.usage;
+      }
       recordUsage({
         userId: input.userId,
         novelId: input.novelId,
