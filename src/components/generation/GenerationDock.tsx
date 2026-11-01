@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
+import { toast } from 'sonner';
 import {
   AlertTriangle,
   Ban,
@@ -34,6 +35,20 @@ function chapterHref(job: GenerationView): string | null {
   if (job.chapterId) return `/novels/${job.novelId}/write/${job.chapterId}`;
   if (job.chapterNumber) return `/novels/${job.novelId}/write/${job.chapterNumber}`;
   return `/novels/${job.novelId}`;
+}
+
+async function copyGeneratedContent(jobId: string) {
+  try {
+    const response = await fetch(`/api/generations/${jobId}`, { cache: 'no-store' });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Could not load generated content.');
+    const content = data.generation?.generatedContent || data.generation?.partialText;
+    if (!content) throw new Error('No generated text is available for this job.');
+    await navigator.clipboard.writeText(content);
+    toast.success('Generated content copied.');
+  } catch (error: any) {
+    toast.error(error?.message || 'Could not copy generated content.');
+  }
 }
 
 function isActive(job: GenerationView) {
@@ -323,6 +338,16 @@ function JobRow({
         <div className="mt-2 max-h-24 overflow-hidden rounded-md border border-border/60 bg-black/10 p-2 text-[11px] leading-relaxed text-muted-foreground whitespace-pre-wrap" aria-live="polite">
           {job.partialText.slice(-700)}
         </div>
+      )}
+
+      {!active && job.partialText && (
+        <button
+          type="button"
+          onClick={() => void copyGeneratedContent(job.id)}
+          className="mt-2 text-[11px] inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 hover:border-primary/40 hover:text-primary"
+        >
+          Copy generated content
+        </button>
       )}
 
       {!active && job.status === 'FAILED' && (
