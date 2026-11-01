@@ -102,6 +102,9 @@ export function serializeGeneration(job: GenerationWithContext) {
     chapterNumber: job.chapterNumber ?? null,
     taskType: job.taskType,
     generationType: (() => { try { const p = job.payload ? JSON.parse(job.payload) : {}; return p.generationType ?? job.taskType; } catch { return job.taskType; } })(),
+    title: (() => { try { const p = job.payload ? JSON.parse(job.payload) : {}; return p.title ?? null; } catch { return null; } })(),
+    targetType: (() => { try { const p = job.payload ? JSON.parse(job.payload) : {}; return p.targetType ?? null; } catch { return null; } })(),
+    targetId: (() => { try { const p = job.payload ? JSON.parse(job.payload) : {}; return p.targetId ?? null; } catch { return null; } })(),
     status,
     /**
      * Chapter generation is stage-based: providers do not expose real
