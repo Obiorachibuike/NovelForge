@@ -125,9 +125,14 @@ export async function enqueueChapterGeneration(
     );
   }
 
-  if (aiConfig.forcedDemo || aiBackend() === 'demo') {
+  if (aiConfig.forcedDemo) {
     throw new HttpError(503,
-      'Story generation needs a configured AI provider. Add AGNES_API_KEY, HF_TOKEN, or OPENAI_API_KEY to the server environment, disable AI_DEMO_MODE, and redeploy. No demo chapter was created.',
+      'Story generation is disabled because AI_DEMO_MODE=true in this deployment, even if an AI API key is configured. Set AI_DEMO_MODE=false in Vercel Project Settings → Environment Variables for this deployment’s environment, then redeploy. No demo chapter was created.',
+      'text_provider_unavailable');
+  }
+  if (aiBackend() === 'demo') {
+    throw new HttpError(503,
+      'This deployment cannot find a usable AI provider key. Set AGNES_API_KEY, HF_TOKEN, or OPENAI_API_KEY in Vercel Project Settings → Environment Variables for this deployment’s environment (Production or Preview), then redeploy. Blank or placeholder Agnes/Hugging Face keys are treated as missing. No demo chapter was created.',
       'text_provider_unavailable');
   }
 

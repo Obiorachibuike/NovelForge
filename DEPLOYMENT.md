@@ -67,6 +67,27 @@ production**. Add a Brevo API key, verify your sending domain/address under
 
 ## 3. Hosted inference (Agnes AI primary · Hugging Face fallback)
 
+### Troubleshooting: a configured key still gives the chapter provider error
+
+Chapter generation refuses to queue if **either** `AI_DEMO_MODE=true` **or**
+no usable provider key is available. A saved key does not override demo mode.
+
+1. In Vercel → your project → Settings → Environment Variables, set
+   `AI_DEMO_MODE` to `false` (without literal quotes).
+2. Ensure at least one real key (`AGNES_API_KEY`, `HF_TOKEN`, or
+   `OPENAI_API_KEY`) is assigned to the environment you are using. Production
+   variables do not automatically apply to Preview deployments. Check any
+   branch-specific overrides too. Blank/placeholder Agnes and HF keys are ignored.
+3. Create a new deployment after saving. Editing project variables does not
+   update an existing deployment; open the new deployment or its updated alias,
+   not an older deployment URL.
+
+Vercel injects these values into the server environment; you do not need to
+upload an `.env` file into the running app or add `NEXT_PUBLIC_` to secret keys.
+The old combined error could mean either demo mode or missing credentials;
+new errors distinguish those cases. Enabling generation permits provider calls
+that may consume credits; this does not bypass the configured AI budgets.
+
 ### 3.1 Credentials
 
 **Agnes AI (primary — text and images).** Create an API key in the
