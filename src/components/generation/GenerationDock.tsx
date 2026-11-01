@@ -280,7 +280,7 @@ function JobRow({
 }) {
   const active = isActive(job);
   const href = chapterHref(job);
-  const title = job.chapterTitle || (job.chapterNumber ? `Chapter ${job.chapterNumber}` : 'Chapter');
+  const title = job.chapterTitle || job.title || (job.chapterNumber ? `Chapter ${job.chapterNumber}` : formatGenerationType(job.generationType || job.taskType || 'AI content'));
   return (
     <div
       className={cn(
@@ -293,7 +293,7 @@ function JobRow({
           <div className="text-xs font-medium truncate">{title}</div>
           <div className="text-[10px] text-muted-foreground truncate">
             {job.novelTitle || 'Novel'}
-            {job.chapterNumber ? ` · Chapter ${job.chapterNumber}` : ''}
+            {job.chapterNumber ? ` · Chapter ${job.chapterNumber}` : job.generationType ? ` · ${formatGenerationType(job.generationType)}` : ''}
           </div>
         </div>
         <GenerationStatusBadge status={job.status} />
@@ -317,6 +317,12 @@ function JobRow({
             <div className="h-full w-1/3 bg-gradient-to-r from-indigo-500 to-violet-500 animate-pulse" />
           </div>
         </>
+      )}
+
+      {active && job.partialText && (
+        <div className="mt-2 max-h-24 overflow-hidden rounded-md border border-border/60 bg-black/10 p-2 text-[11px] leading-relaxed text-muted-foreground whitespace-pre-wrap" aria-live="polite">
+          {job.partialText.slice(-700)}
+        </div>
       )}
 
       {!active && job.status === 'FAILED' && (
@@ -360,6 +366,10 @@ function JobRow({
       )}
     </div>
   );
+}
+
+function formatGenerationType(value: string): string {
+  return value.replace(/[_-]+/g, ' ').replace(/\\b\\w/g, char => char.toUpperCase());
 }
 
 function formatRelative(iso?: string | null): string {
