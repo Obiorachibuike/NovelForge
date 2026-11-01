@@ -12,6 +12,11 @@ import {
 } from '@/lib/jobs/generation-jobs';
 import { z } from 'zod';
 
+// --- UNIVERSAL GENERATION ENGINE INTEGRATION ---
+import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
+import { GenerationRequestSchema, GenerationType } from '@/lib/ai/generation/generation-types';
+import { GenerationRegistry } from '@/lib/ai/generation/generation-registry';
+
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
@@ -43,6 +48,44 @@ export const POST = apiHandler(async (req: Request) => {
   enforceRateLimit('aiGeneration', user.id);
   enforceAiRateLimit('text', user.id);
 
+  // --- UNIVERSAL ENGINE DISPATCH ---
+  // If the request matches the Universal Generation schema, route it there.
+  // Otherwise, fall back to the legacy chapter generation logic.
+  const rawBody = await req.json();
+  
+  // Check if it's a Universal Generation Request (has generationType)
+  if (rawBody.generationType && GenerationRegistry.has(rawBody.generationType as GenerationType)) {
+    const body = GenerationRequestSchema.parse(rawBody);
+    
+    // Project ownership check
+    if (body.projectId) {
+      await requireNovel(body.projectId, user.id);
+    }
+
+    // Create Universal Job
+    const jobId = await UniversalGenerationService.createJob({
+      ...body,
+      userId: user.id,
+    });
+
+    const job = getGenerationForUser(user.id, jobId);
+    if (!job) throw new HttpError(500, 'Job creation failed', 'generation_missing');
+
+    return Response.json(
+      {
+        ok: true,
+        jobId,
+        generation: serializeGeneration(job),
+        statusUrl: `/api/generations/${jobId}`,
+        eventsUrl: `/api/generations/${jobId}/events`,
+        cancelUrl: `/api/generations/${jobId}/cancel`,
+        retryUrl: `/api/generations/${jobId}/retry`,
+      },
+      { status: 202 }
+    );
+  }
+
+  // --- LEGACY DISPATCH (Fallback) ---
   const body = await readJsonBody(req, v => createSchema.parse(v));
   await requireNovel(body.novelId, user.id);
 
@@ -91,23 +134,137 @@ export const POST = apiHandler(async (req: Request) => {
 export const GET = apiHandler(async (req: Request) => {
   const user = await requireUser();
   const url = new URL(req.url);
-  const parsed = listQuerySchema.safeParse(Object.fromEntries(url.searchParams));
+  
+  // --- UNIVERSAL GENERATION QUERY ---
+  // If the query asks for universal types, use the universal query logic.
+  const querySchema = z.object({
+    active: z.enum(['true', 'false', '1', '0']).optional(),
+    projectId: z.string().max(64).optional(), // novelId
+    targetId: z.string().max(64).optional(), // chapterId etc.
+    limit: z.coerce.number().int().min(1).max(100).optional(),
+    generationType: z.string().optional(),
+  });
+
+  const parsed = querySchema.safeParse(Object.fromEntries(url.searchParams));
   if (!parsed.success) {
     throw new HttpError(400, parsed.error.errors[0]?.message || 'Invalid query', 'validation_failed');
   }
-  const q = parsed.data;
-  if (q.novelId) await requireNovel(q.novelId, user.id);
 
-  const active = q.active === 'true' || q.active === '1';
+  const q = parsed.data;
+  if (q.projectId) await requireNovel(q.projectId, user.id);
+
+  // If generationType is provided or we're querying universal fields, use Universal logic
+  if (q.generationType || q.projectId || q.targetId) {
+    const { getDb } = await import('@/lib/db');
+    const db = getDb();
+    
+    const clauses = ['j.userId = ?'];
+    const args: unknown[] = [user.id];
+    
+    if (q.active === 'true' || q.active === '1') {
+      clauses.push(`j.status IN ('queued','processing')`);
+    }
+    if (q.projectId) {
+      clauses.push('j.novelId = ?');
+      args.push(q.projectId);
+    }
+    if (q.targetId) {
+      clauses.push('j.chapterId = ?');
+      args.push(q.targetId);
+    }
+    if (q.generationType) {
+      clauses.push('j.taskType = ?');
+      args.push(q.generationType);
+    }
+
+    const limit = Math.min(100, Math.max(1, q.limit ?? 25));
+    
+    const GENERATION_SELECT = `
+      SELECT j.*, n.title AS novelTitle, c.title AS chapterTitle, c.chapterNumber AS chapterNumber
+        FROM generation_jobs j
+        LEFT JOIN novels n ON n.id = j.novelId
+        LEFT JOIN chapters c ON c.id = j.chapterId
+    `;
+
+    const rows = db
+      .prepare(`${GENERATION_SELECT} WHERE ${clauses.join(' AND ')} ORDER BY j.createdAt DESC LIMIT ?`)
+      .all(...args, limit) as any[];
+
+    // Serialize using existing logic (adapted for universal job row)
+    const serialized = rows.map((row: any) => {
+      const status = row.status;
+      const publicStatus = 
+        status === 'queued' ? 'QUEUED' :
+        status === 'processing' ? 'PROCESSING' :
+        status === 'completed' || status === 'awaiting_review' ? 'COMPLETED' :
+        status === 'failed' ? 'FAILED' :
+        status === 'cancelled' ? 'CANCELLED' : 'NOT_STARTED';
+
+      return {
+        id: row.id,
+        novelId: row.novelId,
+        novelTitle: row.novelTitle ?? null,
+        chapterId: row.chapterId ?? null,
+        chapterTitle: row.chapterTitle ?? null,
+        chapterNumber: row.chapterNumber ?? null,
+        taskType: row.taskType,
+        status: publicStatus,
+        progressPercentage: row.progressPercentage ?? null,
+        indeterminate: row.taskType === 'chapter' && !['COMPLETED', 'FAILED', 'CANCELLED'].includes(publicStatus),
+        currentStage: row.currentStage ?? null,
+        currentStageLabel: row.currentStage ? row.currentStage : null, // Simplified
+        errorMessage: row.error ? String(row.error) : null,
+        errorCode: row.errorCode ?? null,
+        retryCount: row.attempts ?? 0,
+        maxAttempts: row.maxAttempts ?? 3,
+        canCancel: ['QUEUED', 'PROCESSING'].includes(publicStatus),
+        canRetry: ['FAILED', 'CANCELLED'].includes(publicStatus),
+        retryable: row.retryable === undefined || row.retryable === null ? true : Boolean(row.retryable),
+        startedAt: row.startedAt ?? null,
+        completedAt: row.completedAt ?? null,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+        partialText: row.result ? (() => {
+          try {
+            const parsed = JSON.parse(row.result);
+            return typeof parsed?.partialText === 'string' ? parsed.partialText.slice(-6000) : null;
+          } catch { return null; }
+        })() : null,
+        requestedModel: row.requestedModel ?? null,
+        actualModel: row.actualModel ?? null,
+        provider: row.provider ?? null,
+        eventsUrl: `/api/generations/${row.id}/events`,
+        generationType: row.taskType,
+      };
+    });
+
+    return Response.json(
+      {
+        generations: serialized,
+        count: serialized.length,
+      },
+      { headers: { 'Cache-Control': 'no-store' } }
+    );
+  }
+
+  // --- LEGACY DISPATCH (Fallback) ---
+  const listParsed = listQuerySchema.safeParse(Object.fromEntries(url.searchParams));
+  if (!listParsed.success) {
+    throw new HttpError(400, listParsed.error.errors[0]?.message || 'Invalid query', 'validation_failed');
+  }
+  const lq = listParsed.data;
+  if (lq.novelId) await requireNovel(lq.novelId, user.id);
+
+  const active = lq.active === 'true' || lq.active === '1';
   const rows = listGenerations(user.id, {
     active,
-    novelId: q.novelId,
-    chapterId: q.chapterId,
-    limit: q.limit ?? 25,
+    novelId: lq.novelId,
+    chapterId: lq.chapterId,
+    limit: lq.limit ?? 25,
   });
   const activeRows = active
     ? rows
-    : listGenerations(user.id, { active: true, novelId: q.novelId, limit: 100 });
+    : listGenerations(user.id, { active: true, novelId: lq.novelId, limit: 100 });
 
   return Response.json(
     {

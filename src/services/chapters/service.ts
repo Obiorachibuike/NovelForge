@@ -15,6 +15,11 @@ import { countWords } from '@/types';
 import { z } from 'zod';
 import 'server-only';
 
+// --- UNIVERSAL GENERATION ENGINE INTEGRATION ---
+import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
+import { GenerationRequest, GenerationType } from '@/lib/ai/generation/generation-types';
+import { GenerationRegistry } from '@/lib/ai/generation/generation-registry';
+
 export interface ChapterDoc { type:'doc'; content: any[] }
 
 export function emptyDoc(text?: string): ChapterDoc {
@@ -54,7 +59,7 @@ function renderNode(node:any): string {
         else if (m.type === 'italic') t = `<em>${t}</em>`;
         else if (m.type === 'underline') t = `<u>${t}</u>`;
         else if (m.type === 'highlight') t = `<mark>${t}</mark>`;
-        else if (m.type === 'link' && m.attrs?.href) t = `<a href="${m.attrs.href}" rel="nofollow noopener">${t}</a>`;
+        else if (m.type === 'link' && m.attrs?.href) t = `<a href=\"${m.attrs.href}\" rel=\"nofollow noopener\">${t}</a>`;
       }
     }
     return t;
@@ -90,6 +95,32 @@ export async function enqueueChapterGeneration(
   chapterNumber: number,
   options: { confirmOverwrite?: boolean; textModel?: string; allowFallback?: boolean } = {},
 ) {
+  // --- UNIVERSAL ENGINE DISPATCH ---
+  // If the Universal Engine is registered for 'chapter', route it there.
+  if (GenerationRegistry.has('chapter')) {
+    const req: GenerationRequest = {
+      generationType: 'chapter',
+      projectId: novelId,
+      targetId: undefined, // Will be set in UniversalGenerationService.createJob
+      userId,
+      prompt: '', // Extracted from payload in UniversalGenerationService
+      context: {
+        chapterNumber,
+        confirmOverwrite: options.confirmOverwrite || false,
+        textModel: options.textModel,
+        allowFallback: options.allowFallback !== false,
+      },
+      stream: false,
+      metadata: {},
+      idempotencyKey: `chapter:${novelId}:${chapterNumber}`,
+    };
+
+    // The UniversalGenerationService handles creation and queuing via pg-boss
+    const jobId = await UniversalGenerationService.createJob(req);
+    return jobId;
+  }
+
+  // --- LEGACY DISPATCH (Fallback) ---
   const db = getDb();
   const novel = db.prepare('SELECT id FROM novels WHERE id = ? AND userId = ?').get(novelId, userId);
   if (!novel) throw new HttpError(404, 'Novel not found', 'novel_not_found');
@@ -189,6 +220,10 @@ function envPositiveInt(name: string, fallback: number): number {
 
 interface ChapterJobPayload { chapterNumber: number; confirmOverwrite?: boolean; textModel?: string; allowFallback?: boolean }
 
+// --- LEGACY HANDLER ---
+// Kept for backward compatibility during transition. The UniversalGenerationService
+// will route 'chapter' to the Universal engine, but we keep this handler registered
+// in case the queue logic falls back.
 export async function runChapterGeneration({ id: jobId, novelId, userId, payload, setStage, isCancelled, signal }: any) {
   const db = getDb();
   const { chapterNumber, confirmOverwrite, textModel, allowFallback } = payload as ChapterJobPayload;
@@ -234,7 +269,7 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
   const wordsPerPage = settings?.wordsPerPage || 320;
 
   const previousChapter = db.prepare(
-    `SELECT summary FROM chapters WHERE novelId=? AND chapterNumber=? AND status='approved' ORDER BY chapterNumber DESC LIMIT 1`,
+    `SELECT summary FROM chapters WHERE novelId=? AND chapterNumber=? AND status='approved' ORDER BY chapterNumber DESC LIMIT 1`
   ).get(novelId, chapterNumber - 1) as any;
   const premise = db.prepare('SELECT logline,shortSynopsis FROM premises WHERE novelId=?').get(novelId) as any;
   const characters = db.prepare('SELECT name,role,personality,arc FROM characters WHERE novelId=? LIMIT 8').all(novelId) as any[];
@@ -345,13 +380,13 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
       const nextRevision = ((existing?.revision as number) || 1) + 1;
       db.prepare(
         `UPDATE chapters SET title=?, contentJson=?, generatedContentJson=?, contentHtml=?, plainText=?, wordCount=?, pageCountEst=?,
-                             status='generated', generationStatus='COMPLETED', generationSource=?, generatedAt=?, lastJobId=?, revision=?, summary=NULL, updatedAt=? WHERE id=?`,
+                             status='generated', generationStatus='COMPLETED', generationSource=?, generatedAt=?, lastJobId=?, revision=?, summary=NULL, updatedAt=? WHERE id=?`
       ).run(outline.title, serializedDoc, serializedDoc, html, text, words, pages, generated.meta.source, now, jobId || null, nextRevision, now, chapterId);
     } else {
       chapterId = nanoid();
       db.prepare(
         `INSERT INTO chapters (id,novelId,outlineId,chapterNumber,title,contentJson,generatedContentJson,contentHtml,plainText,status,wordCount,pageCountEst,generationSource,generatedAt,lastJobId,revision,generationStatus,createdAt,updatedAt)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,'COMPLETED',?,?)`,
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,'COMPLETED',?,?)`
       ).run(chapterId, novelId, outline.id, chapterNumber, outline.title,
         serializedDoc, serializedDoc, html, text, 'generated', words, pages, generated.meta.source, now, jobId || null, now, now);
     }
@@ -365,7 +400,7 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
     const versionId = nanoid();
     db.prepare(
       `INSERT INTO chapter_versions (id,novelId,chapterId,versionNum,contentJson,wordCount,note,revisionType,parentVersionId,createdAt)
-       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?,?)`
     ).run(
       versionId, novelId, chapterId, nextVersion, serializedDoc, words,
       `Generation (${generated.meta.source})`, 'generation', existing?.currentVersionId || null, now,
@@ -389,10 +424,33 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
   };
 }
 
+// Register legacy handler (fallback)
 registerHandler('chapter', runChapterGeneration);
+
+// --- UNIVERSAL GENERATION REGISTRATION ---
+// The UniversalGenerationService handles the actual execution of 'chapter'
+// via GenerationRegistry. The handler above is registered as a fallback.
+// The actual migration is handled in src/lib/ai/generation/migration-registry.ts
 
 /** Queues story-memory extraction for an approved chapter (durable + retried). */
 export async function enqueueMemoryExtraction(userId: string, novelId: string, chapterId: string) {
+  // --- UNIVERSAL ENGINE DISPATCH ---
+  if (GenerationRegistry.has('memory')) {
+    const req: GenerationRequest = {
+      generationType: 'memory',
+      projectId: novelId,
+      targetId: chapterId,
+      userId,
+      prompt: '',
+      context: {},
+      stream: false,
+      metadata: {},
+      idempotencyKey: `memory:${chapterId}`,
+    };
+    return await UniversalGenerationService.createJob(req);
+  }
+
+  // --- LEGACY DISPATCH (Fallback) ---
   const { enqueue } = await import('@/lib/queue');
   return enqueue({
     type: 'memory',
@@ -494,14 +552,42 @@ async function runMemoryExtraction({ novelId, userId, payload }: any) {
   return { source: meta.source, usedFallback: meta.usedFallback, importantEvents: result.importantEvents.length };
 }
 
+// Register legacy handler (fallback)
 registerHandler('memory', runMemoryExtraction);
 
 /** Kept for backwards compatibility with earlier call sites/tests. */
 export async function summarizeChapter(chapterId: string, userId: string, novelId?: string) {
   const db = getDb();
   const chapter = db.prepare('SELECT novelId FROM chapters WHERE id=?').get(chapterId) as any;
-  if (!chapter) throw new Error('Chapter not found');
-  return runMemoryExtraction({ payload: { chapterId }, userId, novelId: novelId || chapter.novelId });
+  if (!chapter) throw new HttpError(404, 'Chapter not found', 'chapter_not_found');
+  
+  // --- UNIVERSAL ENGINE DISPATCH ---
+  if (GenerationRegistry.has('memory')) {
+    const req: GenerationRequest = {
+      generationType: 'memory',
+      projectId: novelId || chapter.novelId,
+      targetId: chapterId,
+      userId,
+      prompt: '',
+      context: {},
+      stream: false,
+      metadata: {},
+      idempotencyKey: `memory:${chapterId}`,
+    };
+    const jobId = await UniversalGenerationService.createJob(req);
+    return { jobId };
+  }
+
+  // --- LEGACY DISPATCH (Fallback) ---
+  const { enqueue } = await import('@/lib/queue');
+  const jobId = await enqueue({
+    type: 'memory',
+    userId,
+    novelId: novelId || chapter.novelId,
+    payload: { chapterId },
+    idempotencyKey: `memory:${chapterId}`,
+  });
+  return { jobId };
 }
 
 export const MAX_AUTOSAVE_VERSIONS_PER_CHAPTER = 25;
@@ -516,12 +602,12 @@ export interface SaveChapterOptions {
 
 function pruneAutosaveVersions(db: any, chapterId: string) {
   const autosaves = db.prepare(
-    `SELECT id FROM chapter_versions WHERE chapterId = ? AND revisionType = 'autosave' ORDER BY versionNum DESC`,
+    `SELECT id FROM chapter_versions WHERE chapterId = ? AND revisionType = 'autosave' ORDER BY versionNum DESC`
   ).all(chapterId) as { id: string }[];
   if (autosaves.length > MAX_AUTOSAVE_VERSIONS_PER_CHAPTER) {
     const toDelete = autosaves.slice(MAX_AUTOSAVE_VERSIONS_PER_CHAPTER).map(r => r.id);
     db.prepare(
-      `DELETE FROM chapter_versions WHERE id IN (${toDelete.map(() => '?').join(',')})`,
+      `DELETE FROM chapter_versions WHERE id IN (${toDelete.map(() => '?').join(',')})`
     ).run(...toDelete);
   }
 }
@@ -573,7 +659,7 @@ export async function saveChapterContent(
           .get(chapterId) as { next: number }).next;
         db.prepare(
           `INSERT INTO chapter_versions (id,novelId,chapterId,versionNum,contentJson,wordCount,note,revisionType,parentVersionId,createdAt)
-           VALUES (?,?,?,?,?,?,?,?,?,?)`,
+           VALUES (?,?,?,?,?,?,?,?,?,?)`
         ).run(
           conflictVersionId, novelId, chapterId, nextVer, serialized, words,
           `Conflicting edit preserved (base revision ${options.expectedRevision})`,
@@ -614,7 +700,7 @@ export async function saveChapterContent(
       db.prepare(
         `UPDATE chapters SET title=?, contentJson=?, contentHtml=?, plainText=?, wordCount=?, pageCountEst=?,
                              status=CASE WHEN status='generated' THEN 'edited' ELSE status END,
-                             revision=?, updatedAt=? WHERE id=?`,
+                             revision=?, updatedAt=? WHERE id=?`
       ).run(nextTitle, serialized, html, plain, words, pages, nextRevision, now, chapterId);
 
       if (nextTitle !== chapter.title && chapter.outlineId) {
@@ -624,7 +710,7 @@ export async function saveChapterContent(
     }
 
     const latestVer = db.prepare(
-      `SELECT id, wordCount, contentJson FROM chapter_versions WHERE chapterId=? ORDER BY versionNum DESC LIMIT 1`,
+      `SELECT id, wordCount, contentJson FROM chapter_versions WHERE chapterId=? ORDER BY versionNum DESC LIMIT 1`
     ).get(chapterId) as { id: string; wordCount: number; contentJson: string } | undefined;
 
     const shouldSnapshot = Boolean(
@@ -642,7 +728,7 @@ export async function saveChapterContent(
       const note = options.snapshotNote || (options.createSnapshot ? 'Manual save' : 'Autosave checkpoint');
       db.prepare(
         `INSERT INTO chapter_versions (id,novelId,chapterId,versionNum,contentJson,wordCount,note,revisionType,parentVersionId,createdAt)
-         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+         VALUES (?,?,?,?,?,?,?,?,?,?)`
       ).run(
         versionId, novelId, chapterId, nextVer, serialized, words, note, revType,
         chapter.currentVersionId || latestVer?.id || null, now,
@@ -665,7 +751,7 @@ export async function createVersion(
 ) {
   const db = getDb();
   const chapter = db.prepare(
-    `SELECT c.* FROM chapters c JOIN novels n ON n.id=c.novelId WHERE c.id=? AND c.novelId=? AND n.userId=?`,
+    `SELECT c.* FROM chapters c JOIN novels n ON n.id=c.novelId WHERE c.id=? AND c.novelId=? AND n.userId=?`
   ).get(chapterId, novelId, userId) as any;
   if (!chapter) throw new HttpError(404, 'Chapter not found', 'chapter_not_found');
   const current = db.prepare(`SELECT COALESCE(MAX(versionNum),0)+1 AS next FROM chapter_versions WHERE chapterId=?`).get(chapterId) as any;
@@ -673,7 +759,7 @@ export async function createVersion(
   const now = new Date().toISOString();
   db.prepare(
     `INSERT INTO chapter_versions (id,novelId,chapterId,versionNum,contentJson,wordCount,note,revisionType,parentVersionId,createdAt)
-     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+     VALUES (?,?,?,?,?,?,?,?,?,?)`
   ).run(
     id, novelId, chapterId, current.next, chapter.contentJson, chapter.wordCount,
     note || null, revisionType, chapter.currentVersionId || null, now,
@@ -691,7 +777,7 @@ export async function createVersion(
 export async function approveChapter(userId: string, novelId: string, chapterId: string) {
   const db = getDb();
   const chapter = db.prepare(
-    `SELECT c.* FROM chapters c JOIN novels n ON n.id=c.novelId WHERE c.id=? AND c.novelId=? AND n.userId=?`,
+    `SELECT c.* FROM chapters c JOIN novels n ON n.id=c.novelId WHERE c.id=? AND c.novelId=? AND n.userId=?`
   ).get(chapterId, novelId, userId) as any;
   if (!chapter) throw new HttpError(404, 'Chapter not found', 'chapter_not_found');
   if (!chapter.plainText || countWords(chapter.plainText) < 1) {
@@ -749,14 +835,14 @@ export async function listVersions(chapterId: string) {
   const db = getDb();
   return db.prepare(
     `SELECT id, novelId, chapterId, versionNum, wordCount, note, revisionType, parentVersionId, createdAt
-       FROM chapter_versions WHERE chapterId=? ORDER BY versionNum DESC`,
+       FROM chapter_versions WHERE chapterId=? ORDER BY versionNum DESC`
   ).all(chapterId) as any[];
 }
 
 export async function getVersion(userId: string, novelId: string, chapterId: string, versionId: string) {
   const db = getDb();
   const chapter = db.prepare(
-    `SELECT c.id FROM chapters c JOIN novels n ON n.id=c.novelId WHERE c.id=? AND c.novelId=? AND n.userId=?`,
+    `SELECT c.id FROM chapters c JOIN novels n ON n.id=c.novelId WHERE c.id=? AND c.novelId=? AND n.userId=?`
   ).get(chapterId, novelId, userId) as any;
   if (!chapter) throw new HttpError(404, 'Chapter not found', 'chapter_not_found');
   const v = db.prepare(`SELECT * FROM chapter_versions WHERE id=? AND chapterId=?`).get(versionId, chapterId) as any;
@@ -774,7 +860,7 @@ export async function getVersion(userId: string, novelId: string, chapterId: str
 export async function restoreVersion(userId: string, novelId: string, chapterId: string, versionId: string) {
   const db = getDb();
   const chapter = db.prepare(
-    `SELECT c.* FROM chapters c JOIN novels n ON n.id=c.novelId WHERE c.id=? AND c.novelId=? AND n.userId=?`,
+    `SELECT c.* FROM chapters c JOIN novels n ON n.id=c.novelId WHERE c.id=? AND c.novelId=? AND n.userId=?`
   ).get(chapterId, novelId, userId) as any;
   if (!chapter) throw new HttpError(404, 'Chapter not found', 'chapter_not_found');
   if (chapter.status === 'approved') throw new HttpError(409, 'Approved chapters are read-only.', 'chapter_approved');
@@ -791,7 +877,7 @@ export async function restoreVersion(userId: string, novelId: string, chapterId:
 
   const tx = db.transaction(() => {
     const latestVer = db.prepare(
-      `SELECT id, contentJson FROM chapter_versions WHERE chapterId=? ORDER BY versionNum DESC LIMIT 1`,
+      `SELECT id, contentJson FROM chapter_versions WHERE chapterId=? ORDER BY versionNum DESC LIMIT 1`
     ).get(chapterId) as { id: string; contentJson: string } | undefined;
 
     let parentId: string | null = chapter.currentVersionId || latestVer?.id || null;
@@ -801,7 +887,7 @@ export async function restoreVersion(userId: string, novelId: string, chapterId:
       const preId = nanoid();
       db.prepare(
         `INSERT INTO chapter_versions (id,novelId,chapterId,versionNum,contentJson,wordCount,note,revisionType,parentVersionId,createdAt)
-         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+         VALUES (?,?,?,?,?,?,?,?,?,?)`
       ).run(
         preId, novelId, chapterId, nextPreVer, chapter.contentJson, chapter.wordCount,
         `Auto-save before restoring v${v.versionNum}`, 'pre_restore', parentId, now,
@@ -814,7 +900,7 @@ export async function restoreVersion(userId: string, novelId: string, chapterId:
     const restoredVerId = nanoid();
     db.prepare(
       `INSERT INTO chapter_versions (id,novelId,chapterId,versionNum,contentJson,wordCount,note,revisionType,parentVersionId,createdAt)
-       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?,?)`
     ).run(
       restoredVerId, novelId, chapterId, nextVer, v.contentJson, words,
       `Restored from v${v.versionNum}`, 'restore', v.id, now,
@@ -822,7 +908,7 @@ export async function restoreVersion(userId: string, novelId: string, chapterId:
 
     db.prepare(
       `UPDATE chapters SET contentJson=?, plainText=?, contentHtml=?, wordCount=?, pageCountEst=?,
-                           status='edited', currentVersionId=?, revision=?, updatedAt=? WHERE id=? AND novelId=?`,
+                           status='edited', currentVersionId=?, revision=?, updatedAt=? WHERE id=? AND novelId=?`
     ).run(v.contentJson, plain, docToHtml(parsed), words, pages, restoredVerId, nextRevision, now, chapterId, novelId);
     db.prepare(`UPDATE novels SET updatedAt=? WHERE id=?`).run(now, novelId);
   });

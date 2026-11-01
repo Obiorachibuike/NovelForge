@@ -9,6 +9,11 @@ import { HttpError } from '@/lib/api/http';
 import { z } from 'zod';
 import 'server-only';
 
+// --- UNIVERSAL GENERATION ENGINE INTEGRATION ---
+import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
+import { GenerationRequest, GenerationType } from '@/lib/ai/generation/generation-types';
+import { GenerationRegistry } from '@/lib/ai/generation/generation-registry';
+
 const premiseShape = z.object({
   logline: z.string(),
   shortSynopsis: z.string(),
@@ -39,6 +44,26 @@ export async function enqueuePrepareNovel(
   novelId: string,
   options: { textModel?: string; allowFallback?: boolean } = {},
 ) {
+  // --- UNIVERSAL ENGINE DISPATCH ---
+  if (GenerationRegistry.has('premise')) {
+    const req: GenerationRequest = {
+      generationType: 'premise',
+      projectId: novelId,
+      targetId: undefined,
+      userId,
+      prompt: '',
+      context: {
+        ...(options.textModel ? { textModel: options.textModel } : {}),
+        allowFallback: options.allowFallback !== false,
+      },
+      stream: false,
+      metadata: {},
+      idempotencyKey: `premise:${novelId}`,
+    };
+    return await UniversalGenerationService.createJob(req);
+  }
+
+  // --- LEGACY DISPATCH (Fallback) ---
   const { enqueue } = await import('@/lib/queue');
   return enqueue({
     type: 'premise', userId, novelId,
@@ -51,6 +76,10 @@ export async function getPremise(novelId: string) {
   return db.prepare('SELECT * FROM premises WHERE novelId = ?').get(novelId) as any;
 }
 
+// --- LEGACY HANDLER ---
+// Kept for backward compatibility during transition. The UniversalGenerationService
+// will route 'premise' to the Universal engine, but we keep this handler registered
+// in case the queue logic falls back.
 export async function runPremise({ id, novelId, userId, payload }: { id?: string; novelId:string; userId:string; payload?: { textModel?: string; allowFallback?: boolean } }) {
   const db = getDb();
   const novel = db.prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as any;
@@ -136,6 +165,7 @@ export async function runPremise({ id, novelId, userId, payload }: { id?: string
   return { source: meta.source };
 }
 
+// Register legacy handler (fallback)
 registerHandler('premise', runPremise);
 
 function makeDemoPremise(novel: any) {
@@ -200,7 +230,7 @@ export async function updatePremiseField(novelId: string, userId: string, patch:
     if (!existing) {
       db.prepare(
         `INSERT INTO premises (id,novelId,logline,shortSynopsis,fullSynopsis,themes,setting,majorConflicts,createdAt,updatedAt)
-         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+         VALUES (?,?,?,?,?,?,?,?,?,?)`
       ).run(nanoid(), novelId, null, null, null, '[]', null, '[]', now, now);
     }
 
@@ -214,7 +244,7 @@ export async function updatePremiseField(novelId: string, userId: string, patch:
     vals.push(now, novelId, novelId, userId);
     db.prepare(
       `UPDATE premises SET ${sets.join(', ')}, updatedAt=?
-        WHERE novelId=? AND EXISTS(SELECT 1 FROM novels WHERE id=? AND userId=?)`,
+        WHERE novelId=? AND EXISTS(SELECT 1 FROM novels WHERE id=? AND userId=?)`
     ).run(...vals);
     db.prepare(`UPDATE novels SET updatedAt=? WHERE id=? AND userId=?`).run(now, novelId, userId);
   });
