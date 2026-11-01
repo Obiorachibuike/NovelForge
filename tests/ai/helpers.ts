@@ -135,6 +135,9 @@ export function routerModel(body: Record<string, unknown>, status = 200): Respon
 export function useHuggingFaceBackend() {
   const previous = { ...process.env } as Record<string, string | undefined>;
   process.env.HF_TOKEN = 'hf_test_token_0123456789abcdef';
+  // Hosted inference cannot run while forced demo mode is on; the global test
+  // setup enables demo mode so no test reaches a paid provider by accident.
+  delete process.env.AI_DEMO_MODE;
   process.env.AI_BACKEND = 'huggingface';
   process.env.AI_ALLOW_PAID_INFERENCE = 'false';
   process.env.AI_REQUIRE_CONFIRMED_PRICING = 'false';

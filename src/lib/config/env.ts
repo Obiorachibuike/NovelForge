@@ -12,7 +12,7 @@ export interface ValidatedEnvConfig {
   aiMonthlyCostLimitUsd: number;
   aiTimeoutMs: number;
   hasOpenAiKey: boolean;
-  hasRedisUrl: boolean;
+  hasPgBoss: boolean;
   hasCloudinary: boolean;
   hasHuggingFaceToken: boolean;
   hasAgnesKey: boolean;
@@ -164,7 +164,7 @@ export function validateEnvConfig(env: NodeJS.ProcessEnv = process.env): Validat
     aiMonthlyCostLimitUsd: rawMonthlyCost,
     aiTimeoutMs: rawTimeout,
     hasOpenAiKey: Boolean(env.OPENAI_API_KEY && !env.OPENAI_API_KEY.startsWith('sk-...')),
-    hasRedisUrl: Boolean(env.REDIS_URL),
+    hasPgBoss: Boolean(env.DATABASE_URL && /^postgres(ql)?:\/\//i.test(env.DATABASE_URL)),
     hasCloudinary: hasFullCloudinary,
     hasHuggingFaceToken: huggingFaceConfigured(),
     hasAgnesKey: agnesConfigured(),

@@ -26,7 +26,7 @@ export default defineConfig({
       },
     },
     globals: true,
-    include: ['tests/**/*.test.ts'],
+    include: ['tests/**/*.test.ts', 'tests/**/*.test.tsx'],
     setupFiles: ['tests/setup.ts'],
     // Each worker gets its own SQLite file (see tests/setup.ts); keep files
     // serial inside a worker to avoid cross-test interference.

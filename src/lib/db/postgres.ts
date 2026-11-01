@@ -141,6 +141,18 @@ const CAMEL_CASE_COLUMNS: Record<string, string> = {
   confirmedcostusd: 'confirmedCostUsd',
   imagewidth: 'imageWidth',
   imageheight: 'imageHeight',
+  // ── Background generation (migration 0013) ───────────────────────────────
+  generationstatus: 'generationStatus',
+  currentstage: 'currentStage',
+  progresspercentage: 'progressPercentage',
+  stageupdatedat: 'stageUpdatedAt',
+  cancelrequestedat: 'cancelRequestedAt',
+  queuejobid: 'queueJobId',
+  lastheartbeatat: 'lastHeartbeatAt',
+  seq: 'seq',
+  isread: 'isRead',
+  dedupekey: 'dedupeKey',
+  generationjobid: 'generationJobId',
   // Computed alias columns in SELECT queries
   coverurl: 'coverUrl',
   wordswritten: 'wordsWritten',

@@ -25,9 +25,9 @@ const nextConfig = {
     // Route handlers enforce their own, per-endpoint body limits (see
     // src/lib/api/http.ts); this stays for server actions only.
     serverActions: { bodySizeLimit: '10mb' },
-    // better-sqlite3 (and the pg/ioredis drivers used by optional modes) are
-    // native/CJS packages that must not be bundled.
-    serverComponentsExternalPackages: ['better-sqlite3', 'bullmq', 'ioredis'],
+    // better-sqlite3 is a native package that must not be bundled. pg-boss is
+    // ESM and owns its PostgreSQL pool; keep it external to the bundler too.
+    serverComponentsExternalPackages: ['better-sqlite3', 'pg-boss'],
   },
 };
 

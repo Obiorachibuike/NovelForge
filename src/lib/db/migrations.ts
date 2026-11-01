@@ -500,6 +500,73 @@ export const migrations: Migration[] = [
       `CREATE TABLE IF NOT EXISTS schema_migrations (id TEXT PRIMARY KEY, description TEXT NOT NULL, appliedAt TEXT NOT NULL)`,
     ],
   },
+  {
+    id: '0013_background_generation',
+    description: 'Persistent background chapter generation: generation stages, per-chapter status, recoverable SSE events and notifications.',
+    statements: [
+      // ── Per-chapter generation status ─────────────────────────────────────
+      // Content status (`draft`/`generated`/`edited`/`approved`) stays exactly
+      // as it was; the asynchronous generation lifecycle is recorded next to
+      // it so the chapter library can show QUEUED / IN PROGRESS / FAILED
+      // without inventing a content state.
+      `ALTER TABLE chapters ADD COLUMN generationStatus TEXT NOT NULL DEFAULT 'NOT_STARTED'`,
+      `UPDATE chapters SET generationStatus='COMPLETED' WHERE status IN ('generated','edited','approved')`,
+
+      // ── Generation job lifecycle ──────────────────────────────────────────
+      // `progressPercentage` is nullable on purpose: when a provider does not
+      // expose real generation progress we persist NULL and the UI renders an
+      // indeterminate indicator instead of a fabricated number.
+      `ALTER TABLE generation_jobs ADD COLUMN currentStage TEXT`,
+      `ALTER TABLE generation_jobs ADD COLUMN progressPercentage INTEGER`,
+      `ALTER TABLE generation_jobs ADD COLUMN stageUpdatedAt TEXT`,
+      `ALTER TABLE generation_jobs ADD COLUMN cancelRequestedAt TEXT`,
+      `ALTER TABLE generation_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE generation_jobs ADD COLUMN queueJobId TEXT`,
+      `ALTER TABLE generation_jobs ADD COLUMN lastHeartbeatAt TEXT`,
+      `CREATE INDEX IF NOT EXISTS idx_jobs_chapter_active ON generation_jobs(chapterId, status)`,
+      `CREATE INDEX IF NOT EXISTS idx_jobs_user_active ON generation_jobs(userId, taskType, status)`,
+
+      // ── Durable events (SSE replay / Last-Event-ID) ───────────────────────
+      // Events are rows, not in-memory emitter calls, so a reconnect (or a
+      // different Node process) can replay everything it missed.
+      `CREATE TABLE IF NOT EXISTS generation_events (
+        id TEXT PRIMARY KEY,
+        seq INTEGER NOT NULL DEFAULT 0,
+        jobId TEXT NOT NULL,
+        userId TEXT NOT NULL,
+        novelId TEXT,
+        chapterId TEXT,
+        type TEXT NOT NULL,
+        status TEXT,
+        stage TEXT,
+        payload TEXT,
+        createdAt TEXT NOT NULL
+      )`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS ux_generation_events_seq ON generation_events(jobId, seq) WHERE seq > 0`,
+      `CREATE INDEX IF NOT EXISTS idx_generation_events_job ON generation_events(jobId, seq)`,
+      `CREATE INDEX IF NOT EXISTS idx_generation_events_user ON generation_events(userId, createdAt)`,
+
+      // ── Persistent notifications ──────────────────────────────────────────
+      // `dedupeKey` is unique so a pg-boss redelivery or a worker restart can
+      // never create the same notification twice.
+      `CREATE TABLE IF NOT EXISTS notifications (
+        id TEXT PRIMARY KEY,
+        userId TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        title TEXT NOT NULL,
+        message TEXT NOT NULL,
+        novelId TEXT,
+        chapterId TEXT,
+        generationJobId TEXT,
+        isRead INTEGER NOT NULL DEFAULT 0,
+        dedupeKey TEXT,
+        createdAt TEXT NOT NULL
+      )`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS ux_notifications_dedupe ON notifications(dedupeKey) WHERE dedupeKey IS NOT NULL`,
+      `CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(userId, isRead, createdAt)`,
+    ],
+  },
+
 ];
 
 export interface MigrationResult {

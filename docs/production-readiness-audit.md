@@ -1,5 +1,13 @@
 # NovelForge — Production Readiness Audit
 
+> **Historical audit.** Several findings below were fixed after this document was
+> written. In particular, the queue is now **pg-boss on PostgreSQL** with a
+> dedicated worker; Redis/BullMQ has been removed from the codebase and the
+> dependency list. See [`docs/background-generation.md`](background-generation.md)
+> for the current architecture. Statements about `QUEUE_PROVIDER=redis` and
+> BullMQ describe the code as it was at audit time.
+
+
 **Audit date:** 2026-10-11
 **Commit audited:** `b4e2df0` (branch `main`)
 **Method:** direct source inspection plus executed commands. Every claim below is labelled
@@ -345,8 +353,8 @@ Implemented: durable `generation_jobs` rows for every long task, CAS claim
 (`UPDATE … WHERE status='queued' AND (scheduledAt IS NULL OR scheduledAt<=?)`),
 bounded retries with backoff (`min(60 s, 2·2^(n−1))`, `maxAttempts=3`), stale
 claim recovery, partial unique index on `idempotencyKey` while a job is active,
-a real BullMQ consumer used when `QUEUE_PROVIDER=redis` **and** `REDIS_URL` are
-set, and a protected status endpoint (`GET /api/jobs/[jobId]`, owner-scoped).
+a pg-boss consumer in the dedicated worker (PostgreSQL; see
+`docs/background-generation.md`), and a protected status endpoint (`GET /api/jobs/[jobId]`, owner-scoped).
 `tests/queue/queue.test.ts` (11 tests) proves: ten concurrent enqueues of the
 same key collapse to one job; three racing `runJob` calls run the handler once;
 failures retry and finally fail with the recorded error; a job abandoned by a
@@ -498,7 +506,7 @@ npm ci
 npm run build
 DATABASE_URL=file:/data/novelforge.db DATA_DIR=/data AUTH_SECRET=… npm start
 # queue: either in-process, or
-QUEUE_PROVIDER=redis REDIS_URL=redis://… npm run worker
+QUEUE_PROVIDER=database npm run worker   # PostgreSQL/pg-boss is the default
 ```
 
 First run applies migrations automatically; `npm run db:status` reports what is

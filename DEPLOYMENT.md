@@ -258,17 +258,40 @@ npm run db:migrate          # apply migrations (PostgreSQL or SQLite)
 # Web
 npm run start               # serves the production build (port 3000 by default)
 
-# Worker (recommended in a separate process/container, same DATABASE_URL)
-npm run worker              # polls the durable job store; BullMQ when REDIS_URL is set
+# Worker (REQUIRED, separate persistent process/container, same DATABASE_URL)
+npm run worker              # pg-boss consumer + stale-job recovery sweep
 ```
 
 Two processes are safe: job claiming is an atomic compare-and-set `UPDATE`, and
 stale jobs are recovered after `QUEUE_STALE_JOB_MS` (default 5 min), so the
-BullMQ consumer, the database poller and an in-process dispatch can run
-concurrently without executing the same job twice.
+pg-boss consumer and the database sweep can run concurrently without executing
+the same job twice. pg-boss carries only the wake-up; `generation_jobs` is the
+source of truth.
+
+### 5.1 Background generation hosting requirements
+
+| Requirement | Detail |
+| --- | --- |
+| Persistent Node.js process for the worker | `npm run worker` must run on a container/VM host (Fly.io, Railway, Render, Kubernetes, EC2…). It cannot run in a Vercel serverless function: functions freeze after the response, which would silently stop generation. |
+| Shared PostgreSQL | Both processes need the same `postgresql://` `DATABASE_URL`. Migration `0013` creates generation columns/events/notifications; pg-boss creates its own `pgboss` schema on first start. The DB user needs `CREATE` on the schema (or pre-create `pgboss`). |
+| SSE-capable app host | `GET /api/generations/[jobId]/events` is a long-lived response. Responses send `Cache-Control: no-cache, no-transform` and `X-Accel-Buffering: no`; disable proxy buffering/timeouts shorter than `SSE_HEARTBEAT_MS` (default 15s). A serverless platform with a hard response duration will cut streams, though the job itself continues and reconnects replay missed events. |
+| Credentials | AI keys (`AGNES_API_KEY`, `HF_TOKEN`, `OPENAI_API_KEY`) belong to the **worker** (it calls the provider). The web app needs database/auth/storage keys. Never expose them to the browser. |
+| Shutdown | The worker handles `SIGTERM`/`SIGINT`: stops pg-boss, waits up to `WORKER_SHUTDOWN_MS` (25s) for in-flight jobs, closes the pool. |
+
+Suggested commands:
+
+```bash
+# Web (can be Vercel or the same container host)
+npm run start
+
+# Worker
+npm run worker
+```
 
 Health: `GET /api/health` reports database connectivity, foreign keys, the latest
-migration, queue state and configuration validation.
+migration, queue state (`queue.transport`, `queue.pgBoss`) and configuration
+validation. Full background-generation reference:
+[`docs/background-generation.md`](docs/background-generation.md).
 
 ---
 

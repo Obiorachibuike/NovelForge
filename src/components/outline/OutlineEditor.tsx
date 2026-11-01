@@ -6,10 +6,13 @@ import { toast } from 'sonner';
 import { Loader2, Wand2, CheckCircle2, Lock, ArrowRight, RefreshCw, BookOpen, Play, Pencil, Check, X } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 import { useJobWatcher } from '@/lib/hooks/useJobWatcher';
+import { useOptionalGeneration } from '@/components/generation/GenerationContext';
+import { GenerationStatusBadge } from '@/components/generation/GenerationStatusBadge';
 
 export default function OutlineEditor({ novel, outlines, acts, chapters, navigation }: any) {
   const router = useRouter();
   const qc = useQueryClient();
+  const generation = useOptionalGeneration();
   const [structure, setStructure] = useState('three-act');
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState<{ title: string; summary: string; targetWords: number }>({
@@ -76,6 +79,25 @@ export default function OutlineEditor({ novel, outlines, acts, chapters, navigat
     onSuccess: () => { toast.success('Outline approved — Chapter 1 is ready to write.'); router.push(`/novels/${novel.id}/write/1`); },
     onError: (e:any) => toast.error(e.message),
   });
+
+  /**
+   * Latest/active generation for a chapter row. The navigation payload is
+   * server-rendered; live SSE state can be newer, so the panel wins when both
+   * are available.
+   */
+  function generationFor(c: any) {
+    const candidates = (generation?.generations || []).filter(
+      (g: any) =>
+        g.novelId === novel.id &&
+        ((c.chapterId && g.chapterId === c.chapterId) || g.chapterNumber === c.chapterNumber),
+    );
+    return candidates.sort((a: any, b: any) => {
+      const activeA = a.status === 'QUEUED' || a.status === 'PROCESSING' ? 0 : 1;
+      const activeB = b.status === 'QUEUED' || b.status === 'PROCESSING' ? 0 : 1;
+      if (activeA !== activeB) return activeA - activeB;
+      return String(b.createdAt || '').localeCompare(String(a.createdAt || ''));
+    })[0];
+  }
 
   const plannedWords = outlines.reduce((s:number,c:any)=>s+c.targetWords,0);
   const approvedChapters = chapters.filter((c:any)=>c.status==='approved').length;
@@ -202,6 +224,7 @@ export default function OutlineEditor({ novel, outlines, acts, chapters, navigat
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
                       <h3 className="font-serif text-base font-semibold">{c.title}</h3>
+                      <GenerationStatusBadge status={generationFor(c)?.status || c.generationStatus} />
                       <StatusChip status={c.status} />
                     </div>
                     {c.summary && <p className="text-xs text-muted-foreground mt-1 line-clamp-2">{c.summary}</p>}
@@ -227,15 +250,69 @@ export default function OutlineEditor({ novel, outlines, acts, chapters, navigat
                     <Lock className="w-4 h-4 text-muted-foreground" />
                   ) : c.status === 'approved' ? (
                     <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                  ) : c.chapterId ? (
-                    <button className="btn-outline text-xs px-3 py-1.5" onClick={()=>router.push(`/novels/${novel.id}/write/${c.chapterNumber}`)}>
-                      <Play className="w-3 h-3"/> Open
-                    </button>
-                  ) : (
-                    <button className="btn-primary text-xs px-3 py-1.5" disabled={c.status === 'locked'} onClick={()=>router.push(`/novels/${novel.id}/write/${c.chapterNumber}`)}>
-                      Write <ArrowRight className="w-3 h-3"/>
-                    </button>
-                  )}
+                  ) : (() => {
+                    const job = generationFor(c);
+                    const active = job?.status === 'QUEUED' || job?.status === 'PROCESSING';
+                    if (active) {
+                      return (
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            className="btn-outline text-xs px-2.5 py-1.5"
+                            onClick={() => router.push(`/novels/${novel.id}/write/${c.chapterNumber}`)}
+                            title={job?.currentStageLabel || 'Generating in the background'}
+                          >
+                            <Loader2 className="w-3 h-3 animate-spin" /> View status
+                          </button>
+                          <button
+                            className="btn-outline text-xs px-2 py-1.5 text-destructive border-destructive/30"
+                            onClick={() => void generation?.cancelGeneration(job!.id)}
+                            title="Cancel generation"
+                          >
+                            <X className="w-3 h-3" />
+                          </button>
+                        </div>
+                      );
+                    }
+                    if (job?.status === 'FAILED') {
+                      return (
+                        <div className="flex items-center gap-1.5">
+                          <span
+                            className="text-[10px] text-destructive max-w-[140px] truncate"
+                            title={job.errorMessage || 'Generation failed'}
+                          >
+                            {job.errorMessage || 'Generation failed'}
+                          </span>
+                          <button
+                            className="btn-outline text-xs px-2.5 py-1.5"
+                            onClick={() => void generation?.retryGeneration(job.id)}
+                          >
+                            <RefreshCw className="w-3 h-3" /> Retry
+                          </button>
+                        </div>
+                      );
+                    }
+                    if (c.chapterId) {
+                      return (
+                        <div className="flex items-center gap-1.5">
+                          <button className="btn-outline text-xs px-3 py-1.5" onClick={()=>router.push(`/novels/${novel.id}/write/${c.chapterNumber}`)}>
+                            <Play className="w-3 h-3"/> Open
+                          </button>
+                          <button
+                            className="btn-outline text-xs px-2.5 py-1.5"
+                            title="Regenerate this chapter"
+                            onClick={()=>router.push(`/novels/${novel.id}/write/${c.chapterNumber}?generate=1`)}
+                          >
+                            <RefreshCw className="w-3 h-3" />
+                          </button>
+                        </div>
+                      );
+                    }
+                    return (
+                      <button className="btn-primary text-xs px-3 py-1.5" disabled={c.status === 'locked'} onClick={()=>router.push(`/novels/${novel.id}/write/${c.chapterNumber}?generate=1`)}>
+                        Generate <ArrowRight className="w-3 h-3"/>
+                      </button>
+                    );
+                  })()}
                 </>
               )}
             </div>

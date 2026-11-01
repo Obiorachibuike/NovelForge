@@ -21,6 +21,8 @@ export interface ChapterLike {
   wordCount?: number | null;
   pageCountEst?: number | null;
   generationSource?: string | null;
+  /** Background generation lifecycle (NOT_STARTED/QUEUED/PROCESSING/COMPLETED/FAILED/CANCELLED). */
+  generationStatus?: string | null;
 }
 
 export type ChapterNavStatus = 'locked' | 'next' | 'planned' | 'draft' | 'generated' | 'edited' | 'approved';
@@ -36,6 +38,11 @@ export interface ChapterNav {
   wordCount: number;
   pageCountEst: number;
   generationSource: string | null;
+  /**
+   * Background generation status for this chapter, derived from the persisted
+   * chapter row. `NOT_STARTED` is used when no generation has ever run.
+   */
+  generationStatus: string;
 }
 
 export function computeNavigation(outlines: OutlineLike[], chapters: ChapterLike[]): ChapterNav[] {
@@ -65,8 +72,21 @@ export function computeNavigation(outlines: OutlineLike[], chapters: ChapterLike
       wordCount: chapter?.wordCount ?? 0,
       pageCountEst: chapter?.pageCountEst ?? 0,
       generationSource: chapter?.generationSource ?? null,
+      generationStatus: resolveGenerationStatus(chapter),
     };
   });
+}
+
+/**
+ * Existing rows written before background generation existed have the column
+ * default; a chapter that already contains generated prose is completed even
+ * if the new status was never stamped.
+ */
+function resolveGenerationStatus(chapter?: ChapterLike | null): string {
+  if (!chapter) return 'NOT_STARTED';
+  const stored = chapter.generationStatus;
+  if (stored) return stored;
+  return ['generated', 'edited', 'approved'].includes(chapter.status) ? 'COMPLETED' : 'NOT_STARTED';
 }
 
 function normalizeStatus(status: string): ChapterNavStatus {

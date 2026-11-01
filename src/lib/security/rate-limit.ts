@@ -28,6 +28,8 @@ const HOUR = 60 * 60 * 1000;
 export const RATE_LIMITS = {
   /** Paid AI text/structured generations (chapter, outline, premise, consistency). */
   aiGeneration: { limit: envInt('RATE_LIMIT_AI_PER_HOUR', 60), windowMs: HOUR },
+  /** Cheap background-generation controls (status polling is not counted). */
+  generationControl: { limit: envInt('RATE_LIMIT_GENERATION_CONTROL_PER_HOUR', 600), windowMs: HOUR },
   /** Interactive editor actions from the writing workspace. */
   aiEditor: { limit: envInt('RATE_LIMIT_EDITOR_PER_HOUR', 240), windowMs: HOUR },
   /** Image generation (the most expensive single request). */

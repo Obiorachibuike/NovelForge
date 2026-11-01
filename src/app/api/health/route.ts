@@ -2,6 +2,7 @@ import { getDb, databaseStatus, isPostgresUrl } from '@/lib/db';
 import { validateEnvConfig } from '@/lib/config/env';
 import { classifyDatabaseError, databaseTarget, describeDatabaseFailure } from '@/lib/db/errors';
 import { redactSecrets } from '@/lib/api/http';
+import { queueInfo } from '@/lib/queue';
 
 export const dynamic = 'force-dynamic';
 
@@ -55,7 +56,13 @@ export async function GET() {
         },
         queue: {
           status: migrations.pending.length === 0 ? 'healthy' : 'degraded',
+          transport: queueInfo().driver,
+          pgBoss: queueInfo().pgBoss,
+          queue: queueInfo().queue,
           counts: queueCounts,
+          // Jobs currently waiting or running in the shared database. The
+          // dedicated worker is a separate process; its work shows up here.
+          activeJobs: (queueCounts.queued || 0) + (queueCounts.processing || 0),
         },
         ai: {
           // The backend that will serve the next generation request. Reported

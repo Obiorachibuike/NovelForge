@@ -72,8 +72,24 @@ export default async function SettingsPage() {
         <div className="space-y-2 text-sm">
           <Row label="AI mode" value={aiStatus}/>
           <Row label="Storage" value={`${storage.provider}${storage.persistent ? ' · persistent' : ' · not persistent'}`}/>
-          <Row label="Queue" value={queue.driver === 'redis' ? 'Redis (BullMQ) + database' : 'In-process + database'}/>
-          <Row label="Database" value={'driver' in db && db.driver === 'error' ? 'Configuration error' : 'SQLite (single instance)'}/>
+          <Row
+            label="Queue"
+            value={
+              queue.driver === 'pgboss'
+                ? 'pg-boss on PostgreSQL + dedicated worker'
+                : 'Database queue + worker (SQLite dev/test)'
+            }
+          />
+          <Row
+            label="Database"
+            value={
+              'driver' in db && db.driver === 'error'
+                ? 'Configuration error'
+                : (db as any).driver === 'postgres'
+                  ? 'PostgreSQL'
+                  : 'SQLite (single instance)'
+            }
+          />
           <Row label="Billing" value={!stripeConfigured()
             ? 'Not configured — admins and comped accounts only'
             : billingCatalogReady()

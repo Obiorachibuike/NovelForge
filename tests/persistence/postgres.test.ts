@@ -187,11 +187,31 @@ describe('PostgreSQL database layer & SQLite-to-PostgreSQL migration', () => {
       coverimageid: 'img1',
       publicid: 'novelforge/covers/u1/n1/cover_img1',
       secureurl: 'https://res.cloudinary.com/demo/image/upload/cover.png',
+      generationstatus: 'PROCESSING',
+      currentstage: 'GENERATING_CHAPTER_CONTENT',
+      progresspercentage: null,
+      cancelrequestedat: '2026-01-01T00:00:00.000Z',
+      lastheartbeatat: '2026-01-01T00:00:01.000Z',
+      queuejobid: 'queue-1',
+      generationjobid: 'job-1',
+      isread: 0,
+      dedupekey: 'job-1:completed:1:2026-01-01T00:00:00.000Z',
+      seq: 7,
     })!;
     expect(normalized.userId).toBe('u1');
     expect(normalized.coverImageId).toBe('img1');
     expect(normalized.publicId).toBe('novelforge/covers/u1/n1/cover_img1');
     expect(normalized.secureUrl).toBe('https://res.cloudinary.com/demo/image/upload/cover.png');
+    expect(normalized.generationStatus).toBe('PROCESSING');
+    expect(normalized.currentStage).toBe('GENERATING_CHAPTER_CONTENT');
+    expect(normalized.progressPercentage).toBeNull();
+    expect(normalized.cancelRequestedAt).toBe('2026-01-01T00:00:00.000Z');
+    expect(normalized.lastHeartbeatAt).toBe('2026-01-01T00:00:01.000Z');
+    expect(normalized.queueJobId).toBe('queue-1');
+    expect(normalized.generationJobId).toBe('job-1');
+    expect(normalized.isRead).toBe(0);
+    expect(normalized.dedupeKey).toBe('job-1:completed:1:2026-01-01T00:00:00.000Z');
+    expect(normalized.seq).toBe(7);
   });
 
   it('runs PostgreSQL migrations idempotently, supports transactions, and persists novels and chapters', async () => {
@@ -209,7 +229,7 @@ describe('PostgreSQL database layer & SQLite-to-PostgreSQL migration', () => {
     const health = await checkPostgresHealth(backend.asyncPool);
     expect(health.connected).toBe(true);
     // Updated by the hosted-inference migrations (0008 model registry, 0009 provenance, 0012 agnes purge).
-    expect(health.latestMigrationVersion).toBe('0012_agnes_primary_purge_hf');
+    expect(health.latestMigrationVersion).toBe('0013_background_generation');
     expect(health.pendingMigrations).toBe(0);
 
     // Verify withPgTransaction commits on success and rolls back on error
