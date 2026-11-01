@@ -671,13 +671,14 @@ export function cancelJob(id: string): boolean {
   ).run(now, now, now, id);
   if (res.changes === 0) return false;
 
-  if (job.taskType === 'chapter') {
-    updateChapterGenerationStatus(job.chapterId, 'CANCELLED');
-    emitLifecycle(job, GenerationEventType.CANCELLED, {
-      notify: true,
-      message: 'Generation cancelled. Existing chapter content was preserved.',
-    });
-  }
+  if (job.taskType === 'chapter') updateChapterGenerationStatus(job.chapterId, 'CANCELLED');
+  emitLifecycle(job, GenerationEventType.CANCELLED, {
+    notify: true,
+    message: job.taskType === 'chapter'
+      ? 'Generation cancelled. Existing chapter content was preserved.'
+      : 'Background AI generation was cancelled.',
+    data: { taskType: job.taskType },
+  });
   return true;
 }
 
@@ -707,19 +708,17 @@ export async function retryJob(id: string, options: { priority?: number } = {}):
 
   const res = db.prepare(
     `UPDATE generation_jobs
-        SET status='queued', attempts=0, error=NULL, errorCode=NULL, retryable=1,
+        SET status='queued', attempts=0, error=NULL, errorCode=NULL, retryable=1, result=NULL,
             scheduledAt=?, completedAt=NULL, claimedAt=NULL, claimedBy=NULL, progress=0,
             progressPercentage=NULL, currentStage=NULL, cancelRequestedAt=NULL, updatedAt=?
       WHERE id=? AND status IN ('failed','cancelled')`,
   ).run(now, now, id);
   if (res.changes === 0) return false;
 
-  if (job.taskType === 'chapter') {
-    updateChapterGenerationStatus(job.chapterId, 'QUEUED');
-    emitLifecycle({ ...job, attempts: 0 }, GenerationEventType.QUEUED, {
-      data: { manualRetry: true },
-    });
-  }
+  if (job.taskType === 'chapter') updateChapterGenerationStatus(job.chapterId, 'QUEUED');
+  emitLifecycle({ ...job, attempts: 0 }, GenerationEventType.QUEUED, {
+    data: { manualRetry: true, taskType: job.taskType },
+  });
   await dispatch(id, { priority: options.priority ?? job.priority ?? 0 });
   return true;
 }
