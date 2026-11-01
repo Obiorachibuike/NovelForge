@@ -100,6 +100,7 @@ export function useGenerationStream(
         'generation_queued',
         'generation_started',
         'generation_progress',
+        'generation_content',
         'generation_completed',
         'generation_failed',
         'generation_cancelled',
@@ -107,7 +108,17 @@ export function useGenerationStream(
       for (const type of types) {
         source.addEventListener(type, event => {
           try {
-            apply(JSON.parse((event as MessageEvent).data));
+            const parsed = JSON.parse((event as MessageEvent).data);
+            if (type === 'generation_content') {
+              setGeneration(current => {
+                const base = current?.partialText ?? '';
+                const next = { ...(current ?? { id: jobId, status: 'PROCESSING' as const }), ...parsed,
+                  id: jobId,
+                  partialText: typeof parsed.partialText === 'string' ? parsed.partialText : base + (parsed.chunk ?? '') };
+                callbacks.current.onUpdate?.(next as GenerationView);
+                return next as GenerationView;
+              });
+            } else apply(parsed);
           } catch {
             /* ignore malformed frame */
           }
