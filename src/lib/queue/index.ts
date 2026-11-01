@@ -590,14 +590,12 @@ export async function recoverStaleJobs({ limit = 20, staleMs }: { limit?: number
               currentStage=NULL, progressPercentage=NULL
         WHERE id=? AND status='processing'`,
     ).run(nowIso(), nowIso(), job.id);
-    if (job.taskType === 'chapter') {
-      updateChapterGenerationStatus(job.chapterId, 'QUEUED');
-      emitLifecycle(job as JobRecord, GenerationEventType.QUEUED, {
-        message: 'Worker restart detected — generation re-queued.',
-        data: { recovered: true },
-      });
-      await dispatch(job.id);
-    }
+    if (job.taskType === 'chapter') updateChapterGenerationStatus(job.chapterId, 'QUEUED');
+    emitLifecycle(job as JobRecord, GenerationEventType.QUEUED, {
+      message: 'Worker restart detected — generation re-queued.',
+      data: { recovered: true, taskType: job.taskType },
+    });
+    await dispatch(job.id);
   }
 
   const due = db.prepare(
