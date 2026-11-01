@@ -135,7 +135,7 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
         jobId: input.jobId,
         taskType: input.taskType,
         signal: input.signal,
-        onText: input.onText,
+        ...(input.onText ? { onText: input.onText } : {}),
       });
       return {
         text: result.text,
