@@ -246,7 +246,7 @@ the hosted-inference configuration (`HF_TOKEN`, verification, worker, timeouts).
 
 The production runtime is **two processes**: the Next.js app (APIs + UI) and
 `npm run worker` (pg-boss consumer + recovery sweep). Both must point at the same
-PostgreSQL `DATABASE_URL`. Chapter generation is never run inside an HTTP
+PostgreSQL `DATABASE_URL`. Background AI generation is never run inside an HTTP
 request, so it survives navigation, browser closure and app redeploys.
 
 - Do **not** host the worker on a serverless function: it is a persistent Node.js
