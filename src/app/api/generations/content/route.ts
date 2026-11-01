@@ -23,7 +23,7 @@ const generationTypes = [
 
 const schema = z.object({
   novelId: z.string().min(1).max(64),
-  chapterId: z.string().max(64).optional(),
+  chapterId: z.string().min(1).max(64).optional(),
   generationType: z.enum(generationTypes),
   prompt: z.string().trim().min(1).max(30_000),
   systemPrompt: z.string().max(12_000).optional(),
@@ -56,12 +56,14 @@ export const POST = apiHandler(async (req: Request) => {
 
   const db = getDb();
   const activeUser = db.prepare("SELECT COUNT(*) AS total FROM generation_jobs WHERE userId=? AND status IN ('queued','processing')").get(user.id) as { total: number };
-  const maxPerUser = Math.max(1, Number(process.env.GENERATION_MAX_ACTIVE_PER_USER || 3));
+  const configuredUserLimit = Number(process.env.GENERATION_MAX_ACTIVE_PER_USER || 3);
+  const maxPerUser = Number.isFinite(configuredUserLimit) && configuredUserLimit > 0 ? Math.floor(configuredUserLimit) : 3;
   if (Number(activeUser.total) >= maxPerUser) {
     throw new HttpError(429, `You already have ${maxPerUser} active AI generations. Wait for one to finish or cancel it before starting another.`, 'generation_concurrency_limit');
   }
   const activeNovel = db.prepare("SELECT COUNT(*) AS total FROM generation_jobs WHERE userId=? AND novelId=? AND taskType!='chapter' AND status IN ('queued','processing')").get(user.id, body.novelId) as { total: number };
-  const maxPerNovel = Math.max(1, Number(process.env.GENERATION_MAX_ACTIVE_CONTENT_PER_NOVEL || 3));
+  const configuredNovelLimit = Number(process.env.GENERATION_MAX_ACTIVE_CONTENT_PER_NOVEL || 3);
+  const maxPerNovel = Number.isFinite(configuredNovelLimit) && configuredNovelLimit > 0 ? Math.floor(configuredNovelLimit) : 3;
   if (Number(activeNovel.total) >= maxPerNovel) {
     throw new HttpError(429, `This novel already has ${maxPerNovel} active AI content jobs.`, 'novel_generation_concurrency_limit');
   }
