@@ -423,8 +423,8 @@ export default function WritingWorkspace({
   const chapterGeneration = (generation?.generations || [])
     .filter(
       (g: any) =>
-        (chapter?.id && g.chapterId === chapter.id) ||
-        (!chapter?.id && g.chapterNumber === chapterNum),
+        g.taskType === 'chapter' && ((chapter?.id && g.chapterId === chapter.id) ||
+        (!chapter?.id && g.chapterNumber === chapterNum)),
     )
     .sort((a: any, b: any) => {
       const aActive = a.status === 'QUEUED' || a.status === 'PROCESSING' ? 0 : 1;
@@ -754,6 +754,16 @@ export default function WritingWorkspace({
               </div>
             ) : (
               <div className="prose-editor">
+                {isWritingJob && chapterGeneration?.partialText && (
+                  <div className="mb-4 rounded-xl border border-primary/30 bg-primary/5 p-4" aria-live="polite">
+                    <div className="mb-2 flex items-center gap-2 text-xs font-semibold text-primary">
+                      <Sparkles className="h-3.5 w-3.5" /> LIVE AI DRAFT · {chapterGeneration.currentStageLabel || 'Generating'}
+                    </div>
+                    <div className="max-h-72 overflow-y-auto whitespace-pre-wrap text-sm leading-7 text-foreground/90">
+                      {chapterGeneration.partialText}
+                    </div>
+                  </div>
+                )}
                 <EditorContent editor={editor} />
               </div>
             )}
