@@ -48,7 +48,7 @@ export interface ListGenerationOptions {
 /** The caller's own generation history / active jobs. Never cross-user. */
 export function listGenerations(userId: string, options: ListGenerationOptions = {}): GenerationWithContext[] {
   const db = getDb();
-  const clauses = ['j.userId = ?', `j.taskType = 'chapter'`];
+  const clauses = ['j.userId = ?'];
   const args: unknown[] = [userId];
   if (options.active) {
     clauses.push(`j.status IN ('queued','processing')`);
@@ -101,6 +101,7 @@ export function serializeGeneration(job: GenerationWithContext) {
     chapterTitle: job.chapterTitle ?? null,
     chapterNumber: job.chapterNumber ?? null,
     taskType: job.taskType,
+    generationType: (() => { try { const p = job.payload ? JSON.parse(job.payload) : {}; return p.generationType ?? job.taskType; } catch { return job.taskType; } })(),
     status,
     /**
      * Chapter generation is stage-based: providers do not expose real
@@ -108,7 +109,7 @@ export function serializeGeneration(job: GenerationWithContext) {
      * indeterminate indicator rather than a fabricated number.
      */
     progressPercentage: job.progressPercentage ?? null,
-    indeterminate: isChapterJob && !['COMPLETED', 'FAILED', 'CANCELLED'].includes(status),
+    indeterminate: !['COMPLETED', 'FAILED', 'CANCELLED'].includes(status) && job.progressPercentage == null,
     currentStage: job.currentStage ?? null,
     currentStageLabel: stageLabel(job.currentStage),
     errorMessage: job.error ? String(job.error) : null,
