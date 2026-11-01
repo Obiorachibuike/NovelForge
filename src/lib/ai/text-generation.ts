@@ -189,7 +189,7 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
         jobId: input.jobId,
         taskType: input.taskType,
         signal: input.signal,
-        onText: input.onText,
+        ...(input.onText ? { onText: input.onText } : {}),
         allowFallback: input.allowModelFallback !== false,
         deduplicate: true,
       });
@@ -372,7 +372,7 @@ export async function generateStructuredDetailed<T>(
         jobId: input.jobId,
         taskType: input.taskType,
         signal: input.signal,
-        onText: input.onText,
+        ...(input.onText ? { onText: input.onText } : {}),
       });
       return {
         data,
@@ -417,7 +417,7 @@ export async function generateStructuredDetailed<T>(
         jobId: input.jobId,
         taskType: input.taskType,
         signal: input.signal,
-        onText: input.onText,
+        ...(input.onText ? { onText: input.onText } : {}),
         allowFallback: input.allowModelFallback !== false,
       });
       return {
