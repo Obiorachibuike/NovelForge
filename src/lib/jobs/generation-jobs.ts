@@ -90,9 +90,15 @@ export function latestGenerationsForNovel(userId: string, novelId: string): Gene
     .all(userId, novelId) as GenerationWithContext[];
 }
 
-export function serializeGeneration(job: GenerationWithContext) {
+export function serializeGeneration(job: GenerationWithContext, options: { includeContent?: boolean } = {}) {
   const status = toPublicStatus(job.status);
-  const isChapterJob = job.taskType === 'chapter';
+  const readPartialText = () => {
+    if (!job.result) return null;
+    try {
+      const parsed = JSON.parse(job.result);
+      return typeof parsed?.partialText === 'string' ? parsed.partialText : null;
+    } catch { return null; }
+  };
   return {
     id: job.id,
     novelId: job.novelId,
@@ -126,17 +132,8 @@ export function serializeGeneration(job: GenerationWithContext) {
     completedAt: job.completedAt ?? null,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
-    partialText: (() => {
-      // Keep whatever prose the provider produced, including after a failure
-      // or a cancellation, so the author never loses usable text.
-      if (!job.result) return null;
-      try {
-        const parsed = JSON.parse(job.result);
-        return typeof parsed?.partialText === 'string' ? parsed.partialText.slice(-6000) : null;
-      } catch {
-        return null;
-      }
-    })(),
+    partialText: readPartialText()?.slice(-6000) ?? null,
+    ...(options.includeContent ? { generatedContent: readPartialText() } : {}),
     requestedModel: job.requestedModel ?? null,
     actualModel: job.actualModel ?? null,
     provider: job.provider ?? null,
