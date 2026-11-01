@@ -465,7 +465,7 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
         safePublishGenerationEvent({
           jobId: job.id, userId: job.userId, novelId: job.novelId, chapterId: job.chapterId ?? null,
           type: GenerationEventType.CONTENT, status: 'PROCESSING',
-          data: { chunk, partialText: safeText, taskType: job.taskType },
+          data: { chunk, partialText: safeText.slice(-6000), taskType: job.taskType },
         });
       },
     });
