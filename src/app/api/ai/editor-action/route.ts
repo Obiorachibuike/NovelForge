@@ -1,4 +1,5 @@
 import { requireUser, requireChapter } from '@/lib/db/ownership';
+import { getDb } from '@/lib/db';
 import { editorActionPrompt } from '@/lib/ai/prompts';
 import { editorActionSchema } from '@/types';
 import { apiHandler, readJsonBody, HttpError } from '@/lib/api/http';
@@ -20,6 +21,12 @@ export const POST = apiHandler(async (req: Request) => {
   const body = await readJsonBody(req, value => editorActionSchema.parse(value));
   enforceRateLimit('aiEditor', user.id);
   enforceAiRateLimit('text', user.id);
+  const db = getDb();
+  const active = db.prepare("SELECT COUNT(*) AS total FROM generation_jobs WHERE userId=? AND status IN ('queued','processing')").get(user.id) as { total: number };
+  const maxActive = Math.max(1, Number(process.env.GENERATION_MAX_ACTIVE_PER_USER || 3));
+  if (Number(active.total) >= maxActive) {
+    throw new HttpError(429, `You already have ${maxActive} active AI generations. Wait for one to finish or cancel it before starting another.`, 'generation_concurrency_limit');
+  }
 
   const chapter = await requireChapter(body.chapterId, user.id);
   if (chapter.status === 'approved' && body.action === 'rewrite') {
