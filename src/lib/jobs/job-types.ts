@@ -101,6 +101,7 @@ export const GenerationEventType = {
   QUEUED: 'generation_queued',
   STARTED: 'generation_started',
   PROGRESS: 'generation_progress',
+  CONTENT: 'generation_content',
   COMPLETED: 'generation_completed',
   FAILED: 'generation_failed',
   CANCELLED: 'generation_cancelled',
