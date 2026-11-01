@@ -68,6 +68,7 @@ export async function runOutline({ id, novelId, userId, payload, onContent }: an
   const fallback = buildDemoOutline(ctx.novel);
   const prompt = outlinePrompt(ctx as any, structureType);
   let streamedText = '';
+  let lastPublishedText = '';
   let lastPublishedAt = 0;
   const { data: result, meta } = await generateStructuredDetailed(outlineShape, {
     messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: prompt.user }],
@@ -81,6 +82,7 @@ export async function runOutline({ id, novelId, userId, payload, onContent }: an
       streamedText = text;
       if (chunk && Date.now() - lastPublishedAt >= 150) {
         onContent?.(chunk, streamedText);
+        lastPublishedText = streamedText;
         lastPublishedAt = Date.now();
       }
     },
@@ -125,7 +127,10 @@ export async function runOutline({ id, novelId, userId, payload, onContent }: an
   });
   tx();
 
-  if (streamedText) onContent?.('', streamedText);
+  if (streamedText !== lastPublishedText) {
+    const finalChunk = streamedText.startsWith(lastPublishedText) ? streamedText.slice(lastPublishedText.length) : streamedText;
+    if (finalChunk) onContent?.(finalChunk, streamedText);
+  }
   return { chapters: result.chapters.length, acts: result.acts.length, source: meta.source, partialText: streamedText };
 }
 
