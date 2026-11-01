@@ -72,6 +72,9 @@ export async function runUniversalTextGeneration(job: JobHandlerContext) {
   if (job.signal.aborted || job.isCancelled()) {
     throw Object.assign(new Error('Generation was cancelled.'), { retryable: false, code: 'cancelled' });
   }
+  if (result.meta.source === 'demo' || result.meta.source === 'fallback') {
+    throw new Error('No usable AI provider is configured for this generation. Configure Agnes AI, Hugging Face, or OpenAI and retry.');
+  }
   if (!result.text.trim()) throw new Error('The AI provider returned an empty response.');
   if (result.text !== lastPublishedText) {
     const finalChunk = result.text.startsWith(lastPublishedText)
