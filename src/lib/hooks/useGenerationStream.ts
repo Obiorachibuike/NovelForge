@@ -18,6 +18,11 @@ export interface GenerationView {
   chapterId?: string | null;
   chapterTitle?: string | null;
   chapterNumber?: number | null;
+  taskType?: string;
+  generationType?: string;
+  title?: string | null;
+  targetType?: string | null;
+  targetId?: string | null;
   status: 'NOT_STARTED' | 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
   progressPercentage?: number | null;
   indeterminate?: boolean;
