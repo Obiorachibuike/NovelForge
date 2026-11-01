@@ -74,6 +74,7 @@ export function useGenerationStream(
     const apply = (data: any) => {
       if (!data || closed) return;
       const next: GenerationView = {
+        ...(generationRef.current ?? {}),
         ...(data as GenerationView),
         id: jobId,
       };
