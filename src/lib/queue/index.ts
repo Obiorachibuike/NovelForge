@@ -296,28 +296,24 @@ async function dispatch(id: string, options: { delayMs?: number; priority?: numb
   const row = (await getJob(id)) as JobRecord | undefined;
   if (!row) return;
 
-  if (row.taskType === 'chapter') {
-    // Chapter generation NEVER runs inside the Next.js process: not in a
-    // request, not in a setImmediate, and not on a serverless host. The
-    // dedicated worker owns it in every environment. SQLite development has no
-    // pg-boss, so the worker's database sweep picks the row up.
-    if (queueTransport() === 'pgboss') {
-      try {
-        const queueJobId = await sendChapterGeneration(id, {
-          priority: options.priority ?? row.priority ?? 0,
-          delayMs: options.delayMs,
-        });
-        if (queueJobId) {
-          getDb().prepare('UPDATE generation_jobs SET queueJobId=?, updatedAt=? WHERE id=?')
-            .run(queueJobId, nowIso(), id);
-        }
-      } catch (err) {
-        // Durable row remains queued; the worker's database sweep will run it.
-        console.error('[queue] pg-boss send failed; job remains queued in PostgreSQL:', err);
+  // Every task type uses the same PostgreSQL/pg-boss queue in production.
+  // The durable generation_jobs row remains the source of truth; the worker's
+  // database sweep is the recovery path if pg-boss is temporarily unavailable.
+  if (queueTransport() === 'pgboss') {
+    try {
+      const queueJobId = await sendChapterGeneration(id, {
+        priority: options.priority ?? row.priority ?? 0,
+        delayMs: options.delayMs,
+      });
+      if (queueJobId) {
+        getDb().prepare('UPDATE generation_jobs SET queueJobId=?, updatedAt=? WHERE id=?')
+          .run(queueJobId, nowIso(), id);
       }
+    } catch (err) {
+      console.error('[queue] pg-boss send failed; job remains queued in PostgreSQL:', err);
     }
-    return;
   }
+  if (row.taskType === 'chapter') return;
 
   if (mayRunInProcess()) {
     if (options.delayMs && options.delayMs > 0) {
