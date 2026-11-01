@@ -167,7 +167,7 @@ export async function generateStructuredHuggingFace<T>(input: HfStructuredInput<
           temperature: input.temperature ?? 0.4,
           responseFormat: 'json_object',
           signal: input.signal,
-          onText: input.onText,
+          ...(input.onText ? { onText: input.onText } : {}),
         });
         raw = completion.text;
         provider = completion.provider;
