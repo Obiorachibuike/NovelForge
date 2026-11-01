@@ -522,7 +522,7 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
       emitLifecycle(job, GenerationEventType.COMPLETED, {
         stage: GenerationStage.COMPLETED,
         notify: true,
-        data: { taskType: job.taskType, result },
+        data: { taskType: job.taskType },
       });
     }
     return { id, status: targetStatus };
