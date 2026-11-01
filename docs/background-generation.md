@@ -12,7 +12,7 @@ PostgreSQL  ── generation_jobs (source of truth)
   │            generation_events (SSE replay)
   │            notifications
   │
-  ├── pg-boss queue: novelforge.chapter-generation
+  ├── pg-boss shared generation queue: novelforge.chapter-generation (legacy name)
   │        │
   │        ▼
   │   NODE.JS WORKER (process B, npm run worker)
@@ -184,6 +184,6 @@ npm run worker:dev
 
 Any feature can submit a text task to `POST /api/generations/content` with an authenticated user's `novelId`, a registered `generationType`, prompt, optional provider model and optional target metadata. The endpoint validates novel ownership and returns `202` immediately. It enqueues the shared `ai-content` handler; the dedicated worker calls the existing provider-agnostic `generateTextDetailed` layer, including Agnes AI and Hugging Face streaming support. It does not introduce a second provider stack.
 
-The worker's `onContent` callback persists the accumulated partial text in the durable job result and publishes `generation_content` events containing both the new `chunk` and current `partialText`. The global generation provider subscribes to every active job, restores active jobs after refresh, and the activity dock displays a live excerpt while the author is elsewhere in the app. Chapter generation uses the same event contract through its existing provider callback. Structured JSON tasks that cannot safely expose partial JSON should continue to publish stage/progress events and reveal validated output when complete.
+The worker's `onContent` callback persists the accumulated partial text in the durable job result and publishes `generation_content` events containing both the new `chunk` and current `partialText`. The global generation provider subscribes to every active job, restores active jobs after refresh, and the activity dock displays a live excerpt while the author is elsewhere in the app. Chapter generation uses the same event contract through its existing provider callback. Premise and outline jobs stream their raw JSON response into the activity preview while their structured database records are written only after schema validation succeeds. Other structured tasks may choose stage-only progress when exposing partial JSON would be misleading.
 
 Supported generation types include novel titles/descriptions/summaries, story ideas/outlines, chapter outlines, pages/scenes, character profiles/backstories/relationships, worldbuilding/locations/cultures/history, blurbs, author bios, marketing copy, rewriting, expansion, summarization, shortening, proofreading and humanization. Add new types through the API allowlist and call the same endpoint; do not create another queue or worker.
