@@ -195,11 +195,13 @@ export function notifyGenerationEvent(
       title = `Generation failed for ${chapterLabel}`;
       message = extra.error
         ? `AI generation failed: ${extra.error}`
-        : 'AI generation failed. You can retry from the chapter list.';
+        : 'AI generation failed. You can retry from the generation activity panel.';
       break;
     default:
       title = `Generation cancelled for ${chapterLabel}`;
-      message = 'The background generation was cancelled. Existing chapter content was preserved.';
+      message = job.taskType === 'chapter'
+        ? 'The background generation was cancelled. Existing chapter content was preserved.'
+        : 'The background AI generation was cancelled.';
       break;
   }
   if (kind === NotificationKind.STARTED && extra.stage) {
