@@ -224,6 +224,7 @@ export async function generateStructuredAgnes<T>(input: AgnesStructuredInput<T>)
           maxNewTokens: maxTokens,
           responseFormat: 'json_object',
           signal: input.signal,
+          onText: input.onText,
         });
         raw = completion.text;
         usage = completion.usage;
@@ -237,6 +238,7 @@ export async function generateStructuredAgnes<T>(input: AgnesStructuredInput<T>)
           temperature: input.temperature ?? 0.4,
           maxNewTokens: maxTokens,
           signal: input.signal,
+          onText: input.onText,
         });
         raw = completion.text;
         usage = completion.usage;
