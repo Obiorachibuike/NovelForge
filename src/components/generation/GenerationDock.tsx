@@ -318,7 +318,7 @@ function JobRow({
         <>
           <div className="text-[11px] text-primary mt-2 flex items-center gap-1.5" role="status" aria-live="polite">
             <Loader2 className="w-3 h-3 animate-spin" aria-hidden="true" />
-            {job.currentStageLabel || 'Queued — waiting for the worker'}
+            {job.currentStageLabel || (job.status === 'QUEUED' ? 'Queued — waiting for the worker' : 'AI is generating content…')}
           </div>
           {/*
             Providers do not expose real generation progress, so this is an
