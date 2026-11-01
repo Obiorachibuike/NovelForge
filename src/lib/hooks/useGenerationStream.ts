@@ -67,6 +67,8 @@ export function useGenerationStream(
   useEffect(() => {
     if (!jobId) return;
     terminalFired.current = false;
+    generationRef.current = null;
+    setGeneration(null);
     let source: EventSource | null = null;
     let closed = false;
     let errors = 0;
