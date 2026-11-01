@@ -189,7 +189,7 @@ function envPositiveInt(name: string, fallback: number): number {
 
 interface ChapterJobPayload { chapterNumber: number; confirmOverwrite?: boolean; textModel?: string; allowFallback?: boolean }
 
-export async function runChapterGeneration({ id: jobId, novelId, userId, payload, setStage, isCancelled, signal }: any) {
+export async function runChapterGeneration({ id: jobId, novelId, userId, payload, setStage, isCancelled, signal, onContent }: any) {
   const db = getDb();
   const { chapterNumber, confirmOverwrite, textModel, allowFallback } = payload as ChapterJobPayload;
   setStage?.(GenerationStage.PREPARING_CHAPTER);
@@ -259,6 +259,7 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
   );
 
   let lastPreviewAt = 0;
+  let lastStreamedText = '';
   let announcedGeneration = false;
   const onText = (text: string) => {
     if (isCancelled?.()) throw new NonRetryableJobError('Generation was cancelled before completion.', 'cancelled');
@@ -268,8 +269,11 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
     }
     if (!jobId || (text && Date.now() - lastPreviewAt < 350)) return;
     lastPreviewAt = Date.now();
+    const chunk = text.startsWith(lastStreamedText) ? text.slice(lastStreamedText.length) : text;
+    lastStreamedText = text;
     db.prepare("UPDATE generation_jobs SET result=?, updatedAt=? WHERE id=? AND status='processing'")
       .run(JSON.stringify({ partialText: text }), new Date().toISOString(), jobId);
+    if (chunk) onContent?.(chunk, text);
   };
 
   // No silent fabrication: in demo mode the caller gets clearly-labelled demo
@@ -290,6 +294,17 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
     ...(textModel ? { model: textModel } : {}),
     allowModelFallback: allowFallback !== false,
   });
+  // Flush the last provider delta even when it arrived inside the throttle
+  // window; the final persisted preview must exactly match the saved chapter.
+  if (jobId && generated.text !== lastStreamedText) {
+    const finalChunk = generated.text.startsWith(lastStreamedText)
+      ? generated.text.slice(lastStreamedText.length)
+      : generated.text;
+    lastStreamedText = generated.text;
+    db.prepare("UPDATE generation_jobs SET result=?, updatedAt=? WHERE id=? AND status='processing'")
+      .run(JSON.stringify({ partialText: generated.text }), new Date().toISOString(), jobId);
+    if (finalChunk) onContent?.(finalChunk, generated.text);
+  }
   // A model-level fallback is a real generation by another eligible model, not
   // a stub: it is recorded in meta.actualModel and surfaced to the author.
   if (generated.meta.source === 'demo' || generated.meta.source === 'fallback') {
@@ -386,6 +401,7 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
     wordCount: words,
     source: generated.meta.source,
     demo: false,
+    partialText: generated.text,
   };
 }
 

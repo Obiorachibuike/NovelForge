@@ -90,7 +90,7 @@ export async function generateTextHuggingFace(input: HfTextInput): Promise<HfTex
       maxNewTokens: input.maxTokens ?? 2_048,
       temperature: input.temperature ?? 0.8,
       signal: input.signal,
-      onText: input.onText,
+      ...(input.onText ? { onText: input.onText } : {}),
     }),
     validate: value => {
       const check = validateTextOutput(value.text, { minChars: 1, rejectPromptEcho: true, prompt });
@@ -167,6 +167,7 @@ export async function generateStructuredHuggingFace<T>(input: HfStructuredInput<
           temperature: input.temperature ?? 0.4,
           responseFormat: 'json_object',
           signal: input.signal,
+          ...(input.onText ? { onText: input.onText } : {}),
         });
         raw = completion.text;
         provider = completion.provider;
@@ -182,6 +183,7 @@ export async function generateStructuredHuggingFace<T>(input: HfStructuredInput<
           maxNewTokens: input.maxTokens ?? 4_096,
           temperature: input.temperature ?? 0.4,
           signal: input.signal,
+          ...(input.onText ? { onText: input.onText } : {}),
         });
         raw = completion.text;
         provider = completion.provider;

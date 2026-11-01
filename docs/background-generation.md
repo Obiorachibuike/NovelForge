@@ -1,9 +1,6 @@
-# Background AI chapter generation
+# Universal background AI generation and streaming
 
-NovelForge generates chapters asynchronously. The request that starts a
-generation returns in milliseconds; the actual AI work happens in a dedicated
-Node.js worker, and the author can navigate anywhere in the application — or
-close the tab — while it runs.
+NovelForge runs AI content generation asynchronously. Chapter generation and universal text-generation jobs share the durable PostgreSQL job store, dedicated Node.js worker, event log and SSE transport. Text providers stream real output incrementally; each chunk is persisted and replayable. Authors can navigate anywhere in the application — or close the tab — while jobs continue.
 
 No Redis, Django, Celery, RabbitMQ or Procrastinate is involved.
 
@@ -15,7 +12,7 @@ PostgreSQL  ── generation_jobs (source of truth)
   │            generation_events (SSE replay)
   │            notifications
   │
-  ├── pg-boss queue: novelforge.chapter-generation
+  ├── pg-boss shared generation queue: novelforge.chapter-generation (legacy name)
   │        │
   │        ▼
   │   NODE.JS WORKER (process B, npm run worker)
@@ -182,3 +179,11 @@ npm run worker:dev
 - SSE connections are held on the web process; a serverless host with short
   function limits will cut them, so run the app on a persistent Node.js
   host for long streams.
+
+## Universal text generation
+
+Any feature can submit a text task to `POST /api/generations/content` with an authenticated user's `novelId`, a registered `generationType`, prompt, optional provider model and optional target metadata. The endpoint validates novel ownership and returns `202` immediately. It enqueues the shared `ai-content` handler; the dedicated worker calls the existing provider-agnostic `generateTextDetailed` layer, including Agnes AI and Hugging Face streaming support. It does not introduce a second provider stack.
+
+The worker's `onContent` callback persists accumulated partial text in the durable job result and publishes `generation_content` events with the new `chunk` and a bounded current-text preview. The global generation provider subscribes to every active job, restores jobs after refresh, and the activity dock displays live output while the author is elsewhere in the app. Chapter, premise, outline, selection-based editor actions, and humanization use this event contract. Premise and outline jobs stream raw JSON into the activity preview while their structured database records are written only after schema validation succeeds. Image generation remains an asynchronous job with progress/completion events rather than text chunks.
+
+Supported generation types include novel titles/descriptions/summaries, story ideas/outlines, chapter outlines, pages/scenes, character profiles/backstories/relationships, worldbuilding/locations/cultures/history, blurbs, author bios, marketing copy, rewriting, expansion, summarization, shortening, proofreading and humanization. Add new types through the API allowlist and call the same endpoint; do not create another queue or worker.

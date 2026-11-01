@@ -4,8 +4,8 @@ import { isPostgresUrl } from '@/lib/db/postgres';
 /**
  * Queue naming and transport selection.
  *
- * Background chapter generation is delivered by pg-boss (PostgreSQL) in
- * production. SQLite is used only for local development and the unit-test
+ * All background AI generation tasks are delivered by pg-boss (PostgreSQL) in
+ * production. The historical queue constant name is retained for compatibility. SQLite is used only for local development and the unit-test
  * harness, where pg-boss cannot run; there the durable `generation_jobs` table
  * itself is the queue and the worker poller drains it. The *durable state* is
  * always the database row — pg-boss is the wake-up/retry transport, never the
@@ -31,7 +31,7 @@ function envInt(name: string, fallback: number): number {
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
 }
 
-/** pg-boss delivery/retry configuration for the chapter queue. */
+/** pg-boss delivery/retry configuration for the shared generation queue. */
 export function chapterQueueOptions() {
   return {
     /** A generation worker may legitimately run for several minutes. */

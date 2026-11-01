@@ -1,24 +1,33 @@
-import { requireUser, requireChapter, jsonError } from '@/lib/db/ownership';
-import { generateTextDetailed } from '@/lib/ai/text-generation';
+import { requireUser, requireChapter } from '@/lib/db/ownership';
+import { getDb } from '@/lib/db';
 import { editorActionPrompt } from '@/lib/ai/prompts';
 import { editorActionSchema } from '@/types';
 import { apiHandler, readJsonBody, HttpError } from '@/lib/api/http';
 import { enforceRateLimit } from '@/lib/security/rate-limit';
 import { enforceAiRateLimit } from '@/lib/ai/rate-limit';
 import { assertRegisteredModelOrAgnes } from '@/lib/ai/model-selection';
+import { enqueue } from '@/lib/queue';
+import '@/services/generation/universal-text';
+
+export const dynamic = 'force-dynamic';
+export const runtime = 'nodejs';
 
 /**
- * Selection-based AI editing.
- *
- * The chapter is loaded through `requireChapter`, which joins `novels.userId`,
- * so a chapter id belonging to another account resolves to 404 before any
- * prompt, provider call or usage record happens.
+ * Selection-based editing now uses the same durable background queue and
+ * provider-backed incremental streaming as every other AI text task.
  */
 export const POST = apiHandler(async (req: Request) => {
   const user = await requireUser();
-  const body = await readJsonBody(req, v => editorActionSchema.parse(v));
+  const body = await readJsonBody(req, value => editorActionSchema.parse(value));
   enforceRateLimit('aiEditor', user.id);
   enforceAiRateLimit('text', user.id);
+  const db = getDb();
+  const active = db.prepare("SELECT COUNT(*) AS total FROM generation_jobs WHERE userId=? AND status IN ('queued','processing')").get(user.id) as { total: number };
+  const configuredLimit = Number(process.env.GENERATION_MAX_ACTIVE_PER_USER || 3);
+  const maxActive = Number.isFinite(configuredLimit) && configuredLimit > 0 ? Math.floor(configuredLimit) : 3;
+  if (Number(active.total) >= maxActive) {
+    throw new HttpError(429, `You already have ${maxActive} active AI generations. Wait for one to finish or cancel it before starting another.`, 'generation_concurrency_limit');
+  }
 
   const chapter = await requireChapter(body.chapterId, user.id);
   if (chapter.status === 'approved' && body.action === 'rewrite') {
@@ -33,23 +42,30 @@ export const POST = apiHandler(async (req: Request) => {
     title: chapter.title,
   });
 
-  const result = await generateTextDetailed({
-    messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: prompt.user }],
-    temperature: 0.7,
-    maxTokens: 1500,
+  const jobId = await enqueue({
+    type: 'ai-content',
     userId: user.id,
     novelId: chapter.novelId,
-    taskType: `editor:${body.action}`,
-    // Interactive editing must never substitute fabricated prose for a real
-    // failure — the author is told and can retry.
-    allowFallbackOnError: false,
-    ...(textModel !== 'auto' ? { model: textModel } : {}),
+    chapterId: chapter.id,
+    payload: {
+      generationType: `editor_${body.action}`,
+      title: `${body.action.replace(/[-_]/g, ' ')} selection`,
+      targetType: 'chapter',
+      targetId: chapter.id,
+      prompt: prompt.user,
+      systemPrompt: prompt.system,
+      maxTokens: 1500,
+      temperature: 0.7,
+      ...(textModel !== 'auto' ? { model: textModel } : {}),
+      allowModelFallback: true,
+    },
   });
 
   return Response.json({
-    text: result.text.trim(),
-    source: result.meta.source,
-    model: result.meta.actualModel ?? result.meta.model,
-    fallbackUsed: result.meta.modelFallbackUsed ?? false,
-  });
+    ok: true,
+    jobId,
+    status: 'QUEUED',
+    generationType: `editor_${body.action}`,
+    eventsUrl: `/api/generations/${jobId}/events`,
+  }, { status: 202, headers: { 'Cache-Control': 'no-store' } });
 });

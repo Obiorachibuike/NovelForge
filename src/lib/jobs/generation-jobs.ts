@@ -48,7 +48,7 @@ export interface ListGenerationOptions {
 /** The caller's own generation history / active jobs. Never cross-user. */
 export function listGenerations(userId: string, options: ListGenerationOptions = {}): GenerationWithContext[] {
   const db = getDb();
-  const clauses = ['j.userId = ?', `j.taskType = 'chapter'`];
+  const clauses = ['j.userId = ?'];
   const args: unknown[] = [userId];
   if (options.active) {
     clauses.push(`j.status IN ('queued','processing')`);
@@ -90,9 +90,15 @@ export function latestGenerationsForNovel(userId: string, novelId: string): Gene
     .all(userId, novelId) as GenerationWithContext[];
 }
 
-export function serializeGeneration(job: GenerationWithContext) {
+export function serializeGeneration(job: GenerationWithContext, options: { includeContent?: boolean } = {}) {
   const status = toPublicStatus(job.status);
-  const isChapterJob = job.taskType === 'chapter';
+  const readPartialText = () => {
+    if (!job.result) return null;
+    try {
+      const parsed = JSON.parse(job.result);
+      return typeof parsed?.partialText === 'string' ? parsed.partialText : null;
+    } catch { return null; }
+  };
   return {
     id: job.id,
     novelId: job.novelId,
@@ -101,6 +107,10 @@ export function serializeGeneration(job: GenerationWithContext) {
     chapterTitle: job.chapterTitle ?? null,
     chapterNumber: job.chapterNumber ?? null,
     taskType: job.taskType,
+    generationType: (() => { try { const p = job.payload ? JSON.parse(job.payload) : {}; return p.generationType ?? job.taskType; } catch { return job.taskType; } })(),
+    title: (() => { try { const p = job.payload ? JSON.parse(job.payload) : {}; return p.title ?? null; } catch { return null; } })(),
+    targetType: (() => { try { const p = job.payload ? JSON.parse(job.payload) : {}; return p.targetType ?? null; } catch { return null; } })(),
+    targetId: (() => { try { const p = job.payload ? JSON.parse(job.payload) : {}; return p.targetId ?? null; } catch { return null; } })(),
     status,
     /**
      * Chapter generation is stage-based: providers do not expose real
@@ -108,7 +118,7 @@ export function serializeGeneration(job: GenerationWithContext) {
      * indeterminate indicator rather than a fabricated number.
      */
     progressPercentage: job.progressPercentage ?? null,
-    indeterminate: isChapterJob && !['COMPLETED', 'FAILED', 'CANCELLED'].includes(status),
+    indeterminate: !['COMPLETED', 'FAILED', 'CANCELLED'].includes(status) && job.progressPercentage == null,
     currentStage: job.currentStage ?? null,
     currentStageLabel: stageLabel(job.currentStage),
     errorMessage: job.error ? String(job.error) : null,
@@ -122,17 +132,8 @@ export function serializeGeneration(job: GenerationWithContext) {
     completedAt: job.completedAt ?? null,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
-    partialText: (() => {
-      // Keep whatever prose the provider produced, including after a failure
-      // or a cancellation, so the author never loses usable text.
-      if (!job.result) return null;
-      try {
-        const parsed = JSON.parse(job.result);
-        return typeof parsed?.partialText === 'string' ? parsed.partialText.slice(-6000) : null;
-      } catch {
-        return null;
-      }
-    })(),
+    partialText: readPartialText()?.slice(-6000) ?? null,
+    ...(options.includeContent ? { generatedContent: readPartialText() } : {}),
     requestedModel: job.requestedModel ?? null,
     actualModel: job.actualModel ?? null,
     provider: job.provider ?? null,

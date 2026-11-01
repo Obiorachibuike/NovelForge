@@ -23,7 +23,7 @@ NovelForge is a production-quality AI-powered novel-writing and digital publishi
 - **Consistency engine** — heuristic + AI checks for timeline clashes, dead characters appearing, word-count targets, world-rule violations.
 - **Exports & Project Backups** — manuscript exports to DOCX, PDF, TXT, Markdown and EPUB (with unsaved local draft warnings), plus SHA-256 checksum-verified full novel JSON backup export (`GET /api/novels/[id]/backup`), transactional non-destructive restore (`POST /api/novels/[id]/backup` and `POST /api/novels/restore`), and online SQLite database backup (`backupSqliteDatabaseFile`).
 - **Health & Observability** — `GET /api/health` readiness endpoint, startup configuration validation (`src/lib/config/env.ts`), and secret-redacting structured logging (`src/lib/logger/index.ts`).
-- **Persistent background AI chapter generation** — `pg-boss` on PostgreSQL plus a dedicated Node.js worker (`npm run worker`), durable generation records and stages, recoverable Server-Sent Events, a global generation indicator that survives navigation/refresh, a notification centre, cancellation, retries and per-user concurrency limits. No Redis. See [`docs/background-generation.md`](docs/background-generation.md).
+- **Universal background AI generation** — `pg-boss` on PostgreSQL plus a dedicated Node.js worker (`npm run worker`), durable generation records and stages, actual incremental provider text streaming, replayable content events, a global generation indicator that survives navigation/refresh, a notification centre, cancellation, retries and per-user concurrency limits. Chapters and universal text tasks share the same PostgreSQL/pg-boss + Node.js worker infrastructure. No Redis. See [`docs/background-generation.md`](docs/background-generation.md).
 - **Cloudinary cover-image storage** — cover candidates are generated as temporary previews; when the author selects a cover, NovelForge validates the image binary/SVG content, uploads only the selected cover to Cloudinary under `novelforge/covers/<user-id>/<novel-id>/cover_<image-id>`, stores `secure_url` and `public_id` in PostgreSQL, cleans up orphaned assets on DB rollback, and deletes superseded covers on replacement. See [`docs/storage.md`](docs/storage.md).
 - **PostgreSQL primary database** — PostgreSQL via `pg` (`Pool`, `PoolClient`) with connection pooling, transactions (`BEGIN`/`COMMIT`/`ROLLBACK`), versioned migrations (`0001`–`0013`), and a non-destructive, idempotent SQLite-to-PostgreSQL migration tool (`npm run db:migrate:sqlite-to-pg`). Production requires `DATABASE_URL=postgresql://...` and never silently falls back to SQLite. See [`docs/postgresql.md`](docs/postgresql.md).
 
@@ -36,7 +36,7 @@ npm ci
 cp .env.example .env.local    # defaults to SQLite (file:./prisma/dev.db) — no database server needed
 npm run db:migrate
 npm run dev
-# in a second terminal — required for background chapter generation
+# in a second terminal — required for background AI generation
 npm run worker
 ```
 
@@ -108,9 +108,9 @@ DATABASE_URL="postgresql://user:password@localhost:5432/novelforge" \
   npm run db:migrate:sqlite-to-pg -- --sqlite ./prisma/dev.db
 ```
 
-Run the dedicated background worker (required for background chapter
+Run the dedicated background worker (required for all background AI
 generation; in SQLite development it drains the durable table, in PostgreSQL it
-consumes the pg-boss queue):
+consumes the shared pg-boss queue):
 
 ```bash
 npm run worker
@@ -199,7 +199,7 @@ src/
 | `npm run dev` | Next.js dev server (port 3000, binds 0.0.0.0) |
 | `npm run build` | Production build |
 | `npm run start` | Serve production build |
-| `npm run worker` | Run the dedicated background worker (pg-boss consumer + recovery sweep). Required for chapter generation outside SQLite dev/test. |
+| `npm run worker` | Run the dedicated background worker (pg-boss consumer + recovery sweep). Required for background AI generation outside SQLite dev/test. |
 | `npm run worker:dev` | Same worker under `tsx watch` for local development. |
 | `npm run lint` / `typecheck` | Lint & type check |
 | `npm test` | Run Vitest unit tests |
@@ -246,7 +246,7 @@ the hosted-inference configuration (`HF_TOKEN`, verification, worker, timeouts).
 
 The production runtime is **two processes**: the Next.js app (APIs + UI) and
 `npm run worker` (pg-boss consumer + recovery sweep). Both must point at the same
-PostgreSQL `DATABASE_URL`. Chapter generation is never run inside an HTTP
+PostgreSQL `DATABASE_URL`. Background AI generation is never run inside an HTTP
 request, so it survives navigation, browser closure and app redeploys.
 
 - Do **not** host the worker on a serverless function: it is a persistent Node.js

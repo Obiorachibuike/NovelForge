@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
+import { toast } from 'sonner';
 import {
   AlertTriangle,
   Ban,
@@ -34,6 +35,20 @@ function chapterHref(job: GenerationView): string | null {
   if (job.chapterId) return `/novels/${job.novelId}/write/${job.chapterId}`;
   if (job.chapterNumber) return `/novels/${job.novelId}/write/${job.chapterNumber}`;
   return `/novels/${job.novelId}`;
+}
+
+async function copyGeneratedContent(jobId: string) {
+  try {
+    const response = await fetch(`/api/generations/${jobId}`, { cache: 'no-store' });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Could not load generated content.');
+    const content = data.generation?.generatedContent || data.generation?.partialText;
+    if (!content) throw new Error('No generated text is available for this job.');
+    await navigator.clipboard.writeText(content);
+    toast.success('Generated content copied.');
+  } catch (error: any) {
+    toast.error(error?.message || 'Could not copy generated content.');
+  }
 }
 
 function isActive(job: GenerationView) {
@@ -73,7 +88,7 @@ export function GenerationDock() {
           )}
           aria-label={
             active
-              ? `${active} background chapter generation${active === 1 ? '' : 's'} in progress. Open the AI generation panel.`
+              ? `${active} background AI generation${active === 1 ? '' : 's'} in progress. Open the AI generation panel.`
               : 'Open the AI generation activity panel'
           }
         >
@@ -280,7 +295,7 @@ function JobRow({
 }) {
   const active = isActive(job);
   const href = chapterHref(job);
-  const title = job.chapterTitle || (job.chapterNumber ? `Chapter ${job.chapterNumber}` : 'Chapter');
+  const title = job.chapterTitle || job.title || (job.chapterNumber ? `Chapter ${job.chapterNumber}` : formatGenerationType(job.generationType || job.taskType || 'AI content'));
   return (
     <div
       className={cn(
@@ -293,7 +308,7 @@ function JobRow({
           <div className="text-xs font-medium truncate">{title}</div>
           <div className="text-[10px] text-muted-foreground truncate">
             {job.novelTitle || 'Novel'}
-            {job.chapterNumber ? ` · Chapter ${job.chapterNumber}` : ''}
+            {job.chapterNumber ? ` · Chapter ${job.chapterNumber}` : job.generationType ? ` · ${formatGenerationType(job.generationType)}` : ''}
           </div>
         </div>
         <GenerationStatusBadge status={job.status} />
@@ -303,7 +318,7 @@ function JobRow({
         <>
           <div className="text-[11px] text-primary mt-2 flex items-center gap-1.5" role="status" aria-live="polite">
             <Loader2 className="w-3 h-3 animate-spin" aria-hidden="true" />
-            {job.currentStageLabel || 'Queued — waiting for the worker'}
+            {job.currentStageLabel || (job.status === 'QUEUED' ? 'Queued — waiting for the worker' : 'AI is generating content…')}
           </div>
           {/*
             Providers do not expose real generation progress, so this is an
@@ -319,6 +334,22 @@ function JobRow({
         </>
       )}
 
+      {job.partialText && (
+        <div className="mt-2 max-h-24 overflow-hidden rounded-md border border-border/60 bg-black/10 p-2 text-[11px] leading-relaxed text-muted-foreground whitespace-pre-wrap" aria-live="polite">
+          {job.partialText.slice(-700)}
+        </div>
+      )}
+
+      {!active && job.partialText && (
+        <button
+          type="button"
+          onClick={() => void copyGeneratedContent(job.id)}
+          className="mt-2 text-[11px] inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 hover:border-primary/40 hover:text-primary"
+        >
+          Copy generated content
+        </button>
+      )}
+
       {!active && job.status === 'FAILED' && (
         <p className="text-[11px] text-destructive mt-2 line-clamp-2" title={job.errorMessage || undefined}>
           {job.errorMessage || 'Generation failed.'}
@@ -332,7 +363,7 @@ function JobRow({
               href={href}
               className="text-[11px] inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 hover:border-primary/40 hover:text-primary"
             >
-              <ExternalLink className="w-3 h-3" aria-hidden="true" /> View chapter
+              <ExternalLink className="w-3 h-3" aria-hidden="true" /> {job.chapterId ? 'View chapter' : 'View novel'}
             </Link>
           )}
           {active && (
@@ -360,6 +391,10 @@ function JobRow({
       )}
     </div>
   );
+}
+
+function formatGenerationType(value: string): string {
+  return value.replace(/[_-]+/g, ' ').replace(/\b\w/g, char => char.toUpperCase());
 }
 
 function formatRelative(iso?: string | null): string {

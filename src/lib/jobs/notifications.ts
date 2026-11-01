@@ -169,10 +169,13 @@ export function notifyGenerationEvent(
           : eventType === GenerationEventType.CANCELLED
             ? NotificationKind.CANCELLED
             : null;
-  if (!kind || job.taskType !== 'chapter') return false;
+  if (!kind) return false;
 
   const ctx = loadNotificationContext(job);
-  const chapterLabel = ctx.chapterTitle || (job.chapterId ? 'Your chapter' : 'Chapter');
+  let payload: Record<string, unknown> = {};
+  try { payload = job.payload ? JSON.parse(job.payload) : {}; } catch { /* keep generic labels */ }
+  const generationLabel = String((payload as any).title || (payload as any).generationType || job.taskType || 'AI content').replace(/[_-]+/g, ' ');
+  const chapterLabel = ctx.chapterTitle || (job.chapterId ? 'Your chapter' : generationLabel);
   const novelLabel = ctx.novelTitle || 'your novel';
 
   let title: string;
@@ -184,17 +187,21 @@ export function notifyGenerationEvent(
       break;
     case NotificationKind.COMPLETED:
       title = `${chapterLabel} is ready`;
-      message = `The chapter was generated and saved. Open it to read or edit.`;
+      message = job.taskType === 'chapter'
+        ? 'The chapter was generated and saved. Open it to read or edit.'
+        : `Your ${generationLabel} is ready. Open the project to view the result.`;
       break;
     case NotificationKind.FAILED:
       title = `Generation failed for ${chapterLabel}`;
       message = extra.error
         ? `AI generation failed: ${extra.error}`
-        : 'AI generation failed. You can retry from the chapter list.';
+        : 'AI generation failed. You can retry from the generation activity panel.';
       break;
     default:
       title = `Generation cancelled for ${chapterLabel}`;
-      message = 'The background generation was cancelled. Existing chapter content was preserved.';
+      message = job.taskType === 'chapter'
+        ? 'The background generation was cancelled. Existing chapter content was preserved.'
+        : 'The background AI generation was cancelled.';
       break;
   }
   if (kind === NotificationKind.STARTED && extra.stage) {

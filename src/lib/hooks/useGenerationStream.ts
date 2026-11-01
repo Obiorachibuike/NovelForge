@@ -18,6 +18,11 @@ export interface GenerationView {
   chapterId?: string | null;
   chapterTitle?: string | null;
   chapterNumber?: number | null;
+  taskType?: string;
+  generationType?: string;
+  title?: string | null;
+  targetType?: string | null;
+  targetId?: string | null;
   status: 'NOT_STARTED' | 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
   progressPercentage?: number | null;
   indeterminate?: boolean;
@@ -54,6 +59,7 @@ export function useGenerationStream(
 ) {
   const [connected, setConnected] = useState(false);
   const [generation, setGeneration] = useState<GenerationView | null>(null);
+  const generationRef = useRef<GenerationView | null>(null);
   const callbacks = useRef(handlers);
   callbacks.current = handlers;
   const terminalFired = useRef(false);
@@ -61,6 +67,8 @@ export function useGenerationStream(
   useEffect(() => {
     if (!jobId) return;
     terminalFired.current = false;
+    generationRef.current = null;
+    setGeneration(null);
     let source: EventSource | null = null;
     let closed = false;
     let errors = 0;
@@ -68,9 +76,11 @@ export function useGenerationStream(
     const apply = (data: any) => {
       if (!data || closed) return;
       const next: GenerationView = {
+        ...(generationRef.current ?? {}),
         ...(data as GenerationView),
         id: jobId,
       };
+      generationRef.current = next;
       setGeneration(next);
       callbacks.current.onUpdate?.(next);
       if (isTerminalStatus(next.status) && !terminalFired.current) {
@@ -100,6 +110,7 @@ export function useGenerationStream(
         'generation_queued',
         'generation_started',
         'generation_progress',
+        'generation_content',
         'generation_completed',
         'generation_failed',
         'generation_cancelled',
@@ -107,7 +118,16 @@ export function useGenerationStream(
       for (const type of types) {
         source.addEventListener(type, event => {
           try {
-            apply(JSON.parse((event as MessageEvent).data));
+            const parsed = JSON.parse((event as MessageEvent).data);
+            if (type === 'generation_content') {
+              const base = generationRef.current?.partialText ?? '';
+              const next = { ...(generationRef.current ?? { id: jobId, status: 'PROCESSING' as const }), ...parsed,
+                id: jobId,
+                partialText: typeof parsed.partialText === 'string' ? parsed.partialText : base + (parsed.chunk ?? '') } as GenerationView;
+              generationRef.current = next;
+              setGeneration(next);
+              callbacks.current.onUpdate?.(next);
+            } else apply(parsed);
           } catch {
             /* ignore malformed frame */
           }

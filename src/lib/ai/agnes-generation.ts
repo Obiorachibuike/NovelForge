@@ -135,7 +135,7 @@ export async function generateTextAgnes(input: AgnesTextInput): Promise<AgnesTex
         maxNewTokens: maxTokens,
         ...(typeof input.topP === 'number' ? { topP: input.topP } : {}),
         signal: input.signal,
-        onText: input.onText,
+        ...(input.onText ? { onText: input.onText } : {}),
       });
       const check = validateTextOutput(completion.text, { minChars: 1 });
       if (!check.ok) throw Object.assign(new Error(check.reason || 'The model returned no text.'), { status: 502 });
@@ -224,6 +224,7 @@ export async function generateStructuredAgnes<T>(input: AgnesStructuredInput<T>)
           maxNewTokens: maxTokens,
           responseFormat: 'json_object',
           signal: input.signal,
+          ...(input.onText ? { onText: input.onText } : {}),
         });
         raw = completion.text;
         usage = completion.usage;
@@ -237,6 +238,7 @@ export async function generateStructuredAgnes<T>(input: AgnesStructuredInput<T>)
           temperature: input.temperature ?? 0.4,
           maxNewTokens: maxTokens,
           signal: input.signal,
+          ...(input.onText ? { onText: input.onText } : {}),
         });
         raw = completion.text;
         usage = completion.usage;

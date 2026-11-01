@@ -126,6 +126,8 @@ export interface JobHandlerContext {
    * fabricate percentages (see `progressPercentage` staying NULL).
    */
   setProgress: (percent: number) => void;
+  /** Persist and publish actual provider text as it arrives. */
+  onContent: (chunk: string, accumulatedText: string) => void;
   /** True if the job was cancelled while running. */
   isCancelled: () => boolean;
   /** Aborted as soon as the job is cancelled, so provider calls can stop. */
@@ -280,12 +282,10 @@ export async function enqueue(task: EnqueueOptions): Promise<string> {
   }
 
   const inserted = db.prepare('SELECT * FROM generation_jobs WHERE id=?').get(id) as JobRecord;
-  if (task.type === 'chapter') {
-    updateChapterGenerationStatus(task.chapterId, 'QUEUED');
-    emitLifecycle(inserted, GenerationEventType.QUEUED, {
-      data: { chapterNumber: (task.payload as any)?.chapterNumber ?? null },
-    });
-  }
+  if (task.type === 'chapter') updateChapterGenerationStatus(task.chapterId, 'QUEUED');
+  emitLifecycle(inserted, GenerationEventType.QUEUED, {
+    data: { taskType: task.type, generationType: (task.payload as any)?.generationType ?? task.type, chapterNumber: (task.payload as any)?.chapterNumber ?? null },
+  });
 
   await dispatch(id, { delayMs: task.delayMs, priority: task.priority });
   return id;
@@ -296,28 +296,24 @@ async function dispatch(id: string, options: { delayMs?: number; priority?: numb
   const row = (await getJob(id)) as JobRecord | undefined;
   if (!row) return;
 
-  if (row.taskType === 'chapter') {
-    // Chapter generation NEVER runs inside the Next.js process: not in a
-    // request, not in a setImmediate, and not on a serverless host. The
-    // dedicated worker owns it in every environment. SQLite development has no
-    // pg-boss, so the worker's database sweep picks the row up.
-    if (queueTransport() === 'pgboss') {
-      try {
-        const queueJobId = await sendChapterGeneration(id, {
-          priority: options.priority ?? row.priority ?? 0,
-          delayMs: options.delayMs,
-        });
-        if (queueJobId) {
-          getDb().prepare('UPDATE generation_jobs SET queueJobId=?, updatedAt=? WHERE id=?')
-            .run(queueJobId, nowIso(), id);
-        }
-      } catch (err) {
-        // Durable row remains queued; the worker's database sweep will run it.
-        console.error('[queue] pg-boss send failed; job remains queued in PostgreSQL:', err);
+  // Every task type uses the same PostgreSQL/pg-boss queue in production.
+  // The durable generation_jobs row remains the source of truth; the worker's
+  // database sweep is the recovery path if pg-boss is temporarily unavailable.
+  if (queueTransport() === 'pgboss') {
+    try {
+      const queueJobId = await sendChapterGeneration(id, {
+        priority: options.priority ?? row.priority ?? 0,
+        delayMs: options.delayMs,
+      });
+      if (queueJobId) {
+        getDb().prepare('UPDATE generation_jobs SET queueJobId=?, updatedAt=? WHERE id=?')
+          .run(queueJobId, nowIso(), id);
       }
+    } catch (err) {
+      console.error('[queue] pg-boss send failed; job remains queued in PostgreSQL:', err);
     }
-    return;
   }
+  if (row.taskType === 'chapter') return;
 
   if (mayRunInProcess()) {
     if (options.delayMs && options.delayMs > 0) {
@@ -412,13 +408,12 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
   }, Math.max(5_000, envInt('GENERATION_HEARTBEAT_MS', 20_000)));
   if (typeof heartbeat.unref === 'function') heartbeat.unref();
 
-  if (job.taskType === 'chapter') {
-    updateChapterGenerationStatus(job.chapterId, 'PROCESSING');
-    emitLifecycle(job, GenerationEventType.STARTED, {
-      stage: GenerationStage.PREPARING_CHAPTER,
-      notify: true,
-    });
-  }
+  if (job.taskType === 'chapter') updateChapterGenerationStatus(job.chapterId, 'PROCESSING');
+  emitLifecycle(job, GenerationEventType.STARTED, {
+    stage: job.taskType === 'chapter' ? GenerationStage.PREPARING_CHAPTER : null,
+    notify: true,
+    data: { taskType: job.taskType },
+  });
 
   try {
     const payload = job.payload ? JSON.parse(job.payload) : {};
@@ -460,6 +455,18 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
         const value = Math.max(0, Math.min(100, Math.round(percent)));
         db.prepare(`UPDATE generation_jobs SET progress=?, progressPercentage=?, updatedAt=? WHERE id=? AND status='processing'`)
           .run(value, value, nowIso(), id);
+      },
+      onContent: (chunk, accumulatedText) => {
+        if (!chunk || controller.signal.aborted || checkCancelled()) return;
+        const safeText = accumulatedText.slice(-1_500_000);
+        const stamp = nowIso();
+        db.prepare(`UPDATE generation_jobs SET result=?, lastHeartbeatAt=?, updatedAt=? WHERE id=? AND status='processing'`)
+          .run(JSON.stringify({ partialText: safeText }), stamp, stamp, id);
+        safePublishGenerationEvent({
+          jobId: job.id, userId: job.userId, novelId: job.novelId, chapterId: job.chapterId ?? null,
+          type: GenerationEventType.CONTENT, status: 'PROCESSING',
+          data: { chunk, partialText: safeText.slice(-6000), taskType: job.taskType },
+        });
       },
     });
     const finished = nowIso();
@@ -504,7 +511,14 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
         data: {
           chapterId: completedJob.chapterId,
           chapterNumber: (result as any)?.chapterNumber ?? (job.payload ? JSON.parse(job.payload).chapterNumber : null),
+          taskType: job.taskType,
         },
+      });
+    } else {
+      emitLifecycle(job, GenerationEventType.COMPLETED, {
+        stage: GenerationStage.COMPLETED,
+        notify: true,
+        data: { taskType: job.taskType },
       });
     }
     return { id, status: targetStatus };
@@ -524,14 +538,12 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
                 progressPercentage=NULL
           WHERE id=? AND status != 'cancelled'`,
       ).run(classified.message, classified.code, classified.retryable ? 1 : 0, finished, finished, id);
-      if (job.taskType === 'chapter') {
-        updateChapterGenerationStatus(job.chapterId, 'FAILED');
-        emitLifecycle(job, GenerationEventType.FAILED, {
-          message: classified.message,
-          notify: true,
-          data: { errorCode: classified.code, retryable: classified.retryable },
-        });
-      }
+      if (job.taskType === 'chapter') updateChapterGenerationStatus(job.chapterId, 'FAILED');
+      emitLifecycle(job, GenerationEventType.FAILED, {
+        message: classified.message,
+        notify: true,
+        data: { errorCode: classified.code, retryable: classified.retryable, taskType: job.taskType },
+      });
       return { id, status: 'failed', reason: classified.message };
     }
     const backoffMs = Math.min(60_000, 2000 * 2 ** (attempts - 1));
@@ -541,13 +553,11 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
               progressPercentage=NULL, currentStage=NULL
         WHERE id=? AND status != 'cancelled'`,
     ).run(classified.message, classified.code, new Date(Date.now() + backoffMs).toISOString(), finished, id);
-    if (job.taskType === 'chapter') {
-      updateChapterGenerationStatus(job.chapterId, 'QUEUED');
-      emitLifecycle(job, GenerationEventType.QUEUED, {
-        message: classified.message,
-        data: { retryAt: new Date(Date.now() + backoffMs).toISOString(), attempt: attempts },
-      });
-    }
+    if (job.taskType === 'chapter') updateChapterGenerationStatus(job.chapterId, 'QUEUED');
+    emitLifecycle(job, GenerationEventType.QUEUED, {
+      message: classified.message,
+      data: { retryAt: new Date(Date.now() + backoffMs).toISOString(), attempt: attempts, taskType: job.taskType },
+    });
     await dispatch(id, { delayMs: backoffMs, priority: job.priority ?? 0 });
     return { id, status: 'queued', reason: classified.message };
   } finally {
@@ -580,14 +590,12 @@ export async function recoverStaleJobs({ limit = 20, staleMs }: { limit?: number
               currentStage=NULL, progressPercentage=NULL
         WHERE id=? AND status='processing'`,
     ).run(nowIso(), nowIso(), job.id);
-    if (job.taskType === 'chapter') {
-      updateChapterGenerationStatus(job.chapterId, 'QUEUED');
-      emitLifecycle(job as JobRecord, GenerationEventType.QUEUED, {
-        message: 'Worker restart detected — generation re-queued.',
-        data: { recovered: true },
-      });
-      await dispatch(job.id);
-    }
+    if (job.taskType === 'chapter') updateChapterGenerationStatus(job.chapterId, 'QUEUED');
+    emitLifecycle(job as JobRecord, GenerationEventType.QUEUED, {
+      message: 'Worker restart detected — generation re-queued.',
+      data: { recovered: true, taskType: job.taskType },
+    });
+    await dispatch(job.id);
   }
 
   const due = db.prepare(
@@ -657,13 +665,14 @@ export function cancelJob(id: string): boolean {
   ).run(now, now, now, id);
   if (res.changes === 0) return false;
 
-  if (job.taskType === 'chapter') {
-    updateChapterGenerationStatus(job.chapterId, 'CANCELLED');
-    emitLifecycle(job, GenerationEventType.CANCELLED, {
-      notify: true,
-      message: 'Generation cancelled. Existing chapter content was preserved.',
-    });
-  }
+  if (job.taskType === 'chapter') updateChapterGenerationStatus(job.chapterId, 'CANCELLED');
+  emitLifecycle(job, GenerationEventType.CANCELLED, {
+    notify: true,
+    message: job.taskType === 'chapter'
+      ? 'Generation cancelled. Existing chapter content was preserved.'
+      : 'Background AI generation was cancelled.',
+    data: { taskType: job.taskType },
+  });
   return true;
 }
 
@@ -693,19 +702,17 @@ export async function retryJob(id: string, options: { priority?: number } = {}):
 
   const res = db.prepare(
     `UPDATE generation_jobs
-        SET status='queued', attempts=0, error=NULL, errorCode=NULL, retryable=1,
+        SET status='queued', attempts=0, error=NULL, errorCode=NULL, retryable=1, result=NULL,
             scheduledAt=?, completedAt=NULL, claimedAt=NULL, claimedBy=NULL, progress=0,
             progressPercentage=NULL, currentStage=NULL, cancelRequestedAt=NULL, updatedAt=?
       WHERE id=? AND status IN ('failed','cancelled')`,
   ).run(now, now, id);
   if (res.changes === 0) return false;
 
-  if (job.taskType === 'chapter') {
-    updateChapterGenerationStatus(job.chapterId, 'QUEUED');
-    emitLifecycle({ ...job, attempts: 0 }, GenerationEventType.QUEUED, {
-      data: { manualRetry: true },
-    });
-  }
+  if (job.taskType === 'chapter') updateChapterGenerationStatus(job.chapterId, 'QUEUED');
+  emitLifecycle({ ...job, attempts: 0 }, GenerationEventType.QUEUED, {
+    data: { manualRetry: true, taskType: job.taskType },
+  });
   await dispatch(id, { priority: options.priority ?? job.priority ?? 0 });
   return true;
 }

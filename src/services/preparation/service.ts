@@ -51,13 +51,16 @@ export async function getPremise(novelId: string) {
   return db.prepare('SELECT * FROM premises WHERE novelId = ?').get(novelId) as any;
 }
 
-export async function runPremise({ id, novelId, userId, payload }: { id?: string; novelId:string; userId:string; payload?: { textModel?: string; allowFallback?: boolean } }) {
+export async function runPremise({ id, novelId, userId, payload, onContent }: { id?: string; novelId:string; userId:string; payload?: { textModel?: string; allowFallback?: boolean }; onContent?: (chunk: string, accumulatedText: string) => void }) {
   const db = getDb();
   const novel = db.prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as any;
   if (!novel) throw new Error('Novel not found');
 
   const prompt = premisePrompt(novel);
   const fallback = makeDemoPremise(novel);
+  let streamedText = '';
+  let lastPublishedText = '';
+  let lastPublishedAt = 0;
   const { data: p, meta } = await generateStructuredDetailed(premiseShape, {
     messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: prompt.user }],
     temperature: 0.7,
@@ -66,6 +69,15 @@ export async function runPremise({ id, novelId, userId, payload }: { id?: string
     fallback,
     ...(payload?.textModel ? { model: payload.textModel } : {}),
     allowModelFallback: payload?.allowFallback !== false,
+    ...(onContent ? { onText: (text: string) => {
+      const chunk = text.startsWith(streamedText) ? text.slice(streamedText.length) : text;
+      streamedText = text;
+      if (chunk && Date.now() - lastPublishedAt >= 150) {
+        onContent?.(chunk, streamedText);
+        lastPublishedText = streamedText;
+        lastPublishedAt = Date.now();
+      }
+    } } : {}),
   });
   // In real (non-demo) mode a provider failure must not be written into the
   // author's Story Bible as if it were generated content.
@@ -133,7 +145,11 @@ export async function runPremise({ id, novelId, userId, payload }: { id?: string
   Promise.all([embed(p.logline, userId, novelId), embed(p.shortSynopsis, userId, novelId)])
     .catch(err => console.warn('premise embedding failed', err));
 
-  return { source: meta.source };
+  if (streamedText !== lastPublishedText) {
+    const finalChunk = streamedText.startsWith(lastPublishedText) ? streamedText.slice(lastPublishedText.length) : streamedText;
+    if (finalChunk) onContent?.(finalChunk, streamedText);
+  }
+  return { source: meta.source, partialText: streamedText };
 }
 
 registerHandler('premise', runPremise);

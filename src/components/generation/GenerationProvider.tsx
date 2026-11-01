@@ -63,7 +63,7 @@ export function GenerationProvider({ children }: { children: React.ReactNode }) 
       applyGeneration(job);
 
       if (job.status === 'COMPLETED') {
-        toast.success(job.chapterTitle ? `${job.chapterTitle} is ready` : 'Chapter ready', {
+        toast.success(job.chapterTitle || job.title ? `${job.chapterTitle || job.title} is ready` : `${job.generationType || 'AI content'} is ready`, {
           description: 'Generated in the background and saved. Open it to read or edit.',
           action: job.chapterId
             ? {
@@ -73,12 +73,12 @@ export function GenerationProvider({ children }: { children: React.ReactNode }) 
             : undefined,
         });
       } else if (job.status === 'FAILED') {
-        toast.error('Chapter generation failed', {
+        toast.error(`${job.generationType || 'AI'} generation failed`, {
           description: job.errorMessage || 'You can retry from the generation panel.',
         });
       } else if (job.status === 'CANCELLED') {
         toast.message('Generation cancelled', {
-          description: 'Existing chapter content was preserved.',
+          description: job.chapterId ? 'Existing chapter content was preserved.' : 'Any partial generated content remains available in activity.',
         });
       }
 

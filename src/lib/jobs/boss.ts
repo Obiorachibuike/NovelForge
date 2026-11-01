@@ -21,7 +21,7 @@ const nativeImport = new Function('specifier', 'return import(specifier)') as (
  *
  * Two deployment roles use this module:
  *
- *  - the Next.js runtime only *produces* wake-ups (`sendChapterGeneration`);
+ *  - the Next.js runtime only *produces* wake-ups (`sendChapterGeneration`, retained as a legacy name);
  *  - `npm run worker` consumes them (`startChapterGenerationWorker`).
  *
  * pg-boss is initialized lazily and never inside a request's long-running
@@ -184,7 +184,7 @@ export async function sendChapterGeneration(
 }
 
 /**
- * Starts consuming the chapter-generation queue. Only the dedicated worker
+ * Starts consuming the shared generation queue. Only the dedicated worker
  * process should call this; it resolves once pg-boss has registered the worker.
  */
 export async function startChapterGenerationWorker(
