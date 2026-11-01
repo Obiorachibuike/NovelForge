@@ -17,9 +17,9 @@ import { startChapterGenerationWorker, stopBoss } from './boss';
  * functions are frozen after a response, which would silently stop generation.
  *
  * Two consumption paths run side by side:
- *  1. pg-boss delivers chapter-generation wake-ups immediately (PostgreSQL).
- *  2. The database sweep recovers interrupted jobs and drains every other task
- *     type (outline, memory, images, exports), plus any wake-up pg-boss missed.
+ *  1. pg-boss delivers wake-ups for every generation task (PostgreSQL).
+ *  2. The database sweep recovers interrupted jobs and catches any wake-up
+ *     pg-boss missed; SQLite development uses the same durable poller.
  *
  * The compare-and-set claim in `runJob` makes double delivery harmless.
  */
