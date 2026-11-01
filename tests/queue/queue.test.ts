@@ -124,6 +124,24 @@ describe('recovery and cancellation', () => {
     expect(results.some(r => r.id === id && r.status === 'completed')).toBe(true);
   });
 
+  it('uses the generation heartbeat, not the original claim time, to decide staleness', async () => {
+    registerHandler('test-heartbeat', async () => ({ ok: true }));
+    const id = await enqueue({ type: 'test-heartbeat', userId: user.id, novelId: novel.id, payload: {} });
+    const old = new Date(Date.now() - 10 * 60_000).toISOString();
+    db().prepare(
+      `UPDATE generation_jobs SET status='processing', claimedAt=?, lastHeartbeatAt=?, claimedBy='slow-worker' WHERE id=?`,
+    ).run(old, new Date().toISOString(), id);
+
+    // A job that has been running for longer than QUEUE_STALE_JOB_MS but is
+    // still heartbeating must not be recovered (that would double-generate).
+    expect((await recoverStaleJobs({ staleMs: 60_000 })).recovered).toBe(0);
+
+    // Once the heartbeat itself is stale the worker is presumed dead.
+    db().prepare('UPDATE generation_jobs SET lastHeartbeatAt=? WHERE id=?').run(old, id);
+    expect((await recoverStaleJobs({ staleMs: 60_000 })).recovered).toBe(1);
+    expect((await getJob(id))?.status).toBe('queued');
+  });
+
   it('does not reclaim a job that is still running', async () => {
     registerHandler('test-running', async () => ({ ok: true }));
     const id = await enqueue({ type: 'test-running', userId: user.id, novelId: novel.id, payload: {} });
@@ -154,16 +172,35 @@ describe('recovery and cancellation', () => {
 });
 
 describe('driver reporting', () => {
-  it('reports the in-process driver by default and never claims Redis support', () => {
+  it('uses the database transport for SQLite and never claims Redis support', () => {
     delete process.env.QUEUE_PROVIDER;
-    delete process.env.REDIS_URL;
-    expect(queueDriver()).toBe('inprocess');
+    expect(queueDriver()).toBe('database');
     expect(queueInfo().redisConfigured).toBe(false);
+    expect(queueInfo().pgBoss).toBe(false);
+    expect(queueInfo().note).toMatch(/database|worker/i);
 
-    process.env.REDIS_URL = 'redis://localhost:6379';
-    process.env.QUEUE_PROVIDER = 'redis';
-    expect(queueDriver()).toBe('redis');
+    // PostgreSQL is the production transport for pg-boss.
+    const originalUrl = process.env.DATABASE_URL;
+    process.env.DATABASE_URL = 'postgresql://user:pass@localhost:5432/novelforge';
+    try {
+      expect(queueDriver()).toBe('pgboss');
+      expect(queueInfo().pgBoss).toBe(true);
+      expect(queueInfo().driver).toBe('pgboss');
+    } finally {
+      process.env.DATABASE_URL = originalUrl;
+    }
     delete process.env.QUEUE_PROVIDER;
-    delete process.env.REDIS_URL;
+  });
+
+  it('can be forced to the database transport with QUEUE_PROVIDER', () => {
+    const originalUrl = process.env.DATABASE_URL;
+    process.env.DATABASE_URL = 'postgresql://user:pass@localhost:5432/novelforge';
+    process.env.QUEUE_PROVIDER = 'database';
+    try {
+      expect(queueDriver()).toBe('database');
+    } finally {
+      delete process.env.QUEUE_PROVIDER;
+      process.env.DATABASE_URL = originalUrl;
+    }
   });
 });

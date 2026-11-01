@@ -1,11 +1,12 @@
 'use client';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import { Home, PlusCircle, Book, BookOpen, Library, PenTool, Eye, Upload, Settings, LogOut, Sparkles, ChevronRight, User, Moon, Sun, CreditCard, Cpu } from 'lucide-react';
+import { Home, PlusCircle, Book, BookOpen, Library, Eye, Upload, Settings, LogOut, Sparkles, ChevronRight, Moon, Sun, CreditCard, Cpu, Bell, CheckCheck } from 'lucide-react';
 import { signOut, useSession } from 'next-auth/react';
 import { useTheme } from 'next-themes';
 import { cn } from '@/lib/utils/cn';
 import { useEffect, useState } from 'react';
+import { useOptionalGeneration } from '@/components/generation/GenerationContext';
 
 interface NavGroup { label: string; items: { href: string; label: string; icon: any; badge?: string }[] }
 
@@ -21,8 +22,22 @@ export function Sidebar() {
   const router = useRouter();
   const { data: session } = useSession();
   const { theme, setTheme } = useTheme();
+  const generation = useOptionalGeneration();
   const [mounted, setMounted] = useState(false);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
   useEffect(()=>setMounted(true),[]);
+
+  const activeCount = generation?.activeGenerations.length ?? 0;
+  const unread = generation?.unreadCount ?? 0;
+  const notifications = generation?.notifications.slice(0, 8) ?? [];
+  const activeJob = generation?.activeGenerations[0];
+  const activeHref = activeJob
+    ? activeJob.chapterId
+      ? `/novels/${activeJob.novelId}/write/${activeJob.chapterId}`
+      : activeJob.chapterNumber
+        ? `/novels/${activeJob.novelId}/write/${activeJob.chapterNumber}`
+        : `/novels/${activeJob.novelId}/outline`
+    : '/dashboard';
 
   const isNovelRoute = pathname?.startsWith('/novels/') && !pathname?.endsWith('/new');
   const novelId = isNovelRoute ? pathname.split('/')[2] : null;
@@ -44,6 +59,14 @@ export function Sidebar() {
 
         <NavGroup label="MY NOVELS">
           <NavItem href="/novels/new" icon={PlusCircle} label="New novel" active={pathname==='/novels/new'} />
+          {activeCount > 0 && (
+            <NavItem
+              href={activeHref}
+              icon={Sparkles}
+              label={activeCount === 1 ? 'Generating chapter' : `Generating ${activeCount} chapters`}
+              badge="LIVE"
+            />
+          )}
         </NavGroup>
 
         <NavGroup label="ACCOUNT">
@@ -72,6 +95,93 @@ export function Sidebar() {
       </nav>
 
       <div className="border-t border-border p-3 space-y-2">
+        {generation && (
+          <div className="relative">
+            {notificationsOpen && (
+              <div className="absolute bottom-full left-0 mb-2 w-80 max-w-[80vw] rounded-xl border border-border bg-[hsl(var(--surface))] shadow-2xl overflow-hidden">
+                <div className="flex items-center justify-between px-3 py-2 border-b border-border">
+                  <div className="text-xs font-semibold uppercase tracking-wider">Notifications</div>
+                  {unread > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => { void generation.markAllNotificationsRead(); }}
+                      className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground"
+                    >
+                      <CheckCheck className="w-3 h-3" /> Mark all read
+                    </button>
+                  )}
+                </div>
+                <div className="max-h-80 overflow-y-auto">
+                  {notifications.length === 0 ? (
+                    <p className="px-3 py-6 text-center text-xs text-muted-foreground">
+                      No notifications yet.
+                    </p>
+                  ) : (
+                    notifications.map((n) => {
+                      const content = (
+                        <div className="flex items-start gap-2">
+                          <span
+                            className={cn(
+                              'mt-1.5 w-1.5 h-1.5 rounded-full shrink-0',
+                              n.isRead ? 'bg-muted-foreground/30' : 'bg-primary',
+                            )}
+                          />
+                          <div className="min-w-0">
+                            <div className={cn('text-xs leading-snug', n.isRead ? 'text-muted-foreground' : 'font-medium')}>
+                              {n.title}
+                            </div>
+                            <div className="text-[11px] text-muted-foreground line-clamp-2">{n.message}</div>
+                          </div>
+                        </div>
+                      );
+                      return (
+                        <div key={n.id} className="border-b border-border/60 last:border-0">
+                          {n.href ? (
+                            <Link
+                              href={n.href}
+                              onClick={() => {
+                                if (!n.isRead) void generation.markNotificationRead(n.id);
+                                setNotificationsOpen(false);
+                              }}
+                              className="block px-3 py-2.5 hover:bg-[hsl(var(--surface-secondary))]"
+                            >
+                              {content}
+                            </Link>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => { if (!n.isRead) void generation.markNotificationRead(n.id); }}
+                              className="block w-full text-left px-3 py-2.5 hover:bg-[hsl(var(--surface-secondary))]"
+                            >
+                              {content}
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+                <p className="px-3 py-2 text-[10px] text-muted-foreground border-t border-border">
+                  Notifications are stored on the server and survive reloads.
+                </p>
+              </div>
+            )}
+            <button
+              type="button"
+              onClick={() => setNotificationsOpen((open) => !open)}
+              aria-expanded={notificationsOpen}
+              className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-muted-foreground hover:bg-[hsl(var(--surface-secondary))] hover:text-foreground transition"
+            >
+              <Bell className="w-4 h-4" />
+              <span className="flex-1 text-left">Notifications</span>
+              {unread > 0 && (
+                <span className="min-w-[18px] h-[18px] px-1 rounded-full bg-primary text-primary-foreground text-[10px] font-semibold flex items-center justify-center">
+                  {unread > 9 ? '9+' : unread}
+                </span>
+              )}
+            </button>
+          </div>
+        )}
         <button onClick={()=>setTheme(theme==='dark'?'light':'dark')} className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-muted-foreground hover:bg-[hsl(var(--surface-secondary))] hover:text-foreground transition">
           {mounted && theme==='dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
           {mounted && theme==='dark' ? 'Light mode' : 'Dark mode'}

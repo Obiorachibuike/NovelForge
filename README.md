@@ -23,9 +23,9 @@ NovelForge is a production-quality AI-powered novel-writing and digital publishi
 - **Consistency engine** — heuristic + AI checks for timeline clashes, dead characters appearing, word-count targets, world-rule violations.
 - **Exports & Project Backups** — manuscript exports to DOCX, PDF, TXT, Markdown and EPUB (with unsaved local draft warnings), plus SHA-256 checksum-verified full novel JSON backup export (`GET /api/novels/[id]/backup`), transactional non-destructive restore (`POST /api/novels/[id]/backup` and `POST /api/novels/restore`), and online SQLite database backup (`backupSqliteDatabaseFile`).
 - **Health & Observability** — `GET /api/health` readiness endpoint, startup configuration validation (`src/lib/config/env.ts`), and secret-redacting structured logging (`src/lib/logger/index.ts`).
-- **Queue abstraction** — in-process runner by default; a real BullMQ consumer when `QUEUE_PROVIDER=redis` *and* `REDIS_URL` are set, plus a database poller and stale-job recovery in `npm run worker`.
+- **Persistent background AI chapter generation** — `pg-boss` on PostgreSQL plus a dedicated Node.js worker (`npm run worker`), durable generation records and stages, recoverable Server-Sent Events, a global generation indicator that survives navigation/refresh, a notification centre, cancellation, retries and per-user concurrency limits. No Redis. See [`docs/background-generation.md`](docs/background-generation.md).
 - **Cloudinary cover-image storage** — cover candidates are generated as temporary previews; when the author selects a cover, NovelForge validates the image binary/SVG content, uploads only the selected cover to Cloudinary under `novelforge/covers/<user-id>/<novel-id>/cover_<image-id>`, stores `secure_url` and `public_id` in PostgreSQL, cleans up orphaned assets on DB rollback, and deletes superseded covers on replacement. See [`docs/storage.md`](docs/storage.md).
-- **PostgreSQL primary database** — PostgreSQL via `pg` (`Pool`, `PoolClient`) with connection pooling, transactions (`BEGIN`/`COMMIT`/`ROLLBACK`), versioned migrations (`0001`–`0007`), and a non-destructive, idempotent SQLite-to-PostgreSQL migration tool (`npm run db:migrate:sqlite-to-pg`). Production requires `DATABASE_URL=postgresql://...` and never silently falls back to SQLite. See [`docs/postgresql.md`](docs/postgresql.md).
+- **PostgreSQL primary database** — PostgreSQL via `pg` (`Pool`, `PoolClient`) with connection pooling, transactions (`BEGIN`/`COMMIT`/`ROLLBACK`), versioned migrations (`0001`–`0013`), and a non-destructive, idempotent SQLite-to-PostgreSQL migration tool (`npm run db:migrate:sqlite-to-pg`). Production requires `DATABASE_URL=postgresql://...` and never silently falls back to SQLite. See [`docs/postgresql.md`](docs/postgresql.md).
 
 ## Quick start (local development)
 
@@ -36,6 +36,8 @@ npm ci
 cp .env.example .env.local    # defaults to SQLite (file:./prisma/dev.db) — no database server needed
 npm run db:migrate
 npm run dev
+# in a second terminal — required for background chapter generation
+npm run worker
 ```
 
 Open http://localhost:3000. Register with any email/password — no external services required. In demo mode, stylized SVG covers and deterministic chapter text are used.
@@ -59,7 +61,10 @@ Configure the following in `.env` / `.env.local`:
 | `AI_ALLOW_PAID_INFERENCE` / `AI_REQUIRE_CONFIRMED_PRICING` | Pricing guardrails for hosted inference (default `false` / `true`) |
 | `AUTH_GOOGLE_ID` / `AUTH_GOOGLE_SECRET` | Google OAuth (both required) - see [`docs/google-signin.md`](docs/google-signin.md) |
 | `AUTH_SECRET` | **Required in production** (≥32 chars). The app refuses production requests with a placeholder or missing secret. |
-| `QUEUE_PROVIDER=redis` + `REDIS_URL` | Turns on the BullMQ consumer (run `npm run worker`); otherwise jobs run in-process. |
+| `QUEUE_PROVIDER` | Leave empty for PostgreSQL/pg-boss. `database` forces the SQLite development/test transport (no worker queue daemon, the worker polls the table). |
+| `WORKER_CONCURRENCY` / `WORKER_POLL_MS` | Worker parallelism (default 2) and recovery/poll interval (default 3000 ms). |
+| `GENERATION_MAX_ACTIVE_PER_USER` / `GENERATION_MAX_ACTIVE_PER_NOVEL` | Background generation limits (default 3 per user, 1 per novel). |
+| `PG_BOSS_*` | pg-boss queue tuning: retry limit/backoff, expiry, retention, pool size. See `.env.example`. |
 | `STORAGE_PROVIDER=s3` + `S3_*` | Persistent S3-compatible object storage for exports/files. |
 | `DATA_DIR` | Local file location for `STORAGE_PROVIDER=local` and temporary cover candidate previews (default `.data/`). |
 | `AI_DAILY_TOKEN_LIMIT` / `AI_MONTHLY_COST_LIMIT_USD` | Per-user spend guards enforced from the `ai_usage` table. |
@@ -103,7 +108,9 @@ DATABASE_URL="postgresql://user:password@localhost:5432/novelforge" \
   npm run db:migrate:sqlite-to-pg -- --sqlite ./prisma/dev.db
 ```
 
-Run a dedicated worker (for Redis / BullMQ mode):
+Run the dedicated background worker (required for background chapter
+generation; in SQLite development it drains the durable table, in PostgreSQL it
+consumes the pg-boss queue):
 
 ```bash
 npm run worker
@@ -136,9 +143,10 @@ src/
                                usage-tracker, rate-limit, model-report
     api/                   Route-handler wrapper, error mapping, body limits
     auth/                  Auth.js config (node) + edge config used by middleware
-    db/                    SQLite data layer, versioned migrations, ownership helpers
-    hooks/                 Client hooks (durable job watcher)
-    queue/                 Durable job store + in-process drainer + BullMQ consumer
+    db/                    SQLite/PostgreSQL data layer, versioned migrations, ownership helpers
+    jobs/                  pg-boss queue, durable generation events, notifications, worker
+    hooks/                 Client hooks (SSE generation stream, durable job watcher)
+    queue/                 Durable job store + claim/retry/recovery + pg-boss dispatch
     security/              Per-user/IP rate limiting
     storage/               local / s3 (SigV4) / cloudinary drivers
     workflow/              Sequential-writing gate (shared by server and client)
@@ -182,7 +190,7 @@ src/
 - [x] **Agnes AI primary provider** for text (`agnes-2.5-flash`) and image (`agnes-image-2.5-flash`) generation, with the hosted Hugging Face chain (50 text + 20 image models, registry, verification, bounded task-compatible fallback, circuit breakers, cost-status accounting, admin model console) as the automatic fallback
 - [x] Per-artefact model provenance (which model was requested and which one actually answered, on jobs, usage rows and cover assets)
 - [ ] PostgreSQL adapter (see `docs/postgresql.md`)
-- [ ] Live Redis/BullMQ and Cloudinary runs (code present; not exercised against live services here)
+- [ ] Live pg-boss/PostgreSQL worker run and Cloudinary runs (code present; the environment used for this build had no PostgreSQL or Cloudinary credentials)
 
 ## Scripts
 
@@ -191,7 +199,8 @@ src/
 | `npm run dev` | Next.js dev server (port 3000, binds 0.0.0.0) |
 | `npm run build` | Production build |
 | `npm run start` | Serve production build |
-| `npm run worker` | Run the background worker (in-process or BullMQ when REDIS_URL is set) |
+| `npm run worker` | Run the dedicated background worker (pg-boss consumer + recovery sweep). Required for chapter generation outside SQLite dev/test. |
+| `npm run worker:dev` | Same worker under `tsx watch` for local development. |
 | `npm run lint` / `typecheck` | Lint & type check |
 | `npm test` | Run Vitest unit tests |
 | `npm run admin:grant -- <email> [--revoke]` | Promote (or demote) an administrator account |
@@ -203,11 +212,11 @@ src/
 ```bash
 npm run typecheck     # tsc --noEmit
 npm run lint          # next lint (no warnings)
-npm test              # 339 Vitest tests across 31 files
+npm test              # Vitest suite (background generation, SSE, queue, workflow, security)
 npm run build         # production build with type + lint validation enabled
 npm run db:migrate    # apply pending SQLite migrations non-destructively
 npm run db:status     # inspect applied and pending SQLite migrations
-npm run worker        # standalone worker (migrations, poller, BullMQ when configured)
+npm run worker        # dedicated worker (pg-boss consumer + stale-job recovery)
 npm run ai:verify     # verify hosted-inference Hugging Face models (requires HF_TOKEN; Agnes AI needs no verification)
 ```
 
@@ -235,14 +244,21 @@ token in any response).
 See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full deployment runbook, including
 the hosted-inference configuration (`HF_TOKEN`, verification, worker, timeouts).
 
-The default runtime targets a **persistent, single-instance Node.js server**:
-SQLite needs a writable disk (`DATABASE_URL=file:/data/novelforge.db`), files live
-under `DATA_DIR`, and the queue runs in-process. For multi-instance or
-serverless hosts, object storage (`STORAGE_PROVIDER=s3`) is implemented and
-verified; the database constraint is documented in
-[`docs/postgresql.md`](docs/postgresql.md), and Redis/BullMQ is wired but has not
-been exercised against a live Redis here. Setting an environment variable does
-not by itself enable any adapter — each one either works or refuses loudly.
+The production runtime is **two processes**: the Next.js app (APIs + UI) and
+`npm run worker` (pg-boss consumer + recovery sweep). Both must point at the same
+PostgreSQL `DATABASE_URL`. Chapter generation is never run inside an HTTP
+request, so it survives navigation, browser closure and app redeploys.
+
+- Do **not** host the worker on a serverless function: it is a persistent Node.js
+  process. Vercel's serverless runtime can host the Next.js app; run the worker
+  on a container/VM host (Fly.io, Railway, Render, …).
+- SSE needs a host that permits long-lived responses (the same persistent Node.js
+  host is the safest choice). `Cache-Control: no-transform` and
+  `X-Accel-Buffering: no` are set for proxies.
+- SQLite remains supported for local development and tests. Production refuses
+  it and requires PostgreSQL.
+- Full runbook: [`docs/background-generation.md`](docs/background-generation.md)
+  and [`DEPLOYMENT.md`](DEPLOYMENT.md).
 
 ### Verifying the AI provider after deploying
 

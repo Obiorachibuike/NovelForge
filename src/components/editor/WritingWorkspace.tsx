@@ -19,7 +19,8 @@ import {
   AlertTriangle, History as HistoryIcon, RotateCcw, Eye, X
 } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
-import { useJobWatcher } from '@/lib/hooks/useJobWatcher';
+import { useOptionalGeneration } from '@/components/generation/GenerationContext';
+import { GenerationStatusBadge, generationStatusLabel } from '@/components/generation/GenerationStatusBadge';
 import {
   createAutosaveController,
   loadLocalDraft,
@@ -53,6 +54,7 @@ export default function WritingWorkspace({
 }: any) {
   const router = useRouter();
   const qc = useQueryClient();
+  const generation = useOptionalGeneration();
   const [aiState, setAiState] = useState<'idle' | 'thinking' | 'streaming'>('idle');
   const [selection, setSelection] = useState<string>('');
   const [versions, setVersions] = useState<any[]>(initialVersions);
@@ -95,6 +97,7 @@ export default function WritingWorkspace({
   });
 
   const controllerRef = useRef<ReturnType<typeof createAutosaveController> | null>(null);
+  const syncedChapterRef = useRef<string>('');
 
   useEffect(() => {
     if (!chapter?.id || isApproved || isLocked) {
@@ -183,6 +186,20 @@ export default function WritingWorkspace({
       controllerRef.current?.notifyEdit(editor.getJSON() as any);
     },
   });
+
+  // Background generation adds the chapter (and its prose) after this page was
+  // rendered. `router.refresh()` from the generation provider updates the prop;
+  // this effect mirrors that into the already-mounted editor so the author sees
+  // the finished chapter without reloading. Unsaved typing always wins.
+  useEffect(() => {
+    if (!editor || !chapter?.id) return;
+    const key = `${chapter.id}:${chapter.revision ?? 1}`;
+    if (syncedChapterRef.current === key) return;
+    syncedChapterRef.current = key;
+    if (controllerRef.current?.hasUnsavedChanges()) return;
+    editor.commands.setContent(initialContent, false);
+    editor.setEditable(!isLocked && !isApproved);
+  }, [editor, chapter?.id, chapter?.revision, initialContent, isLocked, isApproved]);
 
   // Warn users before navigating away when unsaved changes exist.
   useEffect(() => {
@@ -279,10 +296,14 @@ export default function WritingWorkspace({
       if (needsConfirmation && !window.confirm('This chapter contains your edits. Regenerating will replace them. Continue?')) {
         throw new Error('cancelled');
       }
-      const res = await fetch(`/api/novels/${novel.id}/chapters`, {
+      const res = await fetch('/api/generations', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chapterNumber: chapterNum, confirmOverwrite: needsConfirmation }),
+        body: JSON.stringify({
+          novelId: novel.id,
+          chapterNumber: chapterNum,
+          confirmOverwrite: needsConfirmation,
+        }),
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
@@ -294,9 +315,19 @@ export default function WritingWorkspace({
     },
     onSuccess: (data: any) => {
       setReadingGeneration(true);
-      toast.success('Chapter generation queued');
-      if (data?.jobId) watch(data.jobId);
-      else pollForChapter();
+      toast.success('Chapter generation queued', {
+        description: 'It runs in the background — you can navigate anywhere in NovelForge.',
+      });
+      if (data?.generation) {
+        generation?.trackGeneration(data.generation);
+      } else if (data?.jobId) {
+        // Older payload shape: make the global provider discover it.
+        window.dispatchEvent(
+          new CustomEvent('novelforge:generation-started', {
+            detail: { id: data.jobId, novelId: novel.id, chapterNumber: chapterNum, status: 'QUEUED' },
+          }),
+        );
+      }
     },
     onError: (e: any) => {
       if (e?.message !== 'cancelled') toast.error(e.message);
@@ -350,34 +381,23 @@ export default function WritingWorkspace({
     },
   });
 
-  const { job: generationJob, watch } = useJobWatcher({
-    onComplete: () => {
-      toast.success('Chapter ready');
-      router.refresh();
-    },
-    onFail: (job) => { setReadingGeneration(false); toast.error(`Generation failed: ${job.error || 'unknown error'}`); },
-  });
-  // The durable job row is the truth: the button stays busy while it runs, even
-  // across a page refresh.
-  const isWritingJob = generationJob?.status === 'queued' || generationJob?.status === 'processing';
-
-  function pollForChapter() {
-    let tries = 0;
-    const tick = setInterval(async () => {
-      tries++;
-      const res = await fetch(`/api/novels/${novel.id}/chapters?chapterNumber=${chapterNum}`);
-      if (res.ok) {
-        const data = await res.json();
-        const found = Array.isArray(data) ? data.find((c: any) => c.chapterNumber === chapterNum) : null;
-        if (found && found.status !== 'queued') {
-          clearInterval(tick);
-          router.refresh();
-          return;
-        }
-      }
-      if (tries > 60) clearInterval(tick);
-    }, 1500);
-  }
+  // The global provider owns the SSE subscriptions, so this chapter's status
+  // is restored after a refresh or a trip to another page. Background work is
+  // never tied to this component's lifetime.
+  const chapterGeneration = (generation?.generations || [])
+    .filter(
+      (g: any) =>
+        (chapter?.id && g.chapterId === chapter.id) ||
+        (!chapter?.id && g.chapterNumber === chapterNum),
+    )
+    .sort((a: any, b: any) => {
+      const aActive = a.status === 'QUEUED' || a.status === 'PROCESSING' ? 0 : 1;
+      const bActive = b.status === 'QUEUED' || b.status === 'PROCESSING' ? 0 : 1;
+      if (aActive !== bActive) return aActive - bActive;
+      return String(b.createdAt || '').localeCompare(String(a.createdAt || ''));
+    })[0];
+  const isWritingJob =
+    chapterGeneration?.status === 'QUEUED' || chapterGeneration?.status === 'PROCESSING';
 
   const autoStarted = useRef(false);
   useEffect(() => {
@@ -413,6 +433,11 @@ export default function WritingWorkspace({
           >
             {n.status === 'locked' ? <Lock className="w-3 h-3 inline -mt-0.5 mr-1" /> : null}
             {String(n.chapterNumber).padStart(2, '0')}
+            {n.generationStatus && n.generationStatus !== 'NOT_STARTED' && (
+              <span className="block text-[8px] tracking-wider opacity-80 leading-tight" title={`Generation: ${generationStatusLabel(n.generationStatus)}`}>
+                {generationStatusLabel(n.generationStatus)}
+              </span>
+            )}
           </LinkNext>
         ))}
       </div>
@@ -589,14 +614,74 @@ export default function WritingWorkspace({
               </div>
             )}
 
-            {(readingGeneration || isWritingJob) ? (
+            {(readingGeneration ||
+              isWritingJob ||
+              ((chapterGeneration?.status === 'FAILED' || chapterGeneration?.status === 'CANCELLED') &&
+                !chapter?.plainText)) ? (
               <section className="surface p-6 md:p-10" aria-label="Chapter generation">
-                <div className="flex items-center gap-2 text-sm text-muted-foreground mb-6" role="status">
-                  {isWritingJob ? <><Loader2 className="w-4 h-4 animate-spin" /> Writing your chapter…</> : 'Chapter complete'}
+                <div className="flex items-center justify-between gap-2 mb-2" role="status">
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                    {isWritingJob ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        {chapterGeneration?.currentStageLabel || 'Preparing chapter…'}
+                      </>
+                    ) : (
+                      'Chapter complete'
+                    )}
+                  </div>
+                  <GenerationStatusBadge status={chapterGeneration?.status} />
                 </div>
-                <div className="whitespace-pre-wrap font-serif text-lg leading-relaxed">
-                  {isWritingJob ? (generationJob?.result?.partialText || 'Preparing your story context…') : chapter?.plainText || generationJob?.result?.partialText || 'Loading your saved chapter…'}
-                </div>
+                {isWritingJob && (
+                  <div className="mt-3 mb-5">
+                    {/* Indeterminate: providers expose no real percentage progress. */}
+                    <div className="h-1.5 rounded-full bg-white/5 overflow-hidden" role="progressbar" aria-valuetext={chapterGeneration?.currentStageLabel || 'Generating'}>
+                      <div className="h-full w-1/3 bg-gradient-to-r from-indigo-500 to-violet-500 animate-pulse" />
+                    </div>
+                    <p className="text-[11px] text-muted-foreground mt-2">
+                      Generation continues in the background. You can navigate anywhere in NovelForge.
+                    </p>
+                    {chapterGeneration && (
+                      <button
+                        type="button"
+                        onClick={() => void generation?.cancelGeneration(chapterGeneration.id)}
+                        className="btn-outline text-xs px-2.5 py-1 mt-3"
+                      >
+                        <X className="w-3 h-3" /> Cancel generation
+                      </button>
+                    )}
+                  </div>
+                )}
+                {chapterGeneration?.status === 'FAILED' && !isWritingJob && !chapter?.plainText ? (
+                  <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-4">
+                    <p className="text-sm text-destructive flex items-center gap-2">
+                      <AlertTriangle className="w-4 h-4" /> Generation failed
+                    </p>
+                    <p className="text-xs text-muted-foreground mt-2">
+                      {chapterGeneration.errorMessage || 'The AI provider could not generate this chapter.'}
+                    </p>
+                    <button
+                      className="btn-outline text-xs px-3 py-1.5 mt-4"
+                      onClick={() => void generation?.retryGeneration(chapterGeneration.id)}
+                    >
+                      <RefreshCw className="w-3 h-3" /> Retry generation
+                    </button>
+                  </div>
+                ) : chapterGeneration?.status === 'CANCELLED' && !isWritingJob && !chapter?.plainText ? (
+                  <div className="rounded-lg border border-border p-4">
+                    <p className="text-sm">Generation was cancelled.</p>
+                    <p className="text-xs text-muted-foreground mt-2">No existing content was changed.</p>
+                    <button className="btn-outline text-xs px-3 py-1.5 mt-4" onClick={() => generateChapter.mutate()}>
+                      <Sparkles className="w-3 h-3" /> Generate chapter
+                    </button>
+                  </div>
+                ) : (
+                  <div className="whitespace-pre-wrap font-serif text-lg leading-relaxed">
+                    {isWritingJob
+                      ? chapterGeneration?.partialText || 'Preparing your story context…'
+                      : chapter?.plainText || chapterGeneration?.partialText || 'Loading your saved chapter…'}
+                  </div>
+                )}
                 {!isWritingJob && chapter && (
                   <div className="flex flex-wrap gap-3 mt-8 border-t border-border pt-6">
                     <button className="btn-outline" onClick={() => { setReadingGeneration(false); editor?.commands.setContent(initialContent); }}>Open in editor</button>
@@ -618,7 +703,7 @@ export default function WritingWorkspace({
                 </p>
                 <button className="btn-primary" onClick={() => generateChapter.mutate()} disabled={generateChapter.isPending || isWritingJob || isLocked}>
                   {(generateChapter.isPending || isWritingJob) ? (
-                    <><Loader2 className="w-4 h-4 animate-spin" /> {isWritingJob ? `Writing… ${generationJob?.progress ? `${generationJob.progress}%` : ''}` : 'Generating…'}</>
+                    <><Loader2 className="w-4 h-4 animate-spin" /> {isWritingJob ? (chapterGeneration?.currentStageLabel || 'Generating…') : 'Generating…'}</>
                   ) : (
                     <><Sparkles className="w-4 h-4" /> Generate Chapter {chapterNum}</>
                   )}

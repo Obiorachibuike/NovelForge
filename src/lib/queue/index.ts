@@ -1,24 +1,38 @@
 import { getDb } from '@/lib/db';
 import { nanoid } from 'nanoid';
 import type { GenerationTask } from '@/types';
+import {
+  GenerationEventType,
+  GenerationStage,
+  toPublicStatus,
+  stageLabel,
+  type GenerationJobRow,
+} from '@/lib/jobs/job-types';
+import {
+  queueTransport,
+  CHAPTER_GENERATION_QUEUE,
+  chapterQueueInfo,
+  workerConcurrency,
+  type QueueTransport,
+} from '@/lib/jobs/queues';
+import { safePublishGenerationEvent } from '@/lib/jobs/events';
+import { safeNotifyGenerationEvent } from '@/lib/jobs/notifications';
+import { sendChapterGeneration } from '@/lib/jobs/boss';
 import 'server-only';
 
 /**
  * Durable job queue.
  *
- * Every job is a row in `generation_jobs`; Redis/BullMQ (when configured) only
- * carries the *wake-up* for a job id, so a Redis flush can never lose work — the
- * row remains claimable by the recovery sweep.
+ * Every job is a row in `generation_jobs`, and that row is the source of truth.
+ * pg-boss (PostgreSQL) delivers a wake-up containing only the job id; the
+ * worker claims the row with a compare-and-set UPDATE before running it. This
+ * means:
  *
- * Guarantees:
- *  - Idempotency: `idempotencyKey` is enforced by a partial unique index over
- *    active jobs (`ux_jobs_active_idempotency`), so concurrent duplicate
- *    requests cannot both enqueue.
- *  - Single execution: `runJob` claims a job with a compare-and-set UPDATE and
- *    only runs the handler when that UPDATE changed a row.
- *  - Retries: failed attempts are rescheduled with exponential backoff in
- *    `scheduledAt` until `maxAttempts` is reached.
- *  - Recovery: `recoverStaleJobs` requeues jobs whose worker died mid-flight.
+ *  - a lost or duplicated pg-boss message can never execute a generation twice;
+ *  - a pg-boss outage can never lose work (the database sweep re-queues it);
+ *  - progress, retries and history survive process/browser restarts.
+ *
+ * SQLite development/test runs use the same row-based queue without pg-boss.
  */
 
 export type JobStatus = 'queued' | 'processing' | 'awaiting_review' | 'completed' | 'failed' | 'cancelled';
@@ -53,6 +67,7 @@ const PERMANENT_ERROR_PATTERNS = [
   /previous chapter must be approved/i,
   /chapter has author edits/i,
   /job was cancelled/i,
+  /generation was cancelled/i,
   /chapter was approved while generation/i,
   /chapter was edited while generation/i,
   /daily ai token limit/i,
@@ -91,35 +106,8 @@ export function classifyJobError(err: unknown): { message: string; retryable: bo
   };
 }
 
-export interface JobRecord {
-  id: string;
-  userId: string;
-  novelId: string;
-  chapterId?: string | null;
+export interface JobRecord extends GenerationJobRow {
   taskType: string;
-  payload: string;
-  status: JobStatus;
-  result: string | null;
-  error: string | null;
-  errorCode?: string | null;
-  retryable?: number | null;
-  attempts: number;
-  /** Hosted-inference provenance (which model was asked for, which one answered). */
-  requestedModel?: string | null;
-  actualModel?: string | null;
-  provider?: string | null;
-  fallbackCount?: number | null;
-  durationMs?: number | null;
-  maxAttempts: number;
-  idempotencyKey: string | null;
-  startedAt: string | null;
-  completedAt: string | null;
-  createdAt: string;
-  updatedAt: string;
-  claimedAt?: string | null;
-  claimedBy?: string | null;
-  scheduledAt?: string | null;
-  progress?: number | null;
 }
 
 export interface JobHandlerContext {
@@ -127,10 +115,21 @@ export interface JobHandlerContext {
   payload: Record<string, unknown>;
   novelId: string;
   userId: string;
-  /** Persists 0-100 progress so the status endpoint can report it. */
+  chapterId?: string | null;
+  /**
+   * Persists a real generation stage and publishes `generation_progress`.
+   * The UI only ever shows stages actually reached by the worker.
+   */
+  setStage: (stage: GenerationStage | string, data?: Record<string, unknown>) => void;
+  /**
+   * Legacy numeric progress for non-chapter jobs. Chapter generation does not
+   * fabricate percentages (see `progressPercentage` staying NULL).
+   */
   setProgress: (percent: number) => void;
   /** True if the job was cancelled while running. */
   isCancelled: () => boolean;
+  /** Aborted as soon as the job is cancelled, so provider calls can stop. */
+  signal: AbortSignal;
 }
 
 type JobHandler = (job: JobHandlerContext) => Promise<unknown>;
@@ -145,21 +144,22 @@ export function hasHandler(taskType: string): boolean {
   return handlers.has(taskType);
 }
 
-/** True when the deployment is configured to dispatch through Redis/BullMQ. */
-export function queueDriver(): 'redis' | 'inprocess' {
-  return process.env.QUEUE_PROVIDER === 'redis' && !!process.env.REDIS_URL ? 'redis' : 'inprocess';
+/** The active queue transport. `pgboss` in PostgreSQL deployments. */
+export function queueDriver(): QueueTransport {
+  return queueTransport();
 }
 
 export function queueInfo() {
-  const driver = queueDriver();
+  const transport = queueTransport();
   return {
-    driver,
-    // The BullMQ path is only honest about what it is: a wake-up channel over a
-    // durable SQLite row.
-    redisConfigured: !!process.env.REDIS_URL,
-    note: driver === 'redis'
-      ? 'BullMQ delivers job wake-ups; job state itself is persisted in the database.'
-      : 'Jobs run in-process and are persisted in the database; a separate worker (npm run worker) drains them.',
+    driver: transport,
+    transport,
+    pgBoss: transport === 'pgboss',
+    /** Kept for API consumers that predate pg-boss; Redis is never used. */
+    redisConfigured: false,
+    queue: CHAPTER_GENERATION_QUEUE,
+    concurrency: workerConcurrency(),
+    note: chapterQueueInfo().note,
   };
 }
 
@@ -170,11 +170,79 @@ function envInt(name: string, fallback: number) {
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
 }
 
+/** True when this process may optimistically run a queued job itself. */
+function mayRunInProcess(): boolean {
+  if (process.env.QUEUE_NO_INPROCESS) return false;
+  // Never inside the Next.js production runtime: generation must survive an
+  // application restart, so a dedicated worker owns execution there.
+  if (process.env.NODE_ENV === 'production') return false;
+  return queueTransport() === 'database';
+}
+
+function updateChapterGenerationStatus(
+  chapterId: string | null | undefined,
+  status: string,
+  options: { clearStage?: boolean } = {},
+) {
+  if (!chapterId) return;
+  try {
+    getDb()
+      .prepare('UPDATE chapters SET generationStatus=?, updatedAt=? WHERE id=?')
+      .run(status, nowIso(), chapterId);
+  } catch (err) {
+    // A chapter can legitimately disappear between queueing and execution.
+    console.warn('[queue] could not update chapter generation status', chapterId, err);
+  }
+}
+
+function emitLifecycle(
+  job: Pick<JobRecord, 'id' | 'userId' | 'novelId' | 'chapterId' | 'taskType' | 'attempts'>,
+  type: string,
+  extra: {
+    stage?: string | null;
+    message?: string | null;
+    data?: Record<string, unknown>;
+    notify?: boolean;
+  } = {},
+) {
+  safePublishGenerationEvent({
+    jobId: job.id,
+    userId: job.userId,
+    novelId: job.novelId,
+    chapterId: job.chapterId ?? null,
+    type,
+    status: type === GenerationEventType.QUEUED
+      ? 'QUEUED'
+      : type === GenerationEventType.STARTED
+        ? 'PROCESSING'
+        : type === GenerationEventType.COMPLETED
+          ? 'COMPLETED'
+          : type === GenerationEventType.FAILED
+            ? 'FAILED'
+            : type === GenerationEventType.CANCELLED
+              ? 'CANCELLED'
+              : 'PROCESSING',
+    stage: extra.stage ?? null,
+    data: {
+      ...(extra.stage ? { stage: extra.stage, stageLabel: stageLabel(extra.stage) } : {}),
+      ...(extra.message ? { message: extra.message } : {}),
+      ...(extra.data ?? {}),
+    },
+  });
+  if (extra.notify) {
+    safeNotifyGenerationEvent(job as JobRecord, type, {
+      stage: extra.stage ?? null,
+      error: extra.message ?? null,
+    });
+  }
+}
+
 export interface EnqueueOptions extends GenerationTask {
   chapterId?: string | null;
   maxAttempts?: number;
   /** Milliseconds to wait before the job may first be claimed. */
   delayMs?: number;
+  priority?: number;
 }
 
 export async function enqueue(task: EnqueueOptions): Promise<string> {
@@ -191,17 +259,18 @@ export async function enqueue(task: EnqueueOptions): Promise<string> {
 
   try {
     db.prepare(
-      `INSERT INTO generation_jobs (id,userId,novelId,chapterId,taskType,payload,status,attempts,maxAttempts,idempotencyKey,createdAt,updatedAt,scheduledAt,progress,retryable)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)`,
+      `INSERT INTO generation_jobs (id,userId,novelId,chapterId,taskType,payload,status,attempts,maxAttempts,idempotencyKey,createdAt,updatedAt,scheduledAt,progress,retryable,priority)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       id, task.userId, task.novelId, task.chapterId || null, task.type, JSON.stringify(task.payload ?? {}),
       'queued', 0, task.maxAttempts ?? 3, task.idempotencyKey || null, now, now,
-      task.delayMs ? new Date(Date.now() + task.delayMs).toISOString() : now, 0,
+      task.delayMs ? new Date(Date.now() + task.delayMs).toISOString() : now, 0, 1,
+      task.priority ?? 0,
     );
   } catch (err) {
     // Partial unique index violation: another request enqueued the same work
     // between our SELECT and INSERT.
-    if (task.idempotencyKey && String(err).includes('UNIQUE')) {
+    if (task.idempotencyKey && /UNIQUE|duplicate key/i.test(String(err))) {
       const existing = db.prepare(
         `SELECT id FROM generation_jobs WHERE idempotencyKey = ? AND status IN ('queued','processing')`,
       ).get(task.idempotencyKey) as { id: string } | undefined;
@@ -210,21 +279,53 @@ export async function enqueue(task: EnqueueOptions): Promise<string> {
     throw err;
   }
 
-  if (queueDriver() === 'redis') {
-    const { publishJob } = await import('./bullmq');
-    try {
-      await publishJob(id);
-    } catch (err) {
-      // The row is durable and the recovery sweep will pick it up; surface the
-      // problem loudly rather than pretending the job was dispatched.
-      console.error('[queue] BullMQ publish failed; job remains queued in the database:', err);
-    }
-  } else if (!process.env.QUEUE_NO_INPROCESS) {
-    setImmediate(() => {
-      void runJob(id).catch(err => console.error('[queue] job failed', id, err));
+  const inserted = db.prepare('SELECT * FROM generation_jobs WHERE id=?').get(id) as JobRecord;
+  if (task.type === 'chapter') {
+    updateChapterGenerationStatus(task.chapterId, 'QUEUED');
+    emitLifecycle(inserted, GenerationEventType.QUEUED, {
+      data: { chapterNumber: (task.payload as any)?.chapterNumber ?? null },
     });
   }
+
+  await dispatch(id, { delayMs: task.delayMs, priority: task.priority });
   return id;
+}
+
+/** Wakes the pg-boss worker, or runs in-process in SQLite development/test. */
+async function dispatch(id: string, options: { delayMs?: number; priority?: number } = {}) {
+  const row = (await getJob(id)) as JobRecord | undefined;
+  if (!row) return;
+
+  if (row.taskType === 'chapter') {
+    // Chapter generation NEVER runs inside the Next.js process: not in a
+    // request, not in a setImmediate, and not on a serverless host. The
+    // dedicated worker owns it in every environment. SQLite development has no
+    // pg-boss, so the worker's database sweep picks the row up.
+    if (queueTransport() === 'pgboss') {
+      try {
+        const queueJobId = await sendChapterGeneration(id, {
+          priority: options.priority ?? row.priority ?? 0,
+          delayMs: options.delayMs,
+        });
+        if (queueJobId) {
+          getDb().prepare('UPDATE generation_jobs SET queueJobId=?, updatedAt=? WHERE id=?')
+            .run(queueJobId, nowIso(), id);
+        }
+      } catch (err) {
+        // Durable row remains queued; the worker's database sweep will run it.
+        console.error('[queue] pg-boss send failed; job remains queued in PostgreSQL:', err);
+      }
+    }
+    return;
+  }
+
+  if (mayRunInProcess()) {
+    if (options.delayMs && options.delayMs > 0) {
+      setTimeout(() => { void runJob(id).catch(e => console.error('[queue] job failed', id, e)); }, options.delayMs);
+    } else {
+      setImmediate(() => { void runJob(id).catch(err => console.error('[queue] job failed', id, err)); });
+    }
+  }
 }
 
 export interface JobRunResult {
@@ -238,7 +339,8 @@ export interface JobRunResult {
  *
  * The claim is a single UPDATE ... WHERE status='queued' guarded by the
  * scheduler time; two racing callers cannot both proceed, which is what makes
- * "generate chapter N" safe against duplicate/burst requests.
+ * "generate chapter N" safe against duplicate/burst requests and pg-boss
+ * redelivery.
  */
 export async function runJob(id: string, workerId = `${process.pid}`): Promise<JobRunResult> {
   const db = getDb();
@@ -246,11 +348,12 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
   const claim = db.prepare(
     `UPDATE generation_jobs
         SET status='processing', attempts=attempts+1, claimedAt=?, claimedBy=?,
-            startedAt=COALESCE(startedAt,?), updatedAt=?
+            startedAt=COALESCE(startedAt,?), updatedAt=?, progressPercentage=NULL,
+            currentStage=?, stageUpdatedAt=?, lastHeartbeatAt=?
       WHERE id=?
         AND status='queued'
         AND (scheduledAt IS NULL OR scheduledAt <= ?)`,
-  ).run(now, workerId, now, now, id, now);
+  ).run(now, workerId, now, now, GenerationStage.PREPARING_CHAPTER, now, now, id, now);
 
   if (claim.changes === 0) {
     const row = db.prepare('SELECT status FROM generation_jobs WHERE id=?').get(id) as { status: JobStatus } | undefined;
@@ -262,22 +365,101 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
   if (!handler) {
     db.prepare(`UPDATE generation_jobs SET status='failed', error=?, errorCode='no_handler', retryable=0, completedAt=?, updatedAt=? WHERE id=?`)
       .run(`No handler registered for task type ${job.taskType}`, nowIso(), nowIso(), id);
+    if (job.taskType === 'chapter') {
+      updateChapterGenerationStatus(job.chapterId, 'FAILED');
+      emitLifecycle(job, GenerationEventType.FAILED, {
+        message: `No handler registered for task type ${job.taskType}`,
+        notify: true,
+      });
+    }
     return { id, status: 'failed', reason: 'no handler' };
   }
 
+  // Cancellation is observed by polling the durable row; this also aborts the
+  // in-flight provider request when the provider supports an AbortSignal.
+  const controller = new AbortController();
+  let cancelled = false;
+  const cancelledError = () => Object.assign(new Error('Generation was cancelled.'), { retryable: false, code: 'cancelled' });
   const checkCancelled = () => {
-    const row = db.prepare('SELECT status FROM generation_jobs WHERE id=?').get(id) as { status: JobStatus } | undefined;
-    return !row || row.status === 'cancelled';
+    if (cancelled) return true;
+    try {
+      const row = db.prepare('SELECT status FROM generation_jobs WHERE id=?').get(id) as { status: JobStatus } | undefined;
+      return !row || row.status === 'cancelled';
+    } catch {
+      return false;
+    }
   };
+  const cancelPoll = setInterval(() => {
+    if (checkCancelled()) {
+      cancelled = true;
+      if (!controller.signal.aborted) controller.abort(cancelledError());
+    }
+  }, Math.max(500, envInt('GENERATION_CANCEL_POLL_MS', 1500)));
+  if (typeof cancelPoll.unref === 'function') cancelPoll.unref();
+
+  // A chapter generation can legitimately take many minutes. Without a
+  // heartbeat the stale-job recovery would mistake it for a dead worker and
+  // start a second execution. The heartbeat is independent of provider output.
+  const heartbeat = setInterval(() => {
+    const stamp = nowIso();
+    try {
+      db.prepare(
+        "UPDATE generation_jobs SET lastHeartbeatAt=?, updatedAt=? WHERE id=? AND status='processing'",
+      ).run(stamp, stamp, id);
+    } catch (err) {
+      console.error('[queue] could not record heartbeat', id, err);
+    }
+  }, Math.max(5_000, envInt('GENERATION_HEARTBEAT_MS', 20_000)));
+  if (typeof heartbeat.unref === 'function') heartbeat.unref();
+
+  if (job.taskType === 'chapter') {
+    updateChapterGenerationStatus(job.chapterId, 'PROCESSING');
+    emitLifecycle(job, GenerationEventType.STARTED, {
+      stage: GenerationStage.PREPARING_CHAPTER,
+      notify: true,
+    });
+  }
 
   try {
     const payload = job.payload ? JSON.parse(job.payload) : {};
     const result = await handler({
-      id, payload, novelId: job.novelId, userId: job.userId,
+      id,
+      payload,
+      novelId: job.novelId,
+      userId: job.userId,
+      chapterId: job.chapterId ?? null,
       isCancelled: checkCancelled,
+      signal: controller.signal,
+      setStage: (stage, data) => {
+        const stamp = nowIso();
+        try {
+          db.prepare(
+            `UPDATE generation_jobs
+                SET currentStage=?, stageUpdatedAt=?, lastHeartbeatAt=?, updatedAt=?
+              WHERE id=? AND status='processing'`,
+          ).run(stage, stamp, stamp, stamp, id);
+        } catch (err) {
+          console.error('[queue] could not persist generation stage', stage, err);
+        }
+        if (job.taskType === 'chapter') {
+          safePublishGenerationEvent({
+            jobId: job.id,
+            userId: job.userId,
+            novelId: job.novelId,
+            chapterId: job.chapterId ?? null,
+            type: GenerationEventType.PROGRESS,
+            status: 'PROCESSING',
+            stage,
+            data: { stage, stageLabel: stageLabel(stage), ...(data ?? {}) },
+          });
+        }
+      },
       setProgress: percent => {
+        // Chapter progress is stage-based and deliberately indeterminate.
+        if (job.taskType === 'chapter') return;
         const value = Math.max(0, Math.min(100, Math.round(percent)));
-        db.prepare(`UPDATE generation_jobs SET progress=?, updatedAt=? WHERE id=? AND status='processing'`).run(value, nowIso(), id);
+        db.prepare(`UPDATE generation_jobs SET progress=?, progressPercentage=?, updatedAt=? WHERE id=? AND status='processing'`)
+          .run(value, value, nowIso(), id);
       },
     });
     const finished = nowIso();
@@ -286,15 +468,48 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
       : 'completed';
     const completeUpdate = db.prepare(
       `UPDATE generation_jobs
-          SET status=?, result=?, error=NULL, errorCode=NULL, completedAt=?, updatedAt=?, claimedAt=NULL, claimedBy=NULL, progress=100
+          SET status=?, result=?, error=NULL, errorCode=NULL, completedAt=?, updatedAt=?, claimedAt=NULL, claimedBy=NULL,
+              progress=?, progressPercentage=?, currentStage=?, stageUpdatedAt=?
+              , lastHeartbeatAt=?
         WHERE id=? AND status='processing'`,
-    ).run(targetStatus, JSON.stringify(result ?? null), finished, finished, id);
+    ).run(
+      targetStatus,
+      JSON.stringify(result ?? null),
+      finished,
+      finished,
+      100,
+      job.taskType === 'chapter' ? null : 100,
+      GenerationStage.COMPLETED,
+      finished,
+      finished,
+      id,
+    );
     if (completeUpdate.changes === 0) {
       return { id, status: 'cancelled', reason: 'cancelled while processing' };
     }
+    if (job.taskType === 'chapter') {
+      // The chapter row may have been created *by* the handler, in which case
+      // the job row (and its chapterId) was updated during execution.
+      const fresh = db.prepare('SELECT chapterId FROM generation_jobs WHERE id=?').get(id) as
+        | { chapterId: string | null }
+        | undefined;
+      const completedJob = {
+        ...job,
+        chapterId: (result as any)?.chapterId ?? fresh?.chapterId ?? job.chapterId ?? null,
+      };
+      updateChapterGenerationStatus(completedJob.chapterId, 'COMPLETED');
+      emitLifecycle(completedJob, GenerationEventType.COMPLETED, {
+        stage: GenerationStage.COMPLETED,
+        notify: true,
+        data: {
+          chapterId: completedJob.chapterId,
+          chapterNumber: (result as any)?.chapterNumber ?? (job.payload ? JSON.parse(job.payload).chapterNumber : null),
+        },
+      });
+    }
     return { id, status: targetStatus };
   } catch (err) {
-    if (checkCancelled()) {
+    if (checkCancelled() || controller.signal.aborted) {
       db.prepare(`UPDATE generation_jobs SET claimedAt=NULL, claimedBy=NULL, updatedAt=? WHERE id=?`).run(nowIso(), id);
       return { id, status: 'cancelled', reason: 'cancelled' };
     }
@@ -305,24 +520,39 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
     if (!classified.retryable || attempts >= maxAttempts) {
       db.prepare(
         `UPDATE generation_jobs
-            SET status='failed', error=?, errorCode=?, retryable=?, completedAt=?, updatedAt=?, claimedAt=NULL, claimedBy=NULL
+            SET status='failed', error=?, errorCode=?, retryable=?, completedAt=?, updatedAt=?, claimedAt=NULL, claimedBy=NULL,
+                progressPercentage=NULL
           WHERE id=? AND status != 'cancelled'`,
       ).run(classified.message, classified.code, classified.retryable ? 1 : 0, finished, finished, id);
+      if (job.taskType === 'chapter') {
+        updateChapterGenerationStatus(job.chapterId, 'FAILED');
+        emitLifecycle(job, GenerationEventType.FAILED, {
+          message: classified.message,
+          notify: true,
+          data: { errorCode: classified.code, retryable: classified.retryable },
+        });
+      }
       return { id, status: 'failed', reason: classified.message };
     }
     const backoffMs = Math.min(60_000, 2000 * 2 ** (attempts - 1));
     db.prepare(
       `UPDATE generation_jobs
-          SET status='queued', error=?, errorCode=?, retryable=1, scheduledAt=?, updatedAt=?, claimedAt=NULL, claimedBy=NULL
+          SET status='queued', error=?, errorCode=?, retryable=1, scheduledAt=?, updatedAt=?, claimedAt=NULL, claimedBy=NULL,
+              progressPercentage=NULL, currentStage=NULL
         WHERE id=? AND status != 'cancelled'`,
     ).run(classified.message, classified.code, new Date(Date.now() + backoffMs).toISOString(), finished, id);
-    if (queueDriver() === 'redis') {
-      const { publishJob } = await import('./bullmq');
-      await publishJob(id, backoffMs).catch(e => console.error('[queue] retry publish failed', id, e));
-    } else if (!process.env.QUEUE_NO_INPROCESS) {
-      setTimeout(() => { void runJob(id).catch(e => console.error('[queue] retry failed', id, e)); }, backoffMs);
+    if (job.taskType === 'chapter') {
+      updateChapterGenerationStatus(job.chapterId, 'QUEUED');
+      emitLifecycle(job, GenerationEventType.QUEUED, {
+        message: classified.message,
+        data: { retryAt: new Date(Date.now() + backoffMs).toISOString(), attempt: attempts },
+      });
     }
+    await dispatch(id, { delayMs: backoffMs, priority: job.priority ?? 0 });
     return { id, status: 'queued', reason: classified.message };
+  } finally {
+    clearInterval(cancelPoll);
+    clearInterval(heartbeat);
   }
 }
 
@@ -337,19 +567,36 @@ export async function recoverStaleJobs({ limit = 20, staleMs }: { limit?: number
   const cutoff = new Date(Date.now() - threshold).toISOString();
 
   const stale = db.prepare(
-    `UPDATE generation_jobs
-        SET status='queued', claimedAt=NULL, claimedBy=NULL, scheduledAt=?, updatedAt=?,
-            error=COALESCE(error, 'Recovered from an interrupted worker')
-      WHERE status='processing' AND (claimedAt IS NULL OR claimedAt < ?)`,
-  ).run(nowIso(), nowIso(), cutoff);
+    `SELECT id,userId,novelId,chapterId,taskType,attempts FROM generation_jobs
+      WHERE status='processing'
+        AND (COALESCE(lastHeartbeatAt, claimedAt) IS NULL OR COALESCE(lastHeartbeatAt, claimedAt) < ?)`,
+  ).all(cutoff) as Pick<JobRecord, 'id' | 'userId' | 'novelId' | 'chapterId' | 'taskType' | 'attempts'>[];
+
+  for (const job of stale) {
+    db.prepare(
+      `UPDATE generation_jobs
+          SET status='queued', claimedAt=NULL, claimedBy=NULL, scheduledAt=?, updatedAt=?,
+              error=COALESCE(error, 'Recovered from an interrupted worker'),
+              currentStage=NULL, progressPercentage=NULL
+        WHERE id=? AND status='processing'`,
+    ).run(nowIso(), nowIso(), job.id);
+    if (job.taskType === 'chapter') {
+      updateChapterGenerationStatus(job.chapterId, 'QUEUED');
+      emitLifecycle(job as JobRecord, GenerationEventType.QUEUED, {
+        message: 'Worker restart detected — generation re-queued.',
+        data: { recovered: true },
+      });
+      await dispatch(job.id);
+    }
+  }
 
   const due = db.prepare(
     `SELECT id FROM generation_jobs
       WHERE status='queued' AND (scheduledAt IS NULL OR scheduledAt <= ?)
-      ORDER BY createdAt ASC LIMIT ?`,
+      ORDER BY priority DESC, createdAt ASC LIMIT ?`,
   ).all(nowIso(), limit) as { id: string }[];
 
-  return { recovered: stale.changes, due: due.map(d => d.id) };
+  return { recovered: stale.length, due: due.map(d => d.id) };
 }
 
 /** Claims and runs up to `limit` due jobs (used by the worker loop and tests). */
@@ -377,40 +624,89 @@ export async function listUserJobs(userId: string, { limit = 20 } = {}) {
     .all(userId, limit) as JobRecord[];
 }
 
+/** Counts active chapter generations; used to enforce per-user/novel limits. */
+export function countActiveChapterJobs(filter: { userId?: string; novelId?: string; excludeChapterId?: string | null }) {
+  const db = getDb();
+  const clauses = [`taskType='chapter'`, `status IN ('queued','processing')`];
+  const args: unknown[] = [];
+  if (filter.userId) { clauses.push('userId=?'); args.push(filter.userId); }
+  if (filter.novelId) { clauses.push('novelId=?'); args.push(filter.novelId); }
+  if (filter.excludeChapterId) { clauses.push('(chapterId IS NULL OR chapterId != ?)'); args.push(filter.excludeChapterId); }
+  const row = db.prepare(`SELECT COUNT(*) AS total FROM generation_jobs WHERE ${clauses.join(' AND ')}`)
+    .get(...args) as { total: number } | undefined;
+  return Number(row?.total ?? 0);
+}
+
 /**
  * Marks a queued or processing job as cancelled. Returns false when it has
  * already finished (completed, failed, or cancelled).
+ *
+ * Cancellation is cooperative: the worker observes the status (and aborts the
+ * provider request). Existing chapter content is never touched.
  */
 export function cancelJob(id: string): boolean {
   const db = getDb();
+  const now = nowIso();
+  const job = db.prepare('SELECT * FROM generation_jobs WHERE id=?').get(id) as JobRecord | undefined;
+  if (!job) return false;
   const res = db.prepare(
     `UPDATE generation_jobs
-        SET status='cancelled', updatedAt=?, completedAt=COALESCE(completedAt, ?), claimedAt=NULL, claimedBy=NULL
+        SET status='cancelled', updatedAt=?, completedAt=COALESCE(completedAt, ?), claimedAt=NULL, claimedBy=NULL,
+            cancelRequestedAt=?, progressPercentage=NULL
       WHERE id=? AND status IN ('queued','processing','awaiting_review')`,
-  ).run(nowIso(), nowIso(), id);
-  return res.changes > 0;
+  ).run(now, now, now, id);
+  if (res.changes === 0) return false;
+
+  if (job.taskType === 'chapter') {
+    updateChapterGenerationStatus(job.chapterId, 'CANCELLED');
+    emitLifecycle(job, GenerationEventType.CANCELLED, {
+      notify: true,
+      message: 'Generation cancelled. Existing chapter content was preserved.',
+    });
+  }
+  return true;
 }
 
 /**
  * Re-queues a failed or cancelled job so the user can retry it safely.
+ * Retrying never duplicates a chapter: the worker checks whether the chapter
+ * was already completed by another attempt before writing.
  */
-export async function retryJob(id: string): Promise<boolean> {
+export async function retryJob(id: string, options: { priority?: number } = {}): Promise<boolean> {
   const db = getDb();
   const now = nowIso();
+  const job = db.prepare('SELECT * FROM generation_jobs WHERE id=?').get(id) as JobRecord | undefined;
+  if (!job) return false;
+
+  // A newer attempt may already be running for this chapter. Re-queueing the
+  // old row would violate the active-idempotency index and could write the
+  // chapter twice, so the retry is refused instead.
+  if (job.idempotencyKey) {
+    const conflict = db
+      .prepare(
+        `SELECT id FROM generation_jobs
+          WHERE idempotencyKey=? AND id!=? AND status IN ('queued','processing') LIMIT 1`,
+      )
+      .get(job.idempotencyKey, id) as { id: string } | undefined;
+    if (conflict) return false;
+  }
+
   const res = db.prepare(
     `UPDATE generation_jobs
         SET status='queued', attempts=0, error=NULL, errorCode=NULL, retryable=1,
-            scheduledAt=?, completedAt=NULL, claimedAt=NULL, claimedBy=NULL, progress=0, updatedAt=?
+            scheduledAt=?, completedAt=NULL, claimedAt=NULL, claimedBy=NULL, progress=0,
+            progressPercentage=NULL, currentStage=NULL, cancelRequestedAt=NULL, updatedAt=?
       WHERE id=? AND status IN ('failed','cancelled')`,
   ).run(now, now, id);
   if (res.changes === 0) return false;
 
-  if (queueDriver() === 'redis') {
-    const { publishJob } = await import('./bullmq');
-    await publishJob(id).catch(e => console.error('[queue] retry publish failed', id, e));
-  } else if (!process.env.QUEUE_NO_INPROCESS) {
-    setImmediate(() => { void runJob(id).catch(e => console.error('[queue] retry failed', id, e)); });
+  if (job.taskType === 'chapter') {
+    updateChapterGenerationStatus(job.chapterId, 'QUEUED');
+    emitLifecycle({ ...job, attempts: 0 }, GenerationEventType.QUEUED, {
+      data: { manualRetry: true },
+    });
   }
+  await dispatch(id, { priority: options.priority ?? job.priority ?? 0 });
   return true;
 }
 
@@ -422,7 +718,12 @@ export function serializeJob(job: JobRecord) {
     chapterId: job.chapterId ?? null,
     taskType: job.taskType,
     status: job.status,
+    publicStatus: toPublicStatus(job.status),
     progress: job.progress ?? 0,
+    progressPercentage: job.progressPercentage ?? null,
+    indeterminate: job.taskType === 'chapter' && !job.completedAt,
+    currentStage: job.currentStage ?? null,
+    currentStageLabel: stageLabel(job.currentStage),
     attempts: job.attempts,
     maxAttempts: job.maxAttempts,
     error: job.error ? sanitizeErrorMessage(job.error) : null,
@@ -433,18 +734,11 @@ export function serializeJob(job: JobRecord) {
     completedAt: job.completedAt,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
+    cancelRequestedAt: job.cancelRequestedAt ?? null,
   };
 }
 
 function safeJson(raw: string | null): unknown {
   if (!raw) return null;
   try { return JSON.parse(raw); } catch { return null; }
-}
-
-/**
- * Startup hook. In database mode it schedules a recovery sweep; in Redis mode
- * the worker module owns the timer (see src/worker/index.ts).
- */
-export async function initQueue() {
-  await recoverStaleJobs();
 }

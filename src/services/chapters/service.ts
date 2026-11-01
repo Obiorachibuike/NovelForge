@@ -5,7 +5,8 @@ import { aiBackend } from '@/lib/ai/config';
 import { aiConfig } from '@/lib/ai/provider';
 import { chapterPrompt, chapterSummaryPrompt } from '@/lib/ai/prompts';
 import { embed, serialize, deserialize } from '@/lib/ai/embeddings';
-import { registerHandler } from '@/lib/queue';
+import { registerHandler, NonRetryableJobError } from '@/lib/queue';
+import { GenerationStage } from '@/lib/jobs/job-types';
 import { retrieveMemories } from '@/services/memory/service';
 import { getSettings } from '@/services/novels/service';
 import { HttpError } from '@/lib/api/http';
@@ -136,6 +137,35 @@ export async function enqueueChapterGeneration(
       'text_provider_unavailable');
   }
 
+  // Duplicate prevention is checked before the concurrency limits so a second
+  // click on the same chapter returns the existing job instead of a 429.
+  const idempotencyKey = `chapter:${novelId}:${chapterNumber}`;
+  const activeSameChapter = db.prepare(
+    `SELECT id FROM generation_jobs WHERE idempotencyKey=? AND status IN ('queued','processing')`,
+  ).get(idempotencyKey) as { id: string } | undefined;
+  if (activeSameChapter) return activeSameChapter.id;
+
+  // Multiple background generations are allowed across novels, but a single
+  // author cannot monopolise the worker pool, and a novel is written one
+  // chapter at a time to protect narrative continuity.
+  const maxPerUser = envPositiveInt('GENERATION_MAX_ACTIVE_PER_USER', 3);
+  const maxPerNovel = envPositiveInt('GENERATION_MAX_ACTIVE_PER_NOVEL', 1);
+  const { countActiveChapterJobs } = await import('@/lib/queue');
+  if (countActiveChapterJobs({ userId, excludeChapterId: existing?.id || null }) >= maxPerUser) {
+    throw new HttpError(
+      429,
+      `You already have ${maxPerUser} chapter generations running in the background. Wait for one to finish or cancel it, then try again.`,
+      'generation_limit_user',
+    );
+  }
+  if (countActiveChapterJobs({ novelId, excludeChapterId: existing?.id || null }) >= maxPerNovel) {
+    throw new HttpError(
+      409,
+      'Another chapter of this novel is already generating. Chapters are written in order so the story stays consistent.',
+      'generation_limit_novel',
+    );
+  }
+
   const { enqueue } = await import('@/lib/queue');
   return enqueue({
     type: 'chapter',
@@ -148,17 +178,25 @@ export async function enqueueChapterGeneration(
       ...(options.textModel ? { textModel: options.textModel } : {}),
       allowFallback: options.allowFallback !== false,
     },
-    idempotencyKey: `chapter:${novelId}:${chapterNumber}`,
+    idempotencyKey,
   });
+}
+
+function envPositiveInt(name: string, fallback: number): number {
+  const raw = Number(process.env[name]);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
 }
 
 interface ChapterJobPayload { chapterNumber: number; confirmOverwrite?: boolean; textModel?: string; allowFallback?: boolean }
 
-export async function runChapterGeneration({ id: jobId, novelId, userId, payload, setProgress, isCancelled }: any) {
+export async function runChapterGeneration({ id: jobId, novelId, userId, payload, setStage, isCancelled, signal }: any) {
   const db = getDb();
   const { chapterNumber, confirmOverwrite, textModel, allowFallback } = payload as ChapterJobPayload;
+  setStage?.(GenerationStage.PREPARING_CHAPTER);
   const novel = db.prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as any;
   if (!novel) throw new Error('Novel not found');
+
+  setStage?.(GenerationStage.LOADING_NOVEL_CONTEXT);
 
   const outline = db.prepare('SELECT * FROM chapter_outlines WHERE novelId=? AND chapterNumber=?').get(novelId, chapterNumber) as any;
   if (!outline) throw new Error(`No outline for chapter ${chapterNumber}`);
@@ -170,13 +208,27 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
     if (!prev || prev.status !== 'approved') throw new Error(`Previous chapter must be approved before generating chapter ${chapterNumber}.`);
   }
 
-  const existing = db.prepare('SELECT id,status,currentVersionId,revision FROM chapters WHERE novelId=? AND chapterNumber=?').get(novelId, chapterNumber) as any;
+  const existing = db.prepare('SELECT id,status,currentVersionId,revision,wordCount,lastJobId,generationStatus FROM chapters WHERE novelId=? AND chapterNumber=?').get(novelId, chapterNumber) as any;
   if (existing && existing.status === 'approved') throw new Error('Chapter is already approved.');
+
+  // Crash-safe resumption: the chapter was already saved by *this* job before
+  // the worker died (or before a follow-up step threw). Re-running the AI would
+  // overwrite identical content and burn tokens, so finish the bookkeeping.
+  if (existing && jobId && existing.lastJobId === jobId && existing.generationStatus === 'COMPLETED') {
+    setStage?.(GenerationStage.COMPLETED);
+    await enqueueMemoryExtraction(userId, novelId, existing.id);
+    return {
+      chapterId: existing.id,
+      chapterNumber,
+      wordCount: existing.wordCount || 0,
+      source: 'recovered',
+      demo: false,
+      alreadyCompleted: true,
+    };
+  }
   if (existing && existing.status === 'edited' && !confirmOverwrite) {
     throw new Error('Chapter has author edits; regeneration needs explicit confirmation.');
   }
-
-  setProgress?.(10);
 
   const settings = getSettings(novelId) as any;
   const wordsPerPage = settings?.wordsPerPage || 320;
@@ -197,7 +249,7 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
     console.warn('[chapters] memory retrieval failed, continuing without it:', err);
   }
 
-  setProgress?.(25);
+  setStage?.(GenerationStage.PREPARING_AI_PROMPT);
 
   const prompt = chapterPrompt(
     { novel, premise: premise ? { shortSynopsis: premise.shortSynopsis } : undefined, characters, memories, previousSummary: previousChapter?.summary } as any,
@@ -207,8 +259,13 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
   );
 
   let lastPreviewAt = 0;
+  let announcedGeneration = false;
   const onText = (text: string) => {
-    if (isCancelled?.()) throw new Error('Job was cancelled before completion.');
+    if (isCancelled?.()) throw new NonRetryableJobError('Generation was cancelled before completion.', 'cancelled');
+    if (!announcedGeneration) {
+      announcedGeneration = true;
+      setStage?.(GenerationStage.GENERATING_CHAPTER_CONTENT);
+    }
     if (!jobId || (text && Date.now() - lastPreviewAt < 350)) return;
     lastPreviewAt = Date.now();
     db.prepare("UPDATE generation_jobs SET result=?, updatedAt=? WHERE id=? AND status='processing'")
@@ -218,10 +275,12 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
   // No silent fabrication: in demo mode the caller gets clearly-labelled demo
   // prose; if a real provider call fails the job fails and retries instead of
   // saving mock text as if it were generated.
+  setStage?.(GenerationStage.CONNECTING_TO_AI_PROVIDER);
   const generated = await generateTextDetailed({
     messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: prompt.user }],
     temperature: 0.85,
     onText,
+    ...(signal ? { signal } : {}),
     maxTokens: Math.min(4500, Math.max(1500, Math.round(outline.targetWords * 1.6))),
     userId, novelId,
     chapterId: existing?.id || undefined,
@@ -236,17 +295,20 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
   if (generated.meta.source === 'demo' || generated.meta.source === 'fallback') {
     throw new Error('A real AI provider is required to generate a chapter. Configure a provider and retry.');
   }
+  setStage?.(GenerationStage.PROCESSING_AI_RESPONSE);
   if (!generated.text.trim()) throw new Error('Provider returned an empty chapter.');
+
+  setStage?.(GenerationStage.VALIDATING_CHAPTER);
 
   // Guard against a job that was cancelled while the AI request was in flight:
   // never overwrite chapter content if the job is no longer processing.
   if (isCancelled?.()) {
-    throw new Error('Job was cancelled before completion.');
+    throw new NonRetryableJobError('Generation was cancelled before completion.', 'cancelled');
   }
   if (jobId) {
     const jobRow = db.prepare('SELECT status FROM generation_jobs WHERE id = ?').get(jobId) as { status: string } | undefined;
     if (jobRow && jobRow.status === 'cancelled') {
-      throw new Error('Job was cancelled before completion.');
+      throw new NonRetryableJobError('Generation was cancelled before completion.', 'cancelled');
     }
     // Also re-check if the author edited or approved the chapter while generation was running.
     const latestChapter = db.prepare('SELECT status FROM chapters WHERE novelId=? AND chapterNumber=?').get(novelId, chapterNumber) as { status: string } | undefined;
@@ -258,8 +320,6 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
     }
   }
 
-  setProgress?.(70);
-
   const text = generated.text.trim();
   const doc = emptyDoc(text);
   const serializedDoc = JSON.stringify(doc);
@@ -269,18 +329,29 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
 
   const now = new Date().toISOString();
   let chapterId = existing?.id as string | undefined;
+  setStage?.(GenerationStage.SAVING_CHAPTER);
   const tx = db.transaction(() => {
+    // Final cancellation check *inside* the transaction: a cancel that landed
+    // while the provider response was being validated must not overwrite prose.
+    if (jobId) {
+      const currentJob = db.prepare('SELECT status FROM generation_jobs WHERE id=?').get(jobId) as
+        | { status: string }
+        | undefined;
+      if (currentJob?.status === 'cancelled' || isCancelled?.()) {
+        throw new NonRetryableJobError('Generation was cancelled before saving.', 'cancelled');
+      }
+    }
     if (chapterId) {
       const nextRevision = ((existing?.revision as number) || 1) + 1;
       db.prepare(
         `UPDATE chapters SET title=?, contentJson=?, generatedContentJson=?, contentHtml=?, plainText=?, wordCount=?, pageCountEst=?,
-                             status='generated', generationSource=?, generatedAt=?, lastJobId=?, revision=?, summary=NULL, updatedAt=? WHERE id=?`,
+                             status='generated', generationStatus='COMPLETED', generationSource=?, generatedAt=?, lastJobId=?, revision=?, summary=NULL, updatedAt=? WHERE id=?`,
       ).run(outline.title, serializedDoc, serializedDoc, html, text, words, pages, generated.meta.source, now, jobId || null, nextRevision, now, chapterId);
     } else {
       chapterId = nanoid();
       db.prepare(
-        `INSERT INTO chapters (id,novelId,outlineId,chapterNumber,title,contentJson,generatedContentJson,contentHtml,plainText,status,wordCount,pageCountEst,generationSource,generatedAt,lastJobId,revision,createdAt,updatedAt)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`,
+        `INSERT INTO chapters (id,novelId,outlineId,chapterNumber,title,contentJson,generatedContentJson,contentHtml,plainText,status,wordCount,pageCountEst,generationSource,generatedAt,lastJobId,revision,generationStatus,createdAt,updatedAt)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,'COMPLETED',?,?)`,
       ).run(chapterId, novelId, outline.id, chapterNumber, outline.title,
         serializedDoc, serializedDoc, html, text, 'generated', words, pages, generated.meta.source, now, jobId || null, now, now);
     }
@@ -304,8 +375,6 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
     db.prepare(`UPDATE novels SET updatedAt=? WHERE id=?`).run(now, novelId);
   });
   tx();
-
-  setProgress?.(90);
 
   // Durable follow-up: extraction is its own job so it survives a restart and
   // is retried on failure, instead of being a fire-and-forget setImmediate.
@@ -672,7 +741,7 @@ export async function listChapters(novelId: string) {
 export async function getNavigation(novelId: string): Promise<ChapterNav[]> {
   const db = getDb();
   const outlines = db.prepare(`SELECT chapterNumber, title, summary, targetWords, estimatedPages FROM chapter_outlines WHERE novelId=? ORDER BY chapterNumber`).all(novelId) as any[];
-  const chapters = db.prepare(`SELECT id, chapterNumber, title, status, wordCount, pageCountEst, generationSource FROM chapters WHERE novelId=? ORDER BY chapterNumber`).all(novelId) as any[];
+  const chapters = db.prepare(`SELECT id, chapterNumber, title, status, wordCount, pageCountEst, generationSource, generationStatus FROM chapters WHERE novelId=? ORDER BY chapterNumber`).all(novelId) as any[];
   return computeNavigation(outlines, chapters);
 }
 
