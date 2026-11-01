@@ -21,6 +21,7 @@ import {
 import { cn } from '@/lib/utils/cn';
 import { useOptionalGeneration } from '@/components/generation/GenerationContext';
 import { GenerationStatusBadge, generationStatusLabel } from '@/components/generation/GenerationStatusBadge';
+import { useGenerationStream } from '@/lib/hooks/useGenerationStream';
 import {
   createAutosaveController,
   loadLocalDraft,
@@ -56,6 +57,8 @@ export default function WritingWorkspace({
   const qc = useQueryClient();
   const generation = useOptionalGeneration();
   const [aiState, setAiState] = useState<'idle' | 'thinking' | 'streaming'>('idle');
+  const [aiActionJobId, setAiActionJobId] = useState<string | null>(null);
+  const aiActionRangeRef = useRef<{ from: number; to: number } | null>(null);
   const [selection, setSelection] = useState<string>('');
   const [versions, setVersions] = useState<any[]>(initialVersions);
   const [showCompareRecovery, setShowCompareRecovery] = useState(false);
@@ -334,6 +337,34 @@ export default function WritingWorkspace({
     },
   });
 
+  const handleAiActionTerminal = useCallback((job: any) => {
+    if (job.status === 'COMPLETED' && editor) {
+      const text = String(job.partialText || '').trim();
+      if (text) {
+        const range = aiActionRangeRef.current;
+        if (range && range.to > range.from) {
+          editor.chain().focus().deleteRange(range).insertContent(text).run();
+        } else {
+          editor.chain().focus().insertContentAt(range?.from ?? editor.state.selection.from, text).run();
+        }
+        toast.success('AI edit is ready and has been added to your draft.');
+      } else {
+        toast.error('The AI task completed without returning text.');
+      }
+    } else if (job.status === 'FAILED') {
+      toast.error(job.errorMessage || 'AI editing failed.');
+    } else if (job.status === 'CANCELLED') {
+      toast.message('AI editing was cancelled.');
+    }
+    setAiState('idle');
+    setAiActionJobId(null);
+    aiActionRangeRef.current = null;
+  }, [editor]);
+
+  // This subscription is only a view. The worker continues even if this
+  // editor unmounts; the global generation dock also tracks the same job.
+  useGenerationStream(aiActionJobId, { onTerminal: handleAiActionTerminal });
+
   const approve = useMutation({
     mutationFn: async () => {
       if (!chapter) return;
@@ -358,25 +389,30 @@ export default function WritingWorkspace({
     mutationFn: async (action: string) => {
       if (!editor || !chapter) return;
       setAiState('thinking');
-      const res = await fetch(`/api/ai/editor-action`, {
+      aiActionRangeRef.current = {
+        from: editor.state.selection.from,
+        to: editor.state.selection.to,
+      };
+      const res = await fetch('/api/ai/editor-action', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, selection, chapterId: chapter.id, before: editor.getText().slice(-800) }),
+        body: JSON.stringify({
+          action,
+          selection,
+          chapterId: chapter.id,
+          before: editor.getText().slice(-800),
+        }),
       });
-      if (!res.ok) throw new Error((await res.json()).error || 'AI action failed');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'AI action failed');
+      if (!data.jobId) throw new Error('The AI editing job was not created.');
+      setAiActionJobId(data.jobId);
       setAiState('streaming');
-      const data = await res.json();
-      // insert or replace
-      const { from, to } = editor.state.selection;
-      if (editor.state.selection.empty) {
-        editor.commands.insertContent(data.text);
-      } else {
-        editor.chain().focus().deleteRange({ from, to }).insertContent(data.text).run();
-      }
-      setAiState('idle');
+      return data;
     },
     onError: (e: any) => {
       setAiState('idle');
+      aiActionRangeRef.current = null;
       toast.error(e.message);
     },
   });
