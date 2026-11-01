@@ -77,7 +77,7 @@ export async function runOutline({ id, novelId, userId, payload, onContent }: an
     fallback,
     ...(payload?.textModel ? { model: payload.textModel } : {}),
     allowModelFallback: payload?.allowFallback !== false,
-    onText: (text: string) => {
+    ...(onContent ? { onText: (text: string) => {
       const chunk = text.startsWith(streamedText) ? text.slice(streamedText.length) : text;
       streamedText = text;
       if (chunk && Date.now() - lastPublishedAt >= 150) {
@@ -85,7 +85,7 @@ export async function runOutline({ id, novelId, userId, payload, onContent }: an
         lastPublishedText = streamedText;
         lastPublishedAt = Date.now();
       }
-    },
+    } } : {}),
   });
   // Never persist demo outline content over a real failure: the fallback
   // outline contains placeholder characters and random word budgets.
