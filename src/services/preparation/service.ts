@@ -69,7 +69,7 @@ export async function runPremise({ id, novelId, userId, payload, onContent }: { 
     fallback,
     ...(payload?.textModel ? { model: payload.textModel } : {}),
     allowModelFallback: payload?.allowFallback !== false,
-    onText: text => {
+    ...(onContent ? { onText: (text: string) => {
       const chunk = text.startsWith(streamedText) ? text.slice(streamedText.length) : text;
       streamedText = text;
       if (chunk && Date.now() - lastPublishedAt >= 150) {
@@ -77,7 +77,7 @@ export async function runPremise({ id, novelId, userId, payload, onContent }: { 
         lastPublishedText = streamedText;
         lastPublishedAt = Date.now();
       }
-    },
+    } } : {}),
   });
   // In real (non-demo) mode a provider failure must not be written into the
   // author's Story Bible as if it were generated content.
