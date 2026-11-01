@@ -54,6 +54,7 @@ export function useGenerationStream(
 ) {
   const [connected, setConnected] = useState(false);
   const [generation, setGeneration] = useState<GenerationView | null>(null);
+  const generationRef = useRef<GenerationView | null>(null);
   const callbacks = useRef(handlers);
   callbacks.current = handlers;
   const terminalFired = useRef(false);
@@ -71,6 +72,7 @@ export function useGenerationStream(
         ...(data as GenerationView),
         id: jobId,
       };
+      generationRef.current = next;
       setGeneration(next);
       callbacks.current.onUpdate?.(next);
       if (isTerminalStatus(next.status) && !terminalFired.current) {
@@ -110,14 +112,13 @@ export function useGenerationStream(
           try {
             const parsed = JSON.parse((event as MessageEvent).data);
             if (type === 'generation_content') {
-              setGeneration(current => {
-                const base = current?.partialText ?? '';
-                const next = { ...(current ?? { id: jobId, status: 'PROCESSING' as const }), ...parsed,
-                  id: jobId,
-                  partialText: typeof parsed.partialText === 'string' ? parsed.partialText : base + (parsed.chunk ?? '') };
-                callbacks.current.onUpdate?.(next as GenerationView);
-                return next as GenerationView;
-              });
+              const base = generationRef.current?.partialText ?? '';
+              const next = { ...(generationRef.current ?? { id: jobId, status: 'PROCESSING' as const }), ...parsed,
+                id: jobId,
+                partialText: typeof parsed.partialText === 'string' ? parsed.partialText : base + (parsed.chunk ?? '') } as GenerationView;
+              generationRef.current = next;
+              setGeneration(next);
+              callbacks.current.onUpdate?.(next);
             } else apply(parsed);
           } catch {
             /* ignore malformed frame */
