@@ -29,6 +29,7 @@ import '@/services/images/service';
 import '@/services/preparation/service';
 import '@/services/outlines/service';
 import '@/services/chapters/service';
+import '@/services/generation/universal-text';
 import '@/services/consistency/service';
 import '@/services/exports/service';
 
