@@ -5,6 +5,7 @@ import { enforceRateLimit } from '@/lib/security/rate-limit';
 import { enforceAiRateLimit } from '@/lib/ai/rate-limit';
 import { assertRegisteredModelOrAgnes } from '@/lib/ai/model-selection';
 import { enqueue } from '@/lib/queue';
+import '@/services/generation/universal-text';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
