@@ -10,7 +10,7 @@ const modeGuidance: Record<HumanizationMode,string> = {
   natural:'Improve literary flow, sentence variety, dialogue, transitions, and pacing while preserving the author’s voice and all meaning.',
   deep:'Substantially refine imagery, scene immersion, dialogue, and rhythm without changing facts, characterization, or plot outcomes.',
 };
-export interface HumanizationInput { text:string; modelId?:string; mode?:HumanizationMode; instructions?:string; context?:string; }
+export interface HumanizationInput { text:string; modelId?:string; mode?:HumanizationMode; instructions?:string; context?:string; signal?:AbortSignal; onText?:(text:string)=>void; }
 export async function humanizePassage(input:HumanizationInput) {
   const modelId=input.modelId || process.env.HUMANIZATION_MODEL || process.env.HUGGINGFACE_HUMANIZER_MODEL || DEFAULT_HUMANIZER_MODEL;
   if (!getHumanizerModel(modelId)) throw new Error('Selected model is not in the humanization registry.');
@@ -27,13 +27,17 @@ export async function humanizePassage(input:HumanizationInput) {
       prompt,
       maxNewTokens: Math.min(4096, Math.max(256, Math.ceil(input.text.length*1.8))),
       temperature: 0.35,
+      signal: input.signal,
+      onText: input.onText,
     });
     completion = { text: res.text, provider: res.provider, usage: res.usage, latencyMs: res.latencyMs };
   } else {
     if (!process.env.HF_TOKEN) throw new Error('No AI provider configured; set AGNES_API_KEY or HF_TOKEN for humanization.');
     const res=await hfChatCompletion({modelId, provider:process.env.HUMANIZATION_PROVIDER || 'auto', maxNewTokens:Math.min(4096,Math.max(256,Math.ceil(input.text.length*1.8))),temperature:0.35,
       systemPrompt,
-      prompt});
+      prompt,
+      signal: input.signal,
+      onText: input.onText});
     completion = { text: res.text, provider: res.provider, usage: res.usage, latencyMs: res.latencyMs };
   }
   const text=completion.text.trim();
