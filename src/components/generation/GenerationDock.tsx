@@ -319,7 +319,7 @@ function JobRow({
         </>
       )}
 
-      {active && job.partialText && (
+      {job.partialText && (
         <div className="mt-2 max-h-24 overflow-hidden rounded-md border border-border/60 bg-black/10 p-2 text-[11px] leading-relaxed text-muted-foreground whitespace-pre-wrap" aria-live="polite">
           {job.partialText.slice(-700)}
         </div>
