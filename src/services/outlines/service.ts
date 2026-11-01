@@ -59,7 +59,7 @@ export async function getNovelContext(novelId: string) {
   return { novel, premise, characters };
 }
 
-export async function runOutline({ id, novelId, userId, payload }: any) {
+export async function runOutline({ id, novelId, userId, payload, onContent }: any) {
   const db = getDb();
   const ctx = await getNovelContext(novelId);
   if (!ctx.novel) throw new Error('Novel not found');
@@ -67,6 +67,8 @@ export async function runOutline({ id, novelId, userId, payload }: any) {
 
   const fallback = buildDemoOutline(ctx.novel);
   const prompt = outlinePrompt(ctx as any, structureType);
+  let streamedText = '';
+  let lastPublishedAt = 0;
   const { data: result, meta } = await generateStructuredDetailed(outlineShape, {
     messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: prompt.user }],
     temperature: 0.6, userId, novelId, taskType: 'outline',
@@ -74,6 +76,14 @@ export async function runOutline({ id, novelId, userId, payload }: any) {
     fallback,
     ...(payload?.textModel ? { model: payload.textModel } : {}),
     allowModelFallback: payload?.allowFallback !== false,
+    onText: (text: string) => {
+      const chunk = text.startsWith(streamedText) ? text.slice(streamedText.length) : text;
+      streamedText = text;
+      if (chunk && Date.now() - lastPublishedAt >= 150) {
+        onContent?.(chunk, streamedText);
+        lastPublishedAt = Date.now();
+      }
+    },
   });
   // Never persist demo outline content over a real failure: the fallback
   // outline contains placeholder characters and random word budgets.
@@ -115,7 +125,8 @@ export async function runOutline({ id, novelId, userId, payload }: any) {
   });
   tx();
 
-  return { chapters: result.chapters.length, acts: result.acts.length, source: meta.source };
+  if (streamedText) onContent?.('', streamedText);
+  return { chapters: result.chapters.length, acts: result.acts.length, source: meta.source, partialText: streamedText };
 }
 
 registerHandler('outline', runOutline);
