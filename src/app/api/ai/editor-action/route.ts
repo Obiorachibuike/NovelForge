@@ -23,7 +23,8 @@ export const POST = apiHandler(async (req: Request) => {
   enforceAiRateLimit('text', user.id);
   const db = getDb();
   const active = db.prepare("SELECT COUNT(*) AS total FROM generation_jobs WHERE userId=? AND status IN ('queued','processing')").get(user.id) as { total: number };
-  const maxActive = Math.max(1, Number(process.env.GENERATION_MAX_ACTIVE_PER_USER || 3));
+  const configuredLimit = Number(process.env.GENERATION_MAX_ACTIVE_PER_USER || 3);
+  const maxActive = Number.isFinite(configuredLimit) && configuredLimit > 0 ? Math.floor(configuredLimit) : 3;
   if (Number(active.total) >= maxActive) {
     throw new HttpError(429, `You already have ${maxActive} active AI generations. Wait for one to finish or cancel it before starting another.`, 'generation_concurrency_limit');
   }
