@@ -59,6 +59,7 @@ export async function runPremise({ id, novelId, userId, payload, onContent }: { 
   const prompt = premisePrompt(novel);
   const fallback = makeDemoPremise(novel);
   let streamedText = '';
+  let lastPublishedText = '';
   let lastPublishedAt = 0;
   const { data: p, meta } = await generateStructuredDetailed(premiseShape, {
     messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: prompt.user }],
@@ -73,6 +74,7 @@ export async function runPremise({ id, novelId, userId, payload, onContent }: { 
       streamedText = text;
       if (chunk && Date.now() - lastPublishedAt >= 150) {
         onContent?.(chunk, streamedText);
+        lastPublishedText = streamedText;
         lastPublishedAt = Date.now();
       }
     },
@@ -143,7 +145,10 @@ export async function runPremise({ id, novelId, userId, payload, onContent }: { 
   Promise.all([embed(p.logline, userId, novelId), embed(p.shortSynopsis, userId, novelId)])
     .catch(err => console.warn('premise embedding failed', err));
 
-  if (streamedText) onContent?.('', streamedText);
+  if (streamedText !== lastPublishedText) {
+    const finalChunk = streamedText.startsWith(lastPublishedText) ? streamedText.slice(lastPublishedText.length) : streamedText;
+    if (finalChunk) onContent?.(finalChunk, streamedText);
+  }
   return { source: meta.source, partialText: streamedText };
 }
 
