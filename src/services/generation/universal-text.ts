@@ -19,6 +19,11 @@ export interface UniversalTextPayload {
   targetType?: string;
   targetId?: string;
   title?: string;
+  operation?: 'humanize';
+  modelId?: string;
+  mode?: 'light' | 'natural' | 'deep';
+  instructions?: string;
+  context?: string;
 }
 
 export async function runUniversalTextGeneration(job: JobHandlerContext) {
@@ -31,70 +36,98 @@ export async function runUniversalTextGeneration(job: JobHandlerContext) {
   let accumulated = '';
   let lastPublishedText = '';
   let lastPublishedAt = 0;
-  const result = await generateTextDetailed({
-    messages: [
-      ...(payload.systemPrompt ? [{ role: 'system' as const, content: payload.systemPrompt }] : []),
-      { role: 'user' as const, content: payload.prompt },
-    ],
-    ...(payload.model ? { model: payload.model } : {}),
-    maxTokens: payload.maxTokens ?? 2048,
-    temperature: payload.temperature ?? 0.8,
-    userId: job.userId,
-    novelId: job.novelId,
-    jobId: job.id,
-    taskType: payload.generationType,
-    signal: job.signal,
-    allowFallbackOnError: false,
-    allowModelFallback: payload.allowModelFallback !== false,
-    onText: (snapshot: string) => {
-      if (job.signal.aborted || !snapshot) return;
-      let chunk = '';
-      if (snapshot.startsWith(accumulated)) {
-        chunk = snapshot.slice(accumulated.length);
-      } else {
-        // A provider fallback can start a fresh response after an upstream
-        // failure. Replace the visible partial rather than duplicating text.
-        accumulated = '';
-        chunk = snapshot;
-      }
-      if (!chunk) return;
-      accumulated = snapshot;
-      // Batch rapid provider deltas into modest durable chunks. The final
-      // flush below guarantees that no text is lost between batches.
-      if (Date.now() - lastPublishedAt >= 150) {
-        job.onContent(chunk, accumulated);
-        lastPublishedText = accumulated;
-        lastPublishedAt = Date.now();
-      }
-    },
-  });
+  const emitSnapshot = (snapshot: string) => {
+    if (job.signal.aborted || !snapshot) return;
+    let chunk = '';
+    if (snapshot.startsWith(accumulated)) {
+      chunk = snapshot.slice(accumulated.length);
+    } else {
+      // A provider fallback can start a fresh response after an upstream
+      // failure. Replace the visible partial rather than duplicating text.
+      accumulated = '';
+      lastPublishedText = '';
+      chunk = snapshot;
+    }
+    if (!chunk) return;
+    accumulated = snapshot;
+    // Batch rapid provider deltas into modest durable chunks. The final
+    // flush below guarantees that no text is lost between batches.
+    if (Date.now() - lastPublishedAt >= 150) {
+      job.onContent(chunk, accumulated);
+      lastPublishedText = accumulated;
+      lastPublishedAt = Date.now();
+    }
+  };
+
+  let finalText: string;
+  let provider: string | undefined;
+  let model: string | undefined;
+  let humanizationWarnings: string[] = [];
+  if (payload.operation === 'humanize') {
+    const { humanizePassage } = await import('@/services/humanization/service');
+    const humanized = await humanizePassage({
+      text: payload.prompt,
+      modelId: payload.modelId,
+      mode: payload.mode,
+      instructions: payload.instructions,
+      context: payload.context,
+      signal: job.signal,
+      onText: emitSnapshot,
+    });
+    finalText = humanized.revised;
+    provider = humanized.provider;
+    model = humanized.modelId;
+    humanizationWarnings = humanized.warnings;
+  } else {
+    const result = await generateTextDetailed({
+      messages: [
+        ...(payload.systemPrompt ? [{ role: 'system' as const, content: payload.systemPrompt }] : []),
+        { role: 'user' as const, content: payload.prompt },
+      ],
+      ...(payload.model ? { model: payload.model } : {}),
+      maxTokens: payload.maxTokens ?? 2048,
+      temperature: payload.temperature ?? 0.8,
+      userId: job.userId,
+      novelId: job.novelId,
+      jobId: job.id,
+      taskType: payload.generationType,
+      signal: job.signal,
+      allowFallbackOnError: false,
+      allowModelFallback: payload.allowModelFallback !== false,
+      onText: emitSnapshot,
+    });
+    if (result.meta.source === 'demo' || result.meta.source === 'fallback') {
+      throw new Error('No usable AI provider is configured for this generation. Configure Agnes AI, Hugging Face, or OpenAI and retry.');
+    }
+    finalText = result.text;
+    provider = result.meta.provider ?? result.meta.source;
+    model = result.meta.actualModel ?? result.meta.model;
+  }
 
   if (job.signal.aborted || job.isCancelled()) {
     throw Object.assign(new Error('Generation was cancelled.'), { retryable: false, code: 'cancelled' });
   }
-  if (result.meta.source === 'demo' || result.meta.source === 'fallback') {
-    throw new Error('No usable AI provider is configured for this generation. Configure Agnes AI, Hugging Face, or OpenAI and retry.');
-  }
-  if (!result.text.trim()) throw new Error('The AI provider returned an empty response.');
-  if (result.text !== lastPublishedText) {
-    const finalChunk = result.text.startsWith(lastPublishedText)
-      ? result.text.slice(lastPublishedText.length)
-      : result.text;
-    if (finalChunk) job.onContent(finalChunk, result.text);
+  if (!finalText.trim()) throw new Error('The AI provider returned an empty response.');
+  if (finalText !== lastPublishedText) {
+    const finalChunk = finalText.startsWith(lastPublishedText)
+      ? finalText.slice(lastPublishedText.length)
+      : finalText;
+    if (finalChunk) job.onContent(finalChunk, finalText);
   }
 
   // Keep partialText in the final result so the existing generation serializer
   // can restore the content after refresh, even after the job is complete.
   return {
-    partialText: result.text,
-    text: result.text,
+    partialText: finalText,
+    text: finalText,
     generationType: payload.generationType,
     targetType: payload.targetType ?? null,
     targetId: payload.targetId ?? null,
     title: payload.title ?? null,
-    provider: result.meta.provider ?? result.meta.source,
-    model: result.meta.actualModel ?? result.meta.model,
-    usedFallback: result.meta.usedFallback,
+    provider,
+    model,
+    warnings: humanizationWarnings,
+    usedFallback: false,
   };
 }
 
