@@ -51,10 +51,10 @@ export const POST = apiHandler(async (req: Request) => {
   // --- UNIVERSAL ENGINE DISPATCH ---
   // If the request matches the Universal Generation schema, route it there.
   // Otherwise, fall back to the legacy chapter generation logic.
-  const rawBody = await req.json();
+  const rawBody = await readJsonBody(req, value => z.record(z.unknown()).parse(value));
   
   // Check if it's a Universal Generation Request (has generationType)
-  if (rawBody.generationType && GenerationRegistry.has(rawBody.generationType as GenerationType)) {
+  if (typeof rawBody.generationType === 'string' && GenerationRegistry.hasHandler(rawBody.generationType as GenerationType)) {
     const body = GenerationRequestSchema.parse(rawBody);
     
     // Project ownership check
@@ -86,7 +86,7 @@ export const POST = apiHandler(async (req: Request) => {
   }
 
   // --- LEGACY DISPATCH (Fallback) ---
-  const body = await readJsonBody(req, v => createSchema.parse(v));
+  const body = createSchema.parse(rawBody);
   await requireNovel(body.novelId, user.id);
 
   if (body.chapterId) {

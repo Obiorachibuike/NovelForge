@@ -97,7 +97,7 @@ export async function enqueueChapterGeneration(
 ) {
   // --- UNIVERSAL ENGINE DISPATCH ---
   // If the Universal Engine is registered for 'chapter', route it there.
-  if (GenerationRegistry.has('chapter')) {
+  if (GenerationRegistry.hasHandler('chapter')) {
     const req: GenerationRequest = {
       generationType: 'chapter',
       projectId: novelId,
@@ -435,7 +435,7 @@ registerHandler('chapter', runChapterGeneration);
 /** Queues story-memory extraction for an approved chapter (durable + retried). */
 export async function enqueueMemoryExtraction(userId: string, novelId: string, chapterId: string) {
   // --- UNIVERSAL ENGINE DISPATCH ---
-  if (GenerationRegistry.has('memory')) {
+  if (GenerationRegistry.hasHandler('memory')) {
     const req: GenerationRequest = {
       generationType: 'memory',
       projectId: novelId,
@@ -562,7 +562,7 @@ export async function summarizeChapter(chapterId: string, userId: string, novelI
   if (!chapter) throw new HttpError(404, 'Chapter not found', 'chapter_not_found');
   
   // --- UNIVERSAL ENGINE DISPATCH ---
-  if (GenerationRegistry.has('memory')) {
+  if (GenerationRegistry.hasHandler('memory')) {
     const req: GenerationRequest = {
       generationType: 'memory',
       projectId: novelId || chapter.novelId,
