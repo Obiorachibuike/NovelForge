@@ -1,9 +1,6 @@
 # Universal background AI generation and streaming
 
-NovelForge generates chapters asynchronously. The request that starts a
-generation returns in milliseconds; the actual AI work happens in a dedicated
-Node.js worker, and the author can navigate anywhere in the application — or
-close the tab — while it runs.
+NovelForge runs AI content generation asynchronously. Chapter generation and universal text-generation jobs share the durable PostgreSQL job store, dedicated Node.js worker, event log and SSE transport. Text providers stream real output incrementally; each chunk is persisted and replayable. Authors can navigate anywhere in the application — or close the tab — while jobs continue.
 
 No Redis, Django, Celery, RabbitMQ or Procrastinate is involved.
 
