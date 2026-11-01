@@ -10,6 +10,11 @@ import { coverPrompt } from '@/lib/ai/prompts';
 import { buildCoverPrompt, DEFAULT_COVER_STYLE } from '@/lib/ai/prompt-builder';
 import 'server-only';
 
+// --- UNIVERSAL GENERATION ENGINE INTEGRATION ---
+import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
+import { GenerationRequest, GenerationType } from '@/lib/ai/generation/generation-types';
+import { GenerationRegistry } from '@/lib/ai/generation/generation-registry';
+
 export interface GeneratedCover {
   imageId: string;
   url: string;
@@ -41,6 +46,54 @@ export async function generateCovers(
   variants = 2,
   options: { imageModel?: string; allowFallback?: boolean } = {},
 ): Promise<GeneratedCover[]> {
+  // --- UNIVERSAL ENGINE DISPATCH ---
+  // If the Universal Engine is registered for 'image', route it there.
+  if (GenerationRegistry.has('image')) {
+    const results: GeneratedCover[] = [];
+    for (let i = 0; i < variants; i++) {
+      const req: GenerationRequest = {
+        generationType: 'image',
+        projectId: novelId,
+        targetId: undefined,
+        userId,
+        prompt: promptOverride || buildNovelCoverPrompt(db, novel),
+        context: {
+          variant: i,
+          width: 768,
+          height: 1024,
+          ...(options.imageModel ? { model: options.imageModel } : {}),
+          allowFallback: options.allowFallback !== false,
+        },
+        stream: false,
+        metadata: {},
+        idempotencyKey: `cover:${novelId}:${i}`,
+      };
+
+      // The UniversalGenerationService handles creation and queuing via pg-boss
+      const jobId = await UniversalGenerationService.createJob(req);
+      
+      // Fetch the serialized job for response
+      const { getGenerationForUser, serializeGeneration } = await import('@/lib/jobs/generation-jobs');
+      const job = getGenerationForUser(userId, jobId);
+      if (job) {
+        // For the API response, we return the job ID and status. The actual image URL
+        // will be available once the job completes (via the event stream or polling).
+        // In this migration step, we return a placeholder GeneratedCover structure
+        // that will be populated by the UniversalGenerationService.
+        results.push({
+          imageId: jobId,
+          url: `/api/generations/${jobId}/events`, // Placeholder for SSE stream
+          provider: 'universal-engine',
+          source: 'universal-engine',
+          actualModel: job.requestedModel ?? null,
+          requestedModel: job.requestedModel ?? null,
+        });
+      }
+    }
+    return results;
+  }
+
+  // --- LEGACY DISPATCH (Fallback) ---
   const db = getDb();
   const novel = db.prepare('SELECT * FROM novels WHERE id = ? AND userId = ?').get(novelId, userId) as any;
   if (!novel) throw new HttpError(404, 'Novel not found', 'novel_not_found');
@@ -198,18 +251,7 @@ export function buildNovelCoverPrompt(db: any, novel: any): string {
   return prompt;
 }
 
-function saveImageRecord(db: any, { userId, novelId, url, key, width, height, prompt, provider, format, bytes, model, requestedModel }:{
-  userId:string; novelId:string; url:string; key:string; width:number; height:number; prompt:string; provider:string; format?:string; bytes?:number;
-  model?: string | null; requestedModel?: string | null;
-}) {
-  const id = nanoid();
-  const now = new Date().toISOString();
-  db.prepare(
-    `INSERT INTO image_assets (id,novelId,userId,kind,provider,storageKey,url,width,height,prompt,isPrimary,meta,format,bytes,model,requestedModel,createdAt,updatedAt)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-  ).run(id, novelId, userId, 'cover', provider, key, url, width, height, prompt, 0, null, format || null, bytes ?? null, model ?? null, requestedModel ?? null, now, now);
-  return id;
-}
+function saveImageRecord(db: any, { userId, novelId, url, key, width, height, prompt, provider, format, bytes, model, requestedModel }:{\n  userId:string; novelId:string; url:string; key:string; width:number; height:number; prompt:string; provider:string; format?:string; bytes?:number;\n  model?: string | null; requestedModel?: string | null;\n}) {\n  const id = nanoid();\n  const now = new Date().toISOString();\n  db.prepare(\n    `INSERT INTO image_assets (id,novelId,userId,kind,provider,storageKey,url,width,height,prompt,isPrimary,meta,format,bytes,model,requestedModel,createdAt,updatedAt)\n     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`\n  ).run(id, novelId, userId, 'cover', provider, key, url, width, height, prompt, 0, null, format || null, bytes ?? null, model ?? null, requestedModel ?? null, now, now);\n  return id;\n}
 
 /** Generates a stylized hardcover SVG with title and gradient art. */
 export function makeSvgCover(novel: { title:string; genre?:string; tone?:string }, variant = 0) {
@@ -221,26 +263,26 @@ export function makeSvgCover(novel: { title:string; genre?:string; tone?:string 
   ];
   const p = palettes[variant % palettes.length];
   const titleLines = wrap(novel.title || 'Untitled', 12);
-  const titleSvg = titleLines.map((line, i) => `<text x="50%" y="${340 + i*88}" text-anchor="middle" fill="${p.accent}" font-family="Georgia, 'Playfair Display', serif" font-size="72" font-weight="700">${escapeXml(line)}</text>`).join('');
-  const svg = `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="768" height="1024" viewBox="0 0 768 1024">
+  const titleSvg = titleLines.map((line, i) => `<text x=\"50%\" y=\"${340 + i*88}\" text-anchor=\"middle\" fill=\"${p.accent}\" font-family=\"Georgia, 'Playfair Display', serif\" font-size=\"72\" font-weight=\"700\">${escapeXml(line)}</text>`).join('');
+  const svg = `<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"768\" height=\"1024\" viewBox=\"0 0 768 1024\">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="${p.from}"/>
-      <stop offset="1" stop-color="${p.to}"/>
+    <linearGradient id=\"bg\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\">
+      <stop offset=\"0\" stop-color=\"${p.from}\"/>
+      <stop offset=\"1\" stop-color=\"${p.to}\"/>
     </linearGradient>
-    <radialGradient id="glow" cx="50%" cy="30%" r="70%">
-      <stop offset="0" stop-color="${p.glow}"/>
-      <stop offset="1" stop-color="transparent"/>
+    <radialGradient id=\"glow\" cx=\"50%\" cy=\"30%\" r=\"70%\">
+      <stop offset=\"0\" stop-color=\"${p.glow}\"/>
+      <stop offset=\"1\" stop-color=\"transparent\"/>
     </radialGradient>
   </defs>
-  <rect width="768" height="1024" fill="url(#bg)"/>
-  <rect width="768" height="1024" fill="url(#glow)"/>
-  <rect x="36" y="36" width="696" height="952" fill="none" stroke="${p.accent}" stroke-opacity=".25" stroke-width="2"/>
-  <text x="50%" y="160" text-anchor="middle" fill="${p.accent}" font-family="ui-monospace, Menlo, monospace" font-size="24" letter-spacing="8" opacity=".85">THE</text>
+  <rect width=\"768\" height=\"1024\" fill=\"url(#bg)\"/>
+  <rect width=\"768\" height=\"1024\" fill=\"url(#glow)\"/>
+  <rect x=\"36\" y=\"36\" width=\"696\" height=\"952\" fill=\"none\" stroke=\"${p.accent}\" stroke-opacity=\".25\" stroke-width=\"2\"/>
+  <text x=\"50%\" y=\"160\" text-anchor=\"middle\" fill=\"${p.accent}\" font-family=\"ui-monospace, Menlo, monospace\" font-size=\"24\" letter-spacing=\"8\" opacity=\".85\">THE</text>
   ${titleSvg}
-  <text x="50%" y="${340 + titleLines.length*88 + 20}" text-anchor="middle" fill="${p.accent}" font-size="42" opacity=".7">✦</text>
-  <text x="50%" y="860" text-anchor="middle" fill="${p.accent}" font-family="ui-monospace, Menlo, monospace" font-size="20" letter-spacing="6" opacity=".8">${escapeXml(((novel.genre || 'Fiction') + ' NOVEL').toUpperCase())}</text>
+  <text x=\"50%\" y=\"${340 + titleLines.length*88 + 20}\" text-anchor=\"middle\" fill=\"${p.accent}\" font-size=\"42\" opacity=\".7\">✦</text>
+  <text x=\"50%\" y=\"860\" text-anchor=\"middle\" fill=\"${p.accent}\" font-family=\"ui-monospace, Menlo, monospace\" font-size=\"20\" letter-spacing=\"6\" opacity=\".8\">${escapeXml(((novel.genre || 'Fiction') + ' NOVEL').toUpperCase())}</text>
 </svg>`;
   return Buffer.from(svg);
 }
@@ -262,7 +304,7 @@ function wrap(text: string, width: number) {
 }
 
 function escapeXml(s: string) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;');
 }
 
 export async function listCovers(novelId: string) {

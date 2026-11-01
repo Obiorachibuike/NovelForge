@@ -7,6 +7,11 @@ import { HttpError } from '@/lib/api/http';
 import { z } from 'zod';
 import 'server-only';
 
+// --- UNIVERSAL GENERATION ENGINE INTEGRATION ---
+import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
+import { GenerationRequest, GenerationType } from '@/lib/ai/generation/generation-types';
+import { GenerationRegistry } from '@/lib/ai/generation/generation-registry';
+
 const outlineShape = z.object({
   acts: z.array(z.object({
     actNumber: z.number(),
@@ -39,6 +44,27 @@ export async function enqueueOutline(
   structureType = 'three-act',
   options: { textModel?: string; allowFallback?: boolean } = {},
 ) {
+  // --- UNIVERSAL ENGINE DISPATCH ---
+  if (GenerationRegistry.has('outline')) {
+    const req: GenerationRequest = {
+      generationType: 'outline',
+      projectId: novelId,
+      targetId: undefined,
+      userId,
+      prompt: '',
+      context: {
+        structureType,
+        ...(options.textModel ? { textModel: options.textModel } : {}),
+        allowFallback: options.allowFallback !== false,
+      },
+      stream: false,
+      metadata: {},
+      idempotencyKey: `outline:${novelId}:${structureType}`,
+    };
+    return await UniversalGenerationService.createJob(req);
+  }
+
+  // --- LEGACY DISPATCH (Fallback) ---
   const { enqueue } = await import('@/lib/queue');
   return enqueue({
     type: 'outline', userId, novelId,
@@ -59,6 +85,10 @@ export async function getNovelContext(novelId: string) {
   return { novel, premise, characters };
 }
 
+// --- LEGACY HANDLER ---
+// Kept for backward compatibility during transition. The UniversalGenerationService
+// will route 'outline' to the Universal engine, but we keep this handler registered
+// in case the queue logic falls back.
 export async function runOutline({ id, novelId, userId, payload }: any) {
   const db = getDb();
   const ctx = await getNovelContext(novelId);
@@ -118,6 +148,7 @@ export async function runOutline({ id, novelId, userId, payload }: any) {
   return { chapters: result.chapters.length, acts: result.acts.length, source: meta.source };
 }
 
+// Register legacy handler (fallback)
 registerHandler('outline', runOutline);
 
 export function listOutlines(novelId: string) {
@@ -165,14 +196,14 @@ export async function updateOutline(outlineId: string, novelId: string, userId: 
     // Placeholder order: sets…, outline id, novel id, novels.id, novels.userId.
     db.prepare(
       `UPDATE chapter_outlines SET ${sets.join(',')}
-        WHERE id=? AND novelId=? AND EXISTS(SELECT 1 FROM novels WHERE id=? AND userId=?)`,
+        WHERE id=? AND novelId=? AND EXISTS(SELECT 1 FROM novels WHERE id=? AND userId=?)`
     ).run(...queryVals);
 
     // Keep unapproved chapter titles synchronized with outline edits.
     if (typeof patch.title === 'string' && patch.title.trim()) {
       db.prepare(
         `UPDATE chapters SET title=?, updatedAt=?
-          WHERE novelId=? AND (outlineId=? OR chapterNumber=?) AND status != 'approved'`,
+          WHERE novelId=? AND (outlineId=? OR chapterNumber=?) AND status != 'approved'`
       ).run(patch.title.trim(), now, novelId, outlineId, existing.chapterNumber);
     }
     db.prepare(`UPDATE novels SET updatedAt=? WHERE id=? AND userId=?`).run(now, novelId, userId);
@@ -199,23 +230,19 @@ function buildDemoOutline(novel: any) {
     { actNumber:2, name:'Act II: The Unraveling', description:'Allies and enemies reveal their true shapes; the pact breaks further.', purpose:'Raise stakes and escalate conflicts.', turningPoint:'The archivist\'s secret is exposed.', orderIndex:2 },
     { actNumber:3, name:'Act III: The Choice', description:'The heir must choose between the throne and the kingdom.', purpose:'Climax and resolution.', turningPoint:'The heir refuses the crown.', orderIndex:3 },
   ];
-  const chapters = Array.from({length:total}, (_,i)=>{
-    const variance = 0.75 + Math.random()*0.6;
-    const target = Math.round(avg*variance/100)*100;
-    return {
-      chapterNumber: i+1, title: titles[i % titles.length] + (i>=titles.length?` ${Math.floor(i/titles.length)+1}`:''),
-      summary: `${['Kael returns','Seren discovers','The court tightens','A pact stirs','Allies gather','The truth surfaces','Blood is spilled','A choice is made'][i%8]} in this chapter.`,
-      narrativePurpose: i===0 ? 'Open the novel and establish voice' : i===total-1 ? 'Climax and emotional resolution' : 'Advance plot and reveal character',
-      majorEvents: [`Event ${i+1}A`, `Event ${i+1}B`],
-      charactersInvolved: ['Kael','Seren'],
-      location: ['Border','Glass City','The Archive','The Hollow Road','The Cathedral','The Palace'][i%6],
-      conflict: 'Loyalty vs. truth',
-      emotionalObjective: ['wariness','hope','betrayal','resolve','grief','resolve'][i%6],
-      plotAdvancement: 'Central mystery deepens',
-      foreshadowing: i<total-1 ? 'A hint of what comes next.' : undefined,
-      targetWords: target,
-      estimatedPages: Math.max(1, Math.round(target/320)),
-    };
-  });
+  const chapters = Array.from({length:total}, (_,i)=>({
+    chapterNumber: i+1, title: titles[i % titles.length] + (i>=titles.length?` ${Math.floor(i/titles.length)+1}`:''),
+    summary: `${['Kael returns','Seren discovers','The court tightens','A pact stirs','Allies gather','The truth surfaces','Blood is spilled','A choice is made'][i%8]} in this chapter.`,
+    narrativePurpose: i===0 ? 'Open the novel and establish voice' : i===total-1 ? 'Climax and emotional resolution' : 'Advance plot and reveal character',
+    majorEvents: [`Event ${i+1}A`, `Event ${i+1}B`],
+    charactersInvolved: ['Kael','Seren'],
+    location: ['Border','Glass City','The Archive','The Hollow Road','The Cathedral','The Palace'][i%6],
+    conflict: 'Loyalty vs. truth',
+    emotionalObjective: ['wariness','hope','betrayal','resolve','grief','resolve'][i%6],
+    plotAdvancement: 'Central mystery deepens',
+    foreshadowing: i<total-1 ? 'A hint of what comes next.' : undefined,
+    targetWords: target,
+    estimatedPages: Math.max(1, Math.round(target/320)),
+  }));
   return { acts, chapters };
 }

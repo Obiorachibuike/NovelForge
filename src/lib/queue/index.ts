@@ -20,6 +20,11 @@ import { safeNotifyGenerationEvent } from '@/lib/jobs/notifications';
 import { sendChapterGeneration } from '@/lib/jobs/boss';
 import 'server-only';
 
+// --- UNIVERSAL GENERATION ENGINE INTEGRATION ---
+import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
+import { GenerationRequest, GenerationType } from '@/lib/ai/generation/generation-types';
+import { GenerationRegistry } from '@/lib/ai/generation/generation-registry';
+
 /**
  * Durable job queue.
  *
@@ -246,6 +251,28 @@ export interface EnqueueOptions extends GenerationTask {
 }
 
 export async function enqueue(task: EnqueueOptions): Promise<string> {
+  // --- UNIVERSAL ENGINE DISPATCH ---
+  // If the task type is registered in the Universal Engine, route it there.
+  // Otherwise, fall back to the legacy queue logic.
+  if (GenerationRegistry.has(task.type as GenerationType)) {
+    const req: GenerationRequest = {
+      generationType: task.type as GenerationType,
+      projectId: task.novelId,
+      targetId: task.chapterId || undefined,
+      userId: task.userId,
+      prompt: task.payload?.prompt || '',
+      context: task.payload || {},
+      stream: task.payload?.stream ?? false,
+      metadata: task.payload?.metadata || {},
+      idempotencyKey: task.idempotencyKey,
+    };
+
+    // The UniversalGenerationService handles creation and queuing via pg-boss
+    const jobId = await UniversalGenerationService.createJob(req);
+    return jobId;
+  }
+
+  // --- LEGACY DISPATCH (Fallback) ---
   const db = getDb();
   const now = nowIso();
   const id = nanoid();
@@ -361,6 +388,142 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
   }
 
   const job = db.prepare('SELECT * FROM generation_jobs WHERE id=?').get(id) as JobRecord;
+  
+  // --- UNIVERSAL ENGINE EXECUTION ---
+  // If the task type is registered in the Universal Engine, route it there.
+  // Otherwise, use the legacy handler registry.
+  if (GenerationRegistry.has(job.taskType as GenerationType)) {
+    try {
+      // Map the JobRecord to a Universal GenerationRequest
+      const req: GenerationRequest = {
+        generationType: job.taskType as GenerationType,
+        projectId: job.novelId,
+        targetId: job.chapterId || undefined,
+        userId: job.userId,
+        prompt: '', // Extracted from payload in UniversalGenerationService
+        context: job.payload ? JSON.parse(job.payload) : {},
+        stream: false,
+        metadata: {},
+        idempotencyKey: job.idempotencyKey,
+      };
+
+      // The UniversalGenerationService.executeJob handles the execution and persistence
+      // We pass the JobRecord context to ensure the database row is updated correctly.
+      const context = {
+        id,
+        payload: req.context,
+        novelId: job.novelId,
+        userId: job.userId,
+        chapterId: job.chapterId ?? null,
+        setStage: (stage: GenerationStage | string, data?: Record<string, unknown>) => {
+          const stamp = nowIso();
+          try {
+            db.prepare(
+              `UPDATE generation_jobs
+                  SET currentStage=?, stageUpdatedAt=?, lastHeartbeatAt=?, updatedAt=?
+                WHERE id=? AND status='processing'`,
+            ).run(stage, stamp, stamp, stamp, id);
+          } catch (err) {
+            console.error('[queue] could not persist generation stage', stage, err);
+          }
+          safePublishGenerationEvent({
+            jobId: id,
+            userId: job.userId,
+            novelId: job.novelId,
+            chapterId: job.chapterId ?? null,
+            type: GenerationEventType.PROGRESS,
+            status: 'PROCESSING',
+            stage,
+            data: { stage, stageLabel: stageLabel(stage), ...(data ?? {}) },
+          });
+        },
+        setProgress: (percent: number) => {
+          // Chapter progress is stage-based and deliberately indeterminate.
+          if (job.taskType === 'chapter') return;
+          const value = Math.max(0, Math.min(100, Math.round(percent)));
+          db.prepare(`UPDATE generation_jobs SET progress=?, progressPercentage=?, updatedAt=? WHERE id=? AND status='processing'`)
+            .run(value, value, nowIso(), id);
+        },
+        isCancelled: () => {
+          try {
+            const row = db.prepare('SELECT status FROM generation_jobs WHERE id=?').get(id) as { status: JobStatus } | undefined;
+            return !row || row.status === 'cancelled';
+          } catch {
+            return false;
+          }
+        },
+        signal: new AbortController().signal, // UniversalGenerationService manages its own abort logic
+      };
+
+      // Execute via Universal Engine
+      await UniversalGenerationService.executeJob(req, context);
+      
+      // Finalize job row based on Universal Engine result (handled internally by UniversalGenerationService)
+      // For now, we mark as completed if executeJob succeeds.
+      const finished = nowIso();
+      db.prepare(
+        `UPDATE generation_jobs
+            SET status='completed', completedAt=?, updatedAt=?, claimedAt=NULL, claimedBy=NULL,
+                progress=?, progressPercentage=?, currentStage=?, stageUpdatedAt=?
+                , lastHeartbeatAt=?
+          WHERE id=? AND status='processing'`
+      ).run(finished, finished, 100, job.taskType === 'chapter' ? null : 100, GenerationStage.COMPLETED, finished, finished, id);
+
+      if (job.taskType === 'chapter') {
+        updateChapterGenerationStatus(job.chapterId, 'COMPLETED');
+        emitLifecycle(job, GenerationEventType.COMPLETED, {
+          stage: GenerationStage.COMPLETED,
+          notify: true,
+        });
+      }
+      return { id, status: 'completed' };
+
+    } catch (err) {
+      // Handle Universal Engine errors
+      const classified = classifyJobError(err);
+      const attempts = (db.prepare('SELECT attempts FROM generation_jobs WHERE id=?').get(id) as { attempts: number }).attempts;
+      const maxAttempts = job.maxAttempts || 3;
+      const finished = nowIso();
+      
+      if (!classified.retryable || attempts >= maxAttempts) {
+        db.prepare(
+          `UPDATE generation_jobs
+              SET status='failed', error=?, errorCode=?, retryable=?, completedAt=?, updatedAt=?, claimedAt=NULL, claimedBy=NULL,
+                  progressPercentage=NULL
+            WHERE id=? AND status != 'cancelled'`
+        ).run(classified.message, classified.code, classified.retryable ? 1 : 0, finished, finished, id);
+        if (job.taskType === 'chapter') {
+          updateChapterGenerationStatus(job.chapterId, 'FAILED');
+          emitLifecycle(job, GenerationEventType.FAILED, {
+            message: classified.message,
+            notify: true,
+            data: { errorCode: classified.code, retryable: classified.retryable },
+          });
+        }
+        return { id, status: 'failed', reason: classified.message };
+      }
+      
+      const backoffMs = Math.min(60_000, 2000 * 2 ** (attempts - 1));
+      db.prepare(
+        `UPDATE generation_jobs
+            SET status='queued', error=?, errorCode=?, retryable=1, scheduledAt=?, updatedAt=?, claimedAt=NULL, claimedBy=NULL,
+                progressPercentage=NULL, currentStage=NULL
+          WHERE id=? AND status != 'cancelled'`
+      ).run(classified.message, classified.code, new Date(Date.now() + backoffMs).toISOString(), finished, id);
+      
+      if (job.taskType === 'chapter') {
+        updateChapterGenerationStatus(job.chapterId, 'QUEUED');
+        emitLifecycle(job, GenerationEventType.QUEUED, {
+          message: classified.message,
+          data: { retryAt: new Date(Date.now() + backoffMs).toISOString(), attempt: attempts },
+        });
+      }
+      await dispatch(id, { delayMs: backoffMs, priority: job.priority ?? 0 });
+      return { id, status: 'queued', reason: classified.message };
+    }
+  }
+
+  // --- LEGACY HANDLER EXECUTION (Fallback) ---
   const handler = handlers.get(job.taskType);
   if (!handler) {
     db.prepare(`UPDATE generation_jobs SET status='failed', error=?, errorCode='no_handler', retryable=0, completedAt=?, updatedAt=? WHERE id=?`)
@@ -471,7 +634,7 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
           SET status=?, result=?, error=NULL, errorCode=NULL, completedAt=?, updatedAt=?, claimedAt=NULL, claimedBy=NULL,
               progress=?, progressPercentage=?, currentStage=?, stageUpdatedAt=?
               , lastHeartbeatAt=?
-        WHERE id=? AND status='processing'`,
+        WHERE id=? AND status='processing'`
     ).run(
       targetStatus,
       JSON.stringify(result ?? null),
@@ -522,7 +685,7 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
         `UPDATE generation_jobs
             SET status='failed', error=?, errorCode=?, retryable=?, completedAt=?, updatedAt=?, claimedAt=NULL, claimedBy=NULL,
                 progressPercentage=NULL
-          WHERE id=? AND status != 'cancelled'`,
+          WHERE id=? AND status != 'cancelled'`
       ).run(classified.message, classified.code, classified.retryable ? 1 : 0, finished, finished, id);
       if (job.taskType === 'chapter') {
         updateChapterGenerationStatus(job.chapterId, 'FAILED');
@@ -539,7 +702,7 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
       `UPDATE generation_jobs
           SET status='queued', error=?, errorCode=?, retryable=1, scheduledAt=?, updatedAt=?, claimedAt=NULL, claimedBy=NULL,
               progressPercentage=NULL, currentStage=NULL
-        WHERE id=? AND status != 'cancelled'`,
+        WHERE id=? AND status != 'cancelled'`
     ).run(classified.message, classified.code, new Date(Date.now() + backoffMs).toISOString(), finished, id);
     if (job.taskType === 'chapter') {
       updateChapterGenerationStatus(job.chapterId, 'QUEUED');
@@ -569,7 +732,7 @@ export async function recoverStaleJobs({ limit = 20, staleMs }: { limit?: number
   const stale = db.prepare(
     `SELECT id,userId,novelId,chapterId,taskType,attempts FROM generation_jobs
       WHERE status='processing'
-        AND (COALESCE(lastHeartbeatAt, claimedAt) IS NULL OR COALESCE(lastHeartbeatAt, claimedAt) < ?)`,
+        AND (COALESCE(lastHeartbeatAt, claimedAt) IS NULL OR COALESCE(lastHeartbeatAt, claimedAt) < ?)`
   ).all(cutoff) as Pick<JobRecord, 'id' | 'userId' | 'novelId' | 'chapterId' | 'taskType' | 'attempts'>[];
 
   for (const job of stale) {
@@ -578,7 +741,7 @@ export async function recoverStaleJobs({ limit = 20, staleMs }: { limit?: number
           SET status='queued', claimedAt=NULL, claimedBy=NULL, scheduledAt=?, updatedAt=?,
               error=COALESCE(error, 'Recovered from an interrupted worker'),
               currentStage=NULL, progressPercentage=NULL
-        WHERE id=? AND status='processing'`,
+        WHERE id=? AND status='processing'`
     ).run(nowIso(), nowIso(), job.id);
     if (job.taskType === 'chapter') {
       updateChapterGenerationStatus(job.chapterId, 'QUEUED');
@@ -593,7 +756,7 @@ export async function recoverStaleJobs({ limit = 20, staleMs }: { limit?: number
   const due = db.prepare(
     `SELECT id FROM generation_jobs
       WHERE status='queued' AND (scheduledAt IS NULL OR scheduledAt <= ?)
-      ORDER BY priority DESC, createdAt ASC LIMIT ?`,
+      ORDER BY priority DESC, createdAt ASC LIMIT ?`
   ).all(nowIso(), limit) as { id: string }[];
 
   return { recovered: stale.length, due: due.map(d => d.id) };
@@ -649,11 +812,30 @@ export function cancelJob(id: string): boolean {
   const now = nowIso();
   const job = db.prepare('SELECT * FROM generation_jobs WHERE id=?').get(id) as JobRecord | undefined;
   if (!job) return false;
+  
+  // --- UNIVERSAL ENGINE CANCELLATION ---
+  if (GenerationRegistry.has(job.taskType as GenerationType)) {
+    // The UniversalGenerationService handles cancellation via its own persistence
+    const cancelled = UniversalGenerationService.cancelJob(id);
+    if (cancelled) {
+      if (job.taskType === 'chapter') {
+        updateChapterGenerationStatus(job.chapterId, 'CANCELLED');
+        emitLifecycle(job, GenerationEventType.CANCELLED, {
+          notify: true,
+          message: 'Generation cancelled. Existing chapter content was preserved.',
+        });
+      }
+      return true;
+    }
+    return false;
+  }
+
+  // --- LEGACY CANCELLATION (Fallback) ---
   const res = db.prepare(
     `UPDATE generation_jobs
         SET status='cancelled', updatedAt=?, completedAt=COALESCE(completedAt, ?), claimedAt=NULL, claimedBy=NULL,
             cancelRequestedAt=?, progressPercentage=NULL
-      WHERE id=? AND status IN ('queued','processing','awaiting_review')`,
+      WHERE id=? AND status IN ('queued','processing','awaiting_review')`
   ).run(now, now, now, id);
   if (res.changes === 0) return false;
 
@@ -678,6 +860,23 @@ export async function retryJob(id: string, options: { priority?: number } = {}):
   const job = db.prepare('SELECT * FROM generation_jobs WHERE id=?').get(id) as JobRecord | undefined;
   if (!job) return false;
 
+  // --- UNIVERSAL ENGINE RETRY ---
+  if (GenerationRegistry.has(job.taskType as GenerationType)) {
+    const retried = await UniversalGenerationService.retryJob(id);
+    if (retried) {
+      if (job.taskType === 'chapter') {
+        updateChapterGenerationStatus(job.chapterId, 'QUEUED');
+        emitLifecycle({ ...job, attempts: 0 }, GenerationEventType.QUEUED, {
+          data: { manualRetry: true },
+        });
+      }
+      await dispatch(id, { priority: options.priority ?? job.priority ?? 0 });
+      return true;
+    }
+    return false;
+  }
+
+  // --- LEGACY RETRY (Fallback) ---
   // A newer attempt may already be running for this chapter. Re-queueing the
   // old row would violate the active-idempotency index and could write the
   // chapter twice, so the retry is refused instead.
@@ -685,9 +884,8 @@ export async function retryJob(id: string, options: { priority?: number } = {}):
     const conflict = db
       .prepare(
         `SELECT id FROM generation_jobs
-          WHERE idempotencyKey=? AND id!=? AND status IN ('queued','processing') LIMIT 1`,
-      )
-      .get(job.idempotencyKey, id) as { id: string } | undefined;
+          WHERE idempotencyKey=? AND id!=? AND status IN ('queued','processing') LIMIT 1`
+      ).get(job.idempotencyKey, id) as { id: string } | undefined;
     if (conflict) return false;
   }
 
@@ -696,7 +894,7 @@ export async function retryJob(id: string, options: { priority?: number } = {}):
         SET status='queued', attempts=0, error=NULL, errorCode=NULL, retryable=1,
             scheduledAt=?, completedAt=NULL, claimedAt=NULL, claimedBy=NULL, progress=0,
             progressPercentage=NULL, currentStage=NULL, cancelRequestedAt=NULL, updatedAt=?
-      WHERE id=? AND status IN ('failed','cancelled')`,
+      WHERE id=? AND status IN ('failed','cancelled')`
   ).run(now, now, id);
   if (res.changes === 0) return false;
 
