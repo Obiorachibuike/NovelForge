@@ -36,7 +36,7 @@ npm ci
 cp .env.example .env.local    # defaults to SQLite (file:./prisma/dev.db) — no database server needed
 npm run db:migrate
 npm run dev
-# in a second terminal — required for background chapter generation
+# in a second terminal — required for background AI generation
 npm run worker
 ```
 
@@ -108,9 +108,9 @@ DATABASE_URL="postgresql://user:password@localhost:5432/novelforge" \
   npm run db:migrate:sqlite-to-pg -- --sqlite ./prisma/dev.db
 ```
 
-Run the dedicated background worker (required for background chapter
+Run the dedicated background worker (required for all background AI
 generation; in SQLite development it drains the durable table, in PostgreSQL it
-consumes the pg-boss queue):
+consumes the shared pg-boss queue):
 
 ```bash
 npm run worker
@@ -199,7 +199,7 @@ src/
 | `npm run dev` | Next.js dev server (port 3000, binds 0.0.0.0) |
 | `npm run build` | Production build |
 | `npm run start` | Serve production build |
-| `npm run worker` | Run the dedicated background worker (pg-boss consumer + recovery sweep). Required for chapter generation outside SQLite dev/test. |
+| `npm run worker` | Run the dedicated background worker (pg-boss consumer + recovery sweep). Required for background AI generation outside SQLite dev/test. |
 | `npm run worker:dev` | Same worker under `tsx watch` for local development. |
 | `npm run lint` / `typecheck` | Lint & type check |
 | `npm test` | Run Vitest unit tests |
