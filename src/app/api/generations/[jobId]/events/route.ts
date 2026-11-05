@@ -93,6 +93,8 @@ export async function GET(req: Request, ctx: { params: { jobId: string } }) {
     const generation = getGenerationForUser(user.id, owned.id);
     if (!generation) throw new HttpError(404, 'Generation not found', 'generation_not_found');
 
+    // All generation types publish persisted events; use the same replayable
+    // stream so authentication, connection limits, and reconnects stay consistent.
     const url = new URL(req.url);
     if (!acquireStreamSlot(user.id)) {
       throw new HttpError(429, 'Too many open generation event streams.', 'sse_connection_limit');
