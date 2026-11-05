@@ -6,6 +6,7 @@ import { assertRegisteredModelOrAgnes } from '@/lib/ai/model-selection';
 import {
   createChapterGeneration,
   listGenerations,
+  getGenerationForUser,
   maxActiveGenerationsPerNovel,
   maxActiveGenerationsPerUser,
   serializeGeneration,
@@ -14,7 +15,8 @@ import { z } from 'zod';
 
 // --- UNIVERSAL GENERATION ENGINE INTEGRATION ---
 import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
-import { GenerationRequestSchema, GenerationType } from '@/lib/ai/generation/generation-types';
+import { GenerationType } from '@/lib/ai/generation/generation-types';
+import { validateGenerationInput } from '@/lib/ai/generation/generation-validation';
 import { GenerationRegistry } from '@/lib/ai/generation/generation-registry';
 
 export const dynamic = 'force-dynamic';
@@ -51,22 +53,17 @@ export const POST = apiHandler(async (req: Request) => {
   // --- UNIVERSAL ENGINE DISPATCH ---
   // If the request matches the Universal Generation schema, route it there.
   // Otherwise, fall back to the legacy chapter generation logic.
-  const rawBody = await req.json();
+  const rawBody = await readJsonBody(req, value => z.record(z.unknown()).parse(value));
   
   // Check if it's a Universal Generation Request (has generationType)
-  if (rawBody.generationType && GenerationRegistry.has(rawBody.generationType as GenerationType)) {
-    const body = GenerationRequestSchema.parse(rawBody);
+  if (typeof rawBody.generationType === 'string' && GenerationRegistry.hasHandler(rawBody.generationType as GenerationType)) {
+    const body = validateGenerationInput(rawBody, user.id);
     
     // Project ownership check
-    if (body.projectId) {
-      await requireNovel(body.projectId, user.id);
-    }
+    await requireNovel(body.projectId, user.id);
 
     // Create Universal Job
-    const jobId = await UniversalGenerationService.createJob({
-      ...body,
-      userId: user.id,
-    });
+    const jobId = await UniversalGenerationService.createJob(body);
 
     const job = getGenerationForUser(user.id, jobId);
     if (!job) throw new HttpError(500, 'Job creation failed', 'generation_missing');
@@ -86,7 +83,7 @@ export const POST = apiHandler(async (req: Request) => {
   }
 
   // --- LEGACY DISPATCH (Fallback) ---
-  const body = await readJsonBody(req, v => createSchema.parse(v));
+  const body = createSchema.parse(rawBody);
   await requireNovel(body.novelId, user.id);
 
   if (body.chapterId) {

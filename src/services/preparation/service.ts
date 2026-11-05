@@ -45,7 +45,7 @@ export async function enqueuePrepareNovel(
   options: { textModel?: string; allowFallback?: boolean } = {},
 ) {
   // --- UNIVERSAL ENGINE DISPATCH ---
-  if (GenerationRegistry.has('premise')) {
+  if (GenerationRegistry.hasHandler('premise')) {
     const req: GenerationRequest = {
       generationType: 'premise',
       projectId: novelId,

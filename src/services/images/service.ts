@@ -48,7 +48,7 @@ export async function generateCovers(
 ): Promise<GeneratedCover[]> {
   // --- UNIVERSAL ENGINE DISPATCH ---
   // If the Universal Engine is registered for 'image', route it there.
-  if (GenerationRegistry.has('image')) {
+  if (GenerationRegistry.hasHandler('image')) {
     const results: GeneratedCover[] = [];
     for (let i = 0; i < variants; i++) {
       const req: GenerationRequest = {

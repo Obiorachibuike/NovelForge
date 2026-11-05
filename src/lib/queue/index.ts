@@ -254,7 +254,7 @@ export async function enqueue(task: EnqueueOptions): Promise<string> {
   // --- UNIVERSAL ENGINE DISPATCH ---
   // If the task type is registered in the Universal Engine, route it there.
   // Otherwise, fall back to the legacy queue logic.
-  if (GenerationRegistry.has(task.type as GenerationType)) {
+  if (GenerationRegistry.hasHandler(task.type as GenerationType)) {
     const req: GenerationRequest = {
       generationType: task.type as GenerationType,
       projectId: task.novelId,
@@ -392,7 +392,7 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
   // --- UNIVERSAL ENGINE EXECUTION ---
   // If the task type is registered in the Universal Engine, route it there.
   // Otherwise, use the legacy handler registry.
-  if (GenerationRegistry.has(job.taskType as GenerationType)) {
+  if (GenerationRegistry.hasHandler(job.taskType as GenerationType)) {
     try {
       // Map the JobRecord to a Universal GenerationRequest
       const req: GenerationRequest = {
@@ -814,7 +814,7 @@ export function cancelJob(id: string): boolean {
   if (!job) return false;
   
   // --- UNIVERSAL ENGINE CANCELLATION ---
-  if (GenerationRegistry.has(job.taskType as GenerationType)) {
+  if (GenerationRegistry.hasHandler(job.taskType as GenerationType)) {
     // The UniversalGenerationService handles cancellation via its own persistence
     const cancelled = UniversalGenerationService.cancelJob(id);
     if (cancelled) {
@@ -861,7 +861,7 @@ export async function retryJob(id: string, options: { priority?: number } = {}):
   if (!job) return false;
 
   // --- UNIVERSAL ENGINE RETRY ---
-  if (GenerationRegistry.has(job.taskType as GenerationType)) {
+  if (GenerationRegistry.hasHandler(job.taskType as GenerationType)) {
     const retried = await UniversalGenerationService.retryJob(id);
     if (retried) {
       if (job.taskType === 'chapter') {

@@ -45,7 +45,7 @@ export async function enqueueOutline(
   options: { textModel?: string; allowFallback?: boolean } = {},
 ) {
   // --- UNIVERSAL ENGINE DISPATCH ---
-  if (GenerationRegistry.has('outline')) {
+  if (GenerationRegistry.hasHandler('outline')) {
     const req: GenerationRequest = {
       generationType: 'outline',
       projectId: novelId,
@@ -241,8 +241,8 @@ function buildDemoOutline(novel: any) {
     emotionalObjective: ['wariness','hope','betrayal','resolve','grief','resolve'][i%6],
     plotAdvancement: 'Central mystery deepens',
     foreshadowing: i<total-1 ? 'A hint of what comes next.' : undefined,
-    targetWords: target,
-    estimatedPages: Math.max(1, Math.round(target/320)),
+    targetWords: avg,
+    estimatedPages: Math.max(1, Math.round(avg/320)),
   }));
   return { acts, chapters };
 }
