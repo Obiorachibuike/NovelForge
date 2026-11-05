@@ -22,10 +22,6 @@ import {
   toPublicStatus,
 } from '@/lib/jobs/job-types';
 
-// --- UNIVERSAL GENERATION ENGINE INTEGRATION ---
-import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
-import { GenerationType } from '@/lib/ai/generation/generation-types';
-
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
@@ -97,28 +93,8 @@ export async function GET(req: Request, ctx: { params: { jobId: string } }) {
     const generation = getGenerationForUser(user.id, owned.id);
     if (!generation) throw new HttpError(404, 'Generation not found', 'generation_not_found');
 
-    // --- UNIVERSAL ENGINE STREAMING ---
-    // If the generation type is registered in the Universal Engine, route the SSE stream there.
-    if (generation.taskType && GenerationRegistry.has(generation.taskType as GenerationType)) {
-      // UniversalGenerationService handles the SSE streaming logic internally.
-      // We delegate to the UniversalGenerationService's streamEvents method.
-      const stream = await UniversalGenerationService.streamEvents(generation.id, req.signal);
-      
-      // If the service returns a ReadableStream, we return it directly.
-      if (stream instanceof ReadableStream) {
-        return new Response(stream, {
-          status: 200,
-          headers: {
-            'Content-Type': 'text/event-stream; charset=utf-8',
-            'Cache-Control': 'no-cache, no-transform',
-            Connection: 'keep-alive',
-            'X-Accel-Buffering': 'no',
-          },
-        });
-      }
-    }
-
-    // --- LEGACY STREAMING (Fallback) ---
+    // All generation types publish persisted events; use the same replayable
+    // stream so authentication, connection limits, and reconnects stay consistent.
     const url = new URL(req.url);
     if (!acquireStreamSlot(user.id)) {
       throw new HttpError(429, 'Too many open generation event streams.', 'sse_connection_limit');
