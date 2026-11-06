@@ -182,23 +182,33 @@ export function Sidebar() {
             </button>
           </div>
         )}
-        <button onClick={()=>setTheme(theme==='dark'?'light':'dark')} className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-muted-foreground hover:bg-[hsl(var(--surface-secondary))] hover:text-foreground transition">
-          {mounted && theme==='dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
-          {mounted && theme==='dark' ? 'Light mode' : 'Dark mode'}
+        <button
+          type="button"
+          onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+          className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-muted-foreground hover:bg-[hsl(var(--surface-secondary))] hover:text-foreground transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {mounted && theme === 'dark' ? <Sun className="w-4 h-4" aria-hidden="true" /> : <Moon className="w-4 h-4" aria-hidden="true" />}
+          {mounted && theme === 'dark' ? 'Light mode' : 'Dark mode'}
         </button>
-        <Link href="/settings" className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-muted-foreground hover:bg-[hsl(var(--surface-secondary))] hover:text-foreground transition">
-          <Settings className="w-4 h-4" /> Settings
+        <Link href="/settings" className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-muted-foreground hover:bg-[hsl(var(--surface-secondary))] hover:text-foreground transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+          <Settings className="w-4 h-4" aria-hidden="true" /> Settings
         </Link>
         <div className="flex items-center gap-3 px-3 py-2">
-          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-pink-400 to-indigo-400 flex items-center justify-center text-xs font-bold">
+          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-pink-400 to-indigo-400 flex items-center justify-center text-xs font-bold" aria-hidden="true">
             {session?.user?.name?.[0]?.toUpperCase() || 'U'}
           </div>
           <div className="min-w-0 flex-1">
             <div className="text-sm font-medium truncate">{session?.user?.name || 'Writer'}</div>
             <div className="text-[11px] text-muted-foreground truncate">{session?.user?.email}</div>
           </div>
-          <button onClick={()=>signOut({callbackUrl:'/'})} className="text-muted-foreground hover:text-destructive p-1" title="Sign out">
-            <LogOut className="w-4 h-4" />
+          <button
+            type="button"
+            onClick={() => signOut({ callbackUrl: '/' })}
+            className="text-muted-foreground hover:text-destructive p-1 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
+            title="Sign out"
+            aria-label="Sign out"
+          >
+            <LogOut className="w-4 h-4" aria-hidden="true" />
           </button>
         </div>
       </div>
