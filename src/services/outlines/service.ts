@@ -7,11 +7,6 @@ import { HttpError } from '@/lib/api/http';
 import { z } from 'zod';
 import 'server-only';
 
-// --- UNIVERSAL GENERATION ENGINE INTEGRATION ---
-import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
-import { GenerationRequest, GenerationType } from '@/lib/ai/generation/generation-types';
-import { GenerationRegistry } from '@/lib/ai/generation/generation-registry';
-
 const outlineShape = z.object({
   acts: z.array(z.object({
     actNumber: z.number(),
@@ -44,27 +39,9 @@ export async function enqueueOutline(
   structureType = 'three-act',
   options: { textModel?: string; allowFallback?: boolean } = {},
 ) {
-  // --- UNIVERSAL ENGINE DISPATCH ---
-  if (GenerationRegistry.has('outline')) {
-    const req: GenerationRequest = {
-      generationType: 'outline',
-      projectId: novelId,
-      targetId: undefined,
-      userId,
-      prompt: '',
-      context: {
-        structureType,
-        ...(options.textModel ? { textModel: options.textModel } : {}),
-        allowFallback: options.allowFallback !== false,
-      },
-      stream: false,
-      metadata: {},
-      idempotencyKey: `outline:${novelId}:${structureType}`,
-    };
-    return await UniversalGenerationService.createJob(req);
-  }
-
-  // --- LEGACY DISPATCH (Fallback) ---
+  // Executed by this service's registered `outline` handler via the durable
+  // queue; the generic universal text path would bypass the structured outline
+  // schema and the story-bible writes that follow it.
   const { enqueue } = await import('@/lib/queue');
   return enqueue({
     type: 'outline', userId, novelId,
@@ -241,8 +218,8 @@ function buildDemoOutline(novel: any) {
     emotionalObjective: ['wariness','hope','betrayal','resolve','grief','resolve'][i%6],
     plotAdvancement: 'Central mystery deepens',
     foreshadowing: i<total-1 ? 'A hint of what comes next.' : undefined,
-    targetWords: target,
-    estimatedPages: Math.max(1, Math.round(target/320)),
+    targetWords: avg,
+    estimatedPages: Math.max(1, Math.round(avg/320)),
   }));
   return { acts, chapters };
 }

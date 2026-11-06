@@ -22,9 +22,16 @@ import {
   toPublicStatus,
 } from '@/lib/jobs/job-types';
 
-// --- UNIVERSAL GENERATION ENGINE INTEGRATION ---
-import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
-import { GenerationType } from '@/lib/ai/generation/generation-types';
+// --- UNIVERSAL GENERATION ENGINE ---
+// The stream itself is engine-agnostic: every producer (universal engine, the
+// chapter service, an image job) persists the same `generation_events` rows and
+// every event is replayed from there. The engine an individual job belongs to is
+// read from its *persisted* payload marker, never guessed from a handler lookup,
+// so a legacy job can never be misrouted and a built-in universal type works
+// even when no custom handler is registered.
+import { GenerationRegistry } from '@/lib/ai/generation/generation-registry';
+import { isUniversalEngineJob } from '@/lib/ai/generation/generation-persistence';
+import { isGenerationType } from '@/lib/ai/generation/generation-types';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -97,28 +104,13 @@ export async function GET(req: Request, ctx: { params: { jobId: string } }) {
     const generation = getGenerationForUser(user.id, owned.id);
     if (!generation) throw new HttpError(404, 'Generation not found', 'generation_not_found');
 
-    // --- UNIVERSAL ENGINE STREAMING ---
-    // If the generation type is registered in the Universal Engine, route the SSE stream there.
-    if (generation.taskType && GenerationRegistry.has(generation.taskType as GenerationType)) {
-      // UniversalGenerationService handles the SSE streaming logic internally.
-      // We delegate to the UniversalGenerationService's streamEvents method.
-      const stream = await UniversalGenerationService.streamEvents(generation.id, req.signal);
-      
-      // If the service returns a ReadableStream, we return it directly.
-      if (stream instanceof ReadableStream) {
-        return new Response(stream, {
-          status: 200,
-          headers: {
-            'Content-Type': 'text/event-stream; charset=utf-8',
-            'Cache-Control': 'no-cache, no-transform',
-            Connection: 'keep-alive',
-            'X-Accel-Buffering': 'no',
-          },
-        });
-      }
-    }
+    // Engine ownership comes from the durable row (payload marker). The
+    // registry is only consulted to report whether a *custom* handler overrides
+    // the built-in path for this type.
+    const engine = isUniversalEngineJob(generation) ? 'universal' : 'legacy';
+    const customHandler =
+      isGenerationType(generation.taskType) && GenerationRegistry.hasHandler(generation.taskType);
 
-    // --- LEGACY STREAMING (Fallback) ---
     const url = new URL(req.url);
     if (!acquireStreamSlot(user.id)) {
       throw new HttpError(429, 'Too many open generation event streams.', 'sse_connection_limit');
@@ -179,7 +171,11 @@ export async function GET(req: Request, ctx: { params: { jobId: string } }) {
         // A retry hint lets the browser reconnect quickly after a network blip.
         push('retry: 3000\n\n');
 
-        const snapshot = generationSnapshot(generation);
+        const snapshot = {
+          ...generationSnapshot(generation),
+          engine,
+          customHandler,
+        };
         push(formatSseFrame({ event: GenerationEventType.SNAPSHOT, data: snapshot }));
 
         // Replay everything the client missed. Batches avoid unbounded memory

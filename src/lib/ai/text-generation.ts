@@ -69,6 +69,9 @@ function huggingFaceFallbackAvailable(): boolean {
 export interface TextResult { text: string; meta: GenerationMeta }
 export interface StructuredResult<T> { data: T; meta: GenerationMeta }
 
+/** A provider the caller can pin explicitly. */
+export type ForcedProvider = 'agnes' | 'huggingface' | 'openai';
+
 export interface GenerateTextInput {
   onText?: (text: string) => void;
   messages: ChatMessage[];
@@ -81,6 +84,15 @@ export interface GenerateTextInput {
   jobId?: string;
   taskType: string;
   signal?: AbortSignal;
+  /**
+   * Pins the request to exactly one provider: no *implicit* cross-provider
+   * fallback happens inside this function when it is set. Callers that want a
+   * fallback chain (the universal engine) walk the chain themselves, so the
+   * persisted provenance always names the provider that actually ran instead of
+   * silently switching. `allowFallbackOnError`/demo substitution is still
+   * honoured when explicitly requested.
+   */
+  forceProvider?: ForcedProvider;
   /** When true (default) a provider failure rethrows so the caller decides. */
   allowFallbackOnError?: boolean;
   /**
@@ -118,11 +130,15 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
   // ── Agnes AI: the primary provider ────────────────────────────────────────
   // An explicit Hugging Face repo id overrides the default provider (the user
   // chose that model on purpose); everything else goes to Agnes first.
+  const forced = input.forceProvider;
   const explicitHfModel = isExplicitHuggingFaceModel(input.model);
+  const tryAgnes = forced ? forced === 'agnes' : true;
   let agnesFailure: string | undefined;
-  let hfChainRequested = huggingFaceBackendActive() || (huggingFaceFallbackAvailable() && explicitHfModel);
+  let hfChainRequested = forced
+    ? forced === 'huggingface'
+    : huggingFaceBackendActive() || (huggingFaceFallbackAvailable() && explicitHfModel);
 
-  if (agnesBackendActive() && !explicitHfModel) {
+  if (tryAgnes && agnesBackendActive() && !explicitHfModel) {
     try {
       const result = await generateTextAgnes({
         messages: input.messages,
@@ -151,7 +167,8 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
       };
     } catch (err) {
       agnesFailure = errorMessage(err);
-      if (!huggingFaceFallbackAvailable()) {
+      // A pinned provider never switches implicitly: the caller owns the chain.
+      if (forced || !huggingFaceFallbackAvailable()) {
         // No Hugging Face token configured: the caller decides (labelled
         // fallback for tolerant callers, a real error for chapters etc.).
         if (input.allowFallbackOnError) {
@@ -230,7 +247,17 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
   const client = getOpenAI();
   const model = input.model || aiConfig.textModel;
   if (!client) {
-    if (input.taskType === 'chapter') throw new Error('No text AI provider is available. Configure AGNES_API_KEY, HF_TOKEN, or OPENAI_API_KEY on the server and redeploy.');
+    if (forced === 'openai' && !input.allowFallbackOnError) {
+      throw Object.assign(
+        new Error('OpenAI was requested but OPENAI_API_KEY is not configured on the server.'),
+        { status: 400, code: 'provider_not_configured', retryable: false },
+      );
+    }
+    // No provider key at all: this deployment is a demo deployment. The result
+    // is labelled `source: 'demo'` (and persisted with generationSource='demo'),
+    // so it never claims to be a provider response. Chapter generation applies
+    // its own, stricter gate: it only accepts demo text when the deployment
+    // opted in with AI_DEMO_MODE=true and no key is configured.
     return {
       text: input.fallbackText ?? demoTextResponse(input.messages),
       meta: { source: 'demo', model, usedFallback: false },

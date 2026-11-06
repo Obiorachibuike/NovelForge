@@ -8,7 +8,12 @@ import { useEffect, useRef, useState } from 'react';
  * The browser's EventSource reconnects automatically and sends
  * `Last-Event-ID`; the server replays persisted events from that cursor, so a
  * brief disconnect does not lose updates. This hook never cancels the
- * generation — unmounting only closes the local notification channel.
+ * generation — unmounting only closes the local notification channel, which is
+ * why navigating away or refreshing cannot stop background work.
+ *
+ * Incremental content (`generation_content`) is applied in order and
+ * de-duplicated by its monotonic `sequence`, so a reconnect that replays
+ * already-seen chunks never duplicates text.
  */
 
 export interface GenerationView {
@@ -18,6 +23,7 @@ export interface GenerationView {
   chapterId?: string | null;
   chapterTitle?: string | null;
   chapterNumber?: number | null;
+  taskType?: string | null;
   status: 'NOT_STARTED' | 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
   progressPercentage?: number | null;
   indeterminate?: boolean;
@@ -35,6 +41,8 @@ export interface GenerationView {
   eventsUrl?: string;
   /** Real partial text emitted by the provider, when it streams one. */
   partialText?: string | null;
+  /** Which engine executed the job (persisted on the job row). */
+  engine?: 'universal' | 'legacy';
 }
 
 export const TERMINAL_STATUSES = ['COMPLETED', 'FAILED', 'CANCELLED'] as const;
@@ -44,6 +52,18 @@ export function isTerminalStatus(status?: string | null): boolean {
 }
 
 type Handler = (generation: GenerationView) => void;
+
+/** The event names the server can emit. */
+const EVENT_TYPES = [
+  'generation_snapshot',
+  'generation_queued',
+  'generation_started',
+  'generation_progress',
+  'generation_content',
+  'generation_completed',
+  'generation_failed',
+  'generation_cancelled',
+] as const;
 
 export function useGenerationStream(
   jobId: string | null | undefined,
@@ -65,18 +85,53 @@ export function useGenerationStream(
     let closed = false;
     let errors = 0;
 
+    // Streamed text accumulated from content events, and the highest sequence
+    // applied so far. Both live for the lifetime of one subscription; the
+    // authoritative copy is always the persisted text the server replays.
+    let streamed = '';
+    let lastSequence = -1;
+    let latest: GenerationView | null = null;
+
+    const emit = (patch: Partial<GenerationView>) => {
+      if (closed) return;
+      latest = { ...(latest ?? ({ id: jobId } as GenerationView)), ...patch, id: jobId };
+      setGeneration(latest);
+      callbacks.current.onUpdate?.(latest);
+      if (isTerminalStatus(latest.status) && !terminalFired.current) {
+        terminalFired.current = true;
+        callbacks.current.onTerminal?.(latest);
+      }
+    };
+
     const apply = (data: any) => {
       if (!data || closed) return;
-      const next: GenerationView = {
-        ...(data as GenerationView),
-        id: jobId,
-      };
-      setGeneration(next);
-      callbacks.current.onUpdate?.(next);
-      if (isTerminalStatus(next.status) && !terminalFired.current) {
-        terminalFired.current = true;
-        callbacks.current.onTerminal?.(next);
+      const incoming = data as Partial<GenerationView> & { partialText?: string | null };
+      // A snapshot/replay carries the durable accumulated text: trust it over
+      // local accumulation (it is the copy that survived any disconnect).
+      if (typeof incoming.partialText === 'string' && incoming.partialText.length >= streamed.length) {
+        streamed = incoming.partialText;
       }
+      emit({ ...(incoming as GenerationView), partialText: streamed || incoming.partialText || null });
+    };
+
+    const applyContent = (data: any) => {
+      if (!data || closed) return;
+      const sequence = typeof data.sequence === 'number' ? data.sequence : lastSequence + 1;
+      if (sequence <= lastSequence) return; // replayed chunk already applied
+      lastSequence = sequence;
+      const delta = typeof data.delta === 'string'
+        ? data.delta
+        : typeof data.content === 'string'
+          ? data.content
+          : '';
+      if (!delta) return;
+      streamed += delta;
+      emit({
+        status: (data.status as GenerationView['status']) ?? latest?.status ?? 'PROCESSING',
+        currentStage: data.stage ?? 'STREAMING_CONTENT',
+        currentStageLabel: data.stageLabel ?? 'Streaming content',
+        partialText: streamed,
+      });
     };
 
     try {
@@ -95,19 +150,12 @@ export function useGenerationStream(
         errors += 1;
         if (errors >= 10) source?.close();
       };
-      const types = [
-        'generation_snapshot',
-        'generation_queued',
-        'generation_started',
-        'generation_progress',
-        'generation_completed',
-        'generation_failed',
-        'generation_cancelled',
-      ];
-      for (const type of types) {
+      for (const type of EVENT_TYPES) {
         source.addEventListener(type, event => {
           try {
-            apply(JSON.parse((event as MessageEvent).data));
+            const data = JSON.parse((event as MessageEvent).data);
+            if (type === 'generation_content') applyContent(data);
+            else apply(data);
           } catch {
             /* ignore malformed frame */
           }

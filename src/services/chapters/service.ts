@@ -15,11 +15,6 @@ import { countWords } from '@/types';
 import { z } from 'zod';
 import 'server-only';
 
-// --- UNIVERSAL GENERATION ENGINE INTEGRATION ---
-import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
-import { GenerationRequest, GenerationType } from '@/lib/ai/generation/generation-types';
-import { GenerationRegistry } from '@/lib/ai/generation/generation-registry';
-
 export interface ChapterDoc { type:'doc'; content: any[] }
 
 export function emptyDoc(text?: string): ChapterDoc {
@@ -95,32 +90,10 @@ export async function enqueueChapterGeneration(
   chapterNumber: number,
   options: { confirmOverwrite?: boolean; textModel?: string; allowFallback?: boolean } = {},
 ) {
-  // --- UNIVERSAL ENGINE DISPATCH ---
-  // If the Universal Engine is registered for 'chapter', route it there.
-  if (GenerationRegistry.has('chapter')) {
-    const req: GenerationRequest = {
-      generationType: 'chapter',
-      projectId: novelId,
-      targetId: undefined, // Will be set in UniversalGenerationService.createJob
-      userId,
-      prompt: '', // Extracted from payload in UniversalGenerationService
-      context: {
-        chapterNumber,
-        confirmOverwrite: options.confirmOverwrite || false,
-        textModel: options.textModel,
-        allowFallback: options.allowFallback !== false,
-      },
-      stream: false,
-      metadata: {},
-      idempotencyKey: `chapter:${novelId}:${chapterNumber}`,
-    };
-
-    // The UniversalGenerationService handles creation and queuing via pg-boss
-    const jobId = await UniversalGenerationService.createJob(req);
-    return jobId;
-  }
-
-  // --- LEGACY DISPATCH (Fallback) ---
+  // Chapter generation is executed by this service through the durable queue
+  // (registered below as the `chapter` handler). It is deliberately not routed
+  // through the generic universal text path: the chapter pipeline owns
+  // continuity checks, crash-safe resumption, versioning and memory extraction.
   const db = getDb();
   const novel = db.prepare('SELECT id FROM novels WHERE id = ? AND userId = ?').get(novelId, userId);
   if (!novel) throw new HttpError(404, 'Novel not found', 'novel_not_found');
@@ -157,14 +130,23 @@ export async function enqueueChapterGeneration(
     );
   }
 
-  if (aiConfig.forcedDemo) {
+  // Two different situations, two different answers:
+  //  - a key *is* configured but AI_DEMO_MODE=true: refuse, because silently
+  //    writing demo prose into a deployment that could write real prose is a
+  //    surprise nobody asked for;
+  //  - no provider key at all and AI_DEMO_MODE=true: demo is the only possible
+  //    mode, so chapters are produced as clearly-labelled demo text
+  //    (`generationSource='demo'`, job result `demo: true`) rather than leaving
+  //    the writing flow unreachable.
+  const providerConfigured = aiBackend() !== 'demo';
+  if (aiConfig.forcedDemo && providerConfigured) {
     throw new HttpError(503,
       'Story generation is disabled because AI_DEMO_MODE=true in this deployment, even if an AI API key is configured. Set AI_DEMO_MODE=false in Vercel Project Settings → Environment Variables for this deployment’s environment, then redeploy. No demo chapter was created.',
       'text_provider_unavailable');
   }
-  if (aiBackend() === 'demo') {
+  if (!aiConfig.forcedDemo && !providerConfigured) {
     throw new HttpError(503,
-      'This deployment cannot find a usable AI provider key. Set AGNES_API_KEY, HF_TOKEN, or OPENAI_API_KEY in Vercel Project Settings → Environment Variables for this deployment’s environment (Production or Preview), then redeploy. Blank or placeholder Agnes/Hugging Face keys are treated as missing. No demo chapter was created.',
+      'This deployment cannot find a usable AI provider key. Set AGNES_API_KEY, HF_TOKEN, or OPENAI_API_KEY in Vercel Project Settings → Environment Variables for this deployment’s environment (Production or Preview), then redeploy. Blank or placeholder Agnes/Hugging Face keys are treated as missing.',
       'text_provider_unavailable');
   }
 
@@ -220,13 +202,16 @@ function envPositiveInt(name: string, fallback: number): number {
 
 interface ChapterJobPayload { chapterNumber: number; confirmOverwrite?: boolean; textModel?: string; allowFallback?: boolean }
 
-// --- LEGACY HANDLER ---
-// Kept for backward compatibility during transition. The UniversalGenerationService
-// will route 'chapter' to the Universal engine, but we keep this handler registered
-// in case the queue logic falls back.
+// The `chapter` job handler. The worker executes this through the durable queue;
+// it is the only writer of generated chapter content.
 export async function runChapterGeneration({ id: jobId, novelId, userId, payload, setStage, isCancelled, signal }: any) {
   const db = getDb();
   const { chapterNumber, confirmOverwrite, textModel, allowFallback } = payload as ChapterJobPayload;
+  // A job cancelled before it started must not spend provider tokens or touch
+  // the chapter at all: fail fast and let the queue record the cancellation.
+  if (isCancelled?.()) {
+    throw new NonRetryableJobError('Generation was cancelled before completion.', 'cancelled');
+  }
   setStage?.(GenerationStage.PREPARING_CHAPTER);
   const novel = db.prepare('SELECT * FROM novels WHERE id = ?').get(novelId) as any;
   if (!novel) throw new Error('Novel not found');
@@ -327,7 +312,10 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
   });
   // A model-level fallback is a real generation by another eligible model, not
   // a stub: it is recorded in meta.actualModel and surfaced to the author.
-  if (generated.meta.source === 'demo' || generated.meta.source === 'fallback') {
+  // Demo text is only acceptable when the deployment explicitly opted into it
+  // (AI_DEMO_MODE=true with no provider key, enforced by the gate above) and is
+  // always recorded as demo. A labelled fallback never becomes a chapter.
+  if (generated.meta.source === 'fallback' || (generated.meta.source === 'demo' && !aiConfig.forcedDemo)) {
     throw new Error('A real AI provider is required to generate a chapter. Configure a provider and retry.');
   }
   setStage?.(GenerationStage.PROCESSING_AI_RESPONSE);
@@ -420,37 +408,14 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
     chapterNumber,
     wordCount: words,
     source: generated.meta.source,
-    demo: false,
+    demo: generated.meta.source === 'demo',
   };
 }
 
-// Register legacy handler (fallback)
 registerHandler('chapter', runChapterGeneration);
-
-// --- UNIVERSAL GENERATION REGISTRATION ---
-// The UniversalGenerationService handles the actual execution of 'chapter'
-// via GenerationRegistry. The handler above is registered as a fallback.
-// The actual migration is handled in src/lib/ai/generation/migration-registry.ts
 
 /** Queues story-memory extraction for an approved chapter (durable + retried). */
 export async function enqueueMemoryExtraction(userId: string, novelId: string, chapterId: string) {
-  // --- UNIVERSAL ENGINE DISPATCH ---
-  if (GenerationRegistry.has('memory')) {
-    const req: GenerationRequest = {
-      generationType: 'memory',
-      projectId: novelId,
-      targetId: chapterId,
-      userId,
-      prompt: '',
-      context: {},
-      stream: false,
-      metadata: {},
-      idempotencyKey: `memory:${chapterId}`,
-    };
-    return await UniversalGenerationService.createJob(req);
-  }
-
-  // --- LEGACY DISPATCH (Fallback) ---
   const { enqueue } = await import('@/lib/queue');
   return enqueue({
     type: 'memory',
@@ -552,7 +517,7 @@ async function runMemoryExtraction({ novelId, userId, payload }: any) {
   return { source: meta.source, usedFallback: meta.usedFallback, importantEvents: result.importantEvents.length };
 }
 
-// Register legacy handler (fallback)
+// The `memory` job handler (story-memory extraction).
 registerHandler('memory', runMemoryExtraction);
 
 /** Kept for backwards compatibility with earlier call sites/tests. */
@@ -561,24 +526,6 @@ export async function summarizeChapter(chapterId: string, userId: string, novelI
   const chapter = db.prepare('SELECT novelId FROM chapters WHERE id=?').get(chapterId) as any;
   if (!chapter) throw new HttpError(404, 'Chapter not found', 'chapter_not_found');
   
-  // --- UNIVERSAL ENGINE DISPATCH ---
-  if (GenerationRegistry.has('memory')) {
-    const req: GenerationRequest = {
-      generationType: 'memory',
-      projectId: novelId || chapter.novelId,
-      targetId: chapterId,
-      userId,
-      prompt: '',
-      context: {},
-      stream: false,
-      metadata: {},
-      idempotencyKey: `memory:${chapterId}`,
-    };
-    const jobId = await UniversalGenerationService.createJob(req);
-    return { jobId };
-  }
-
-  // --- LEGACY DISPATCH (Fallback) ---
   const { enqueue } = await import('@/lib/queue');
   const jobId = await enqueue({
     type: 'memory',

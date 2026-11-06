@@ -43,13 +43,28 @@ export interface ListGenerationOptions {
   novelId?: string;
   chapterId?: string;
   limit?: number;
+  /** Restrict to one task/generation type. */
+  taskType?: string;
+  /**
+   * Include every generation type (universal jobs: titles, scenes, images,
+   * rewrites, ...) instead of only chapters.
+   */
+  allTaskTypes?: boolean;
 }
 
 /** The caller's own generation history / active jobs. Never cross-user. */
 export function listGenerations(userId: string, options: ListGenerationOptions = {}): GenerationWithContext[] {
   const db = getDb();
-  const clauses = ['j.userId = ?', `j.taskType = 'chapter'`];
+  const clauses = ['j.userId = ?'];
   const args: unknown[] = [userId];
+  if (options.allTaskTypes) {
+    if (options.taskType) {
+      clauses.push('j.taskType = ?');
+      args.push(options.taskType);
+    }
+  } else {
+    clauses.push(`j.taskType = 'chapter'`);
+  }
   if (options.active) {
     clauses.push(`j.status IN ('queued','processing')`);
   }
@@ -65,6 +80,14 @@ export function listGenerations(userId: string, options: ListGenerationOptions =
   return db
     .prepare(`${GENERATION_SELECT} WHERE ${clauses.join(' AND ')} ORDER BY j.createdAt DESC LIMIT ?`)
     .all(...args, limit) as GenerationWithContext[];
+}
+
+/** Every generation type the caller owns (used by the universal endpoints). */
+export function listGenerationsForUser(
+  userId: string,
+  options: ListGenerationOptions = {},
+): GenerationWithContext[] {
+  return listGenerations(userId, { ...options, allTaskTypes: true });
 }
 
 export function getGenerationForUser(userId: string, jobId: string): GenerationWithContext | undefined {
