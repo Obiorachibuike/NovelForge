@@ -216,14 +216,16 @@ describe('model id validation (no open proxy)', () => {
 });
 
 describe('catalogue endpoints', () => {
-  it('lists the 70 configured models with honest availability metadata', async () => {
+  // The registry is authoritative: 5 Agnes AI models were added alongside the
+  // 50 Hugging Face text models and 23 image models.
+  it('lists every configured model with honest availability metadata', async () => {
     const res = await listModels(jsonRequest('/api/ai/models?limit=200&overview=true'));
     expect(res.status).toBe(200);
     const body = await readJson(res);
     expect(body.models.length).toBe(78);
     expect(body.models.every((m: any) => m.availability === 'Unverified' || m.availability === 'Not verified')).toBeFalsy;
-    expect(body.models.filter((m: any) => m.task === 'text-generation')).toHaveLength(50);
-    expect(body.models.filter((m: any) => m.task === 'text-to-image')).toHaveLength(20);
+    expect(body.models.filter((m: any) => m.task === 'text-generation')).toHaveLength(55);
+    expect(body.models.filter((m: any) => m.task === 'text-to-image')).toHaveLength(23);
     // Nothing is claimed to be operational before verification.
     expect(body.overview.hostedInferenceSupported).toBe(0);
     expect(body.overview.successfullyTested).toBe(0);

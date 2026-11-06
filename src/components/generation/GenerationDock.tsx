@@ -19,6 +19,7 @@ import { cn } from '@/lib/utils/cn';
 import { useGeneration } from './GenerationContext';
 import { GenerationStatusBadge, generationStatusLabel } from './GenerationStatusBadge';
 import type { GenerationView } from '@/lib/hooks/useGenerationStream';
+import { taskTypeLabel } from '@/lib/jobs/job-types';
 
 /**
  * Global AI generation indicator.
@@ -280,7 +281,12 @@ function JobRow({
 }) {
   const active = isActive(job);
   const href = chapterHref(job);
-  const title = job.chapterTitle || (job.chapterNumber ? `Chapter ${job.chapterNumber}` : 'Chapter');
+  const isChapterJob = !job.taskType || job.taskType === 'chapter';
+  // Universal jobs (title, scene, character, image, rewrite, ...) have no
+  // chapter, so they are labelled by their generation type instead.
+  const title = isChapterJob
+    ? job.chapterTitle || (job.chapterNumber ? `Chapter ${job.chapterNumber}` : 'Chapter')
+    : taskTypeLabel(job.taskType);
   return (
     <div
       className={cn(
@@ -293,7 +299,7 @@ function JobRow({
           <div className="text-xs font-medium truncate">{title}</div>
           <div className="text-[10px] text-muted-foreground truncate">
             {job.novelTitle || 'Novel'}
-            {job.chapterNumber ? ` · Chapter ${job.chapterNumber}` : ''}
+            {isChapterJob && job.chapterNumber ? ` · Chapter ${job.chapterNumber}` : ''}
           </div>
         </div>
         <GenerationStatusBadge status={job.status} />
@@ -319,6 +325,14 @@ function JobRow({
         </>
       )}
 
+      {/* Incremental text for universal generations, so content is visible as
+          it streams instead of only after the job finishes. */}
+      {!isChapterJob && job.partialText && (
+        <p className="mt-2 text-[11px] whitespace-pre-wrap line-clamp-3 text-muted-foreground">
+          {job.partialText.slice(-320)}
+        </p>
+      )}
+
       {!active && job.status === 'FAILED' && (
         <p className="text-[11px] text-destructive mt-2 line-clamp-2" title={job.errorMessage || undefined}>
           {job.errorMessage || 'Generation failed.'}
@@ -332,7 +346,8 @@ function JobRow({
               href={href}
               className="text-[11px] inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 hover:border-primary/40 hover:text-primary"
             >
-              <ExternalLink className="w-3 h-3" aria-hidden="true" /> View chapter
+              <ExternalLink className="w-3 h-3" aria-hidden="true" />{' '}
+              {isChapterJob ? 'View chapter' : 'Open novel'}
             </Link>
           )}
           {active && (

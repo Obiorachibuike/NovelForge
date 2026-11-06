@@ -61,6 +61,11 @@ export function costFor(params: {
 /** Persists one AI usage row. Never throws: accounting must not break generation. */
 export function recordGenerationUsage(input: GenerationUsageInput): void {
   try {
+    // `ai_usage.userId` is NOT NULL by design: every paid/consumed generation is
+    // attributable to an account. Calls made without an owner (health checks,
+    // internal probes) have nothing to attribute, so they are simply not
+    // recorded instead of failing an INSERT and logging a constraint error.
+    if (!input.userId) return;
     const db = getDb();
     const crypto = require('node:crypto') as typeof import('node:crypto');
     const id = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
