@@ -1,5 +1,5 @@
 import { requireUser } from '@/lib/db/ownership';
-import { updateUserPrivileges } from '@/services/billing/service';
+import { requireAdmin, updateUserPrivileges } from '@/services/billing/service';
 import { adminUserPatchSchema } from '@/types';
 import { apiHandler, readJsonBody } from '@/lib/api/http';
 
@@ -10,6 +10,8 @@ import { apiHandler, readJsonBody } from '@/lib/api/http';
  */
 export const PATCH = apiHandler(async (req: Request, ctx: { params: { userId: string } }) => {
   const user = await requireUser();
+  // Defense in depth: enforce admin authorization before reading or parsing request payload
+  requireAdmin(user.id);
   const body = await readJsonBody(req, v => adminUserPatchSchema.parse(v));
   return Response.json(await updateUserPrivileges(user.id, ctx.params.userId, body));
 });

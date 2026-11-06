@@ -1,0 +1,4 @@
+## 2026-11-05 - Admin Route Defense-in-Depth Authorization
+**Vulnerability:** The route handler `PATCH /api/admin/users/[userId]` parsed and validated user-supplied payloads via `readJsonBody` before delegating to `updateUserPrivileges`, which performed the `requireAdmin` check. Other admin endpoints (`/api/admin/*`) enforce `requireAdmin(user.id)` immediately at the route handler level before payload consumption.
+**Learning:** While the service layer prevented unauthorized privilege changes, leaving authorization checks solely to the service layer allows unauthorized actors to trigger JSON parsing, schema validation, and potentially DoS attack vectors on administrative endpoints.
+**Prevention:** Always enforce `requireAdmin(user.id)` alongside `requireUser()` at the very top of route handlers under `src/app/api/admin/*` before reading or parsing any request payloads.

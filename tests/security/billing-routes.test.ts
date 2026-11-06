@@ -117,6 +117,17 @@ describe('admin API authorisation', () => {
     expect(body.users.map((u: any) => u.email).sort()).toEqual(['admin@example.com', 'writer@example.com']);
   });
 
+  it('rejects unauthenticated or non-admin calls to PATCH /api/admin/users/[userId] at the route level', async () => {
+    // Unauthenticated caller: 401
+    expect((await adminUserPatchRoute(req(`/api/admin/users/${writer.id}`, { freeNovelAccess: true }, 'PATCH'), { params: { userId: writer.id } } as any)).status).toBe(401);
+
+    // Non-admin authenticated caller: 403 Forbidden even before payload validation
+    session.userId = writer.id;
+    const forbidden = await adminUserPatchRoute(req(`/api/admin/users/${writer.id}`, { freeNovelAccess: true }, 'PATCH'), { params: { userId: writer.id } } as any);
+    expect(forbidden.status).toBe(403);
+    expect((await forbidden.json()).code).toBe('admin_only');
+  });
+
   it('patches privileges for another account, and refuses self-demotion', async () => {
     session.userId = writer.id;
     const forbidden = await adminUserPatchRoute(req(`/api/admin/users/${admin.id}`, { freeNovelAccess: true }, 'PATCH'), { params: { userId: admin.id } } as any);
