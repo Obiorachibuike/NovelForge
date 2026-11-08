@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   freshDatabase,
   db,
@@ -31,11 +31,22 @@ import { recordUsage, novelUsageSummary } from '@/lib/ai/usage';
 import { isRetryableProviderError } from '@/lib/ai/text-generation';
 import { GET as getJobRoute, POST as postJobRoute, DELETE as deleteJobRoute } from '@/app/api/jobs/[jobId]/route';
 import { GET as getUsageRoute } from '@/app/api/usage/route';
+import { __setFetchForTests } from '@/lib/ai/huggingface-client';
+import { patchModel, syncRegistry } from '@/lib/ai/model-registry';
+import { chatHandler, chatSuccess, mockFetch, useHuggingFaceBackend } from '../ai/helpers';
 
 describe('AI job lifecycle, cancellation, error classification & cost estimation', () => {
+  let restoreEnv: (() => void) | undefined;
+
   beforeEach(() => {
     freshDatabase();
     session.userId = null;
+  });
+
+  afterEach(() => {
+    __setFetchForTests(null);
+    restoreEnv?.();
+    restoreEnv = undefined;
   });
 
   it('classifies permanent vs retryable errors and redacts secrets from job error messages', () => {
@@ -107,6 +118,14 @@ describe('AI job lifecycle, cancellation, error classification & cost estimation
     const reviewJob = (await getJob(reviewJobId))!;
     expect(reviewJob.status).toBe('awaiting_review');
 
+    // Chapter generation is a real provider call: mock it instead of relying on
+    // demo prose, which chapters deliberately refuse.
+    restoreEnv = useHuggingFaceBackend();
+    syncRegistry();
+    patchModel('Qwen/Qwen2.5-7B-Instruct', { availabilityStatus: 'available', pricingStatus: 'free' });
+    __setFetchForTests(
+      mockFetch([chatHandler(() => chatSuccess('Chapter one, written by a mocked hosted model.', {}, 'together'))]) as unknown as typeof fetch,
+    );
     registerHandler('chapter', runChapterGeneration);
 
     const jobId = await enqueue({

@@ -6,18 +6,11 @@ import { assertRegisteredModelOrAgnes } from '@/lib/ai/model-selection';
 import {
   createChapterGeneration,
   listGenerations,
-  getGenerationForUser,
   maxActiveGenerationsPerNovel,
   maxActiveGenerationsPerUser,
   serializeGeneration,
 } from '@/lib/jobs/generation-jobs';
 import { z } from 'zod';
-
-// --- UNIVERSAL GENERATION ENGINE INTEGRATION ---
-import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
-import { GenerationType } from '@/lib/ai/generation/generation-types';
-import { validateGenerationInput } from '@/lib/ai/generation/generation-validation';
-import { GenerationRegistry } from '@/lib/ai/generation/generation-registry';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -50,40 +43,10 @@ export const POST = apiHandler(async (req: Request) => {
   enforceRateLimit('aiGeneration', user.id);
   enforceAiRateLimit('text', user.id);
 
-  // --- UNIVERSAL ENGINE DISPATCH ---
-  // If the request matches the Universal Generation schema, route it there.
-  // Otherwise, fall back to the legacy chapter generation logic.
-  const rawBody = await readJsonBody(req, value => z.record(z.unknown()).parse(value));
-  
-  // Check if it's a Universal Generation Request (has generationType)
-  if (typeof rawBody.generationType === 'string' && GenerationRegistry.hasHandler(rawBody.generationType as GenerationType)) {
-    const body = validateGenerationInput(rawBody, user.id);
-    
-    // Project ownership check
-    await requireNovel(body.projectId, user.id);
-
-    // Create Universal Job
-    const jobId = await UniversalGenerationService.createJob(body);
-
-    const job = getGenerationForUser(user.id, jobId);
-    if (!job) throw new HttpError(500, 'Job creation failed', 'generation_missing');
-
-    return Response.json(
-      {
-        ok: true,
-        jobId,
-        generation: serializeGeneration(job),
-        statusUrl: `/api/generations/${jobId}`,
-        eventsUrl: `/api/generations/${jobId}/events`,
-        cancelUrl: `/api/generations/${jobId}/cancel`,
-        retryUrl: `/api/generations/${jobId}/retry`,
-      },
-      { status: 202 }
-    );
-  }
-
-  // --- LEGACY DISPATCH (Fallback) ---
-  const body = createSchema.parse(rawBody);
+  // Chapter generation only. Universal (non-chapter) generation has its own
+  // endpoint — `POST /api/generations/universal` — so this route keeps exactly
+  // one job-creation path and one response contract.
+  const body = await readJsonBody(req, v => createSchema.parse(v));
   await requireNovel(body.novelId, user.id);
 
   if (body.chapterId) {

@@ -119,6 +119,20 @@ export function GenerationProvider({ children }: { children: React.ReactNode }) 
       if (!mounted.current) return;
       setAuthenticated(true);
       const rows: GenerationView[] = Array.isArray(data.generations) ? data.generations : [];
+
+      // Universal generations (titles, outlines, scenes, characters, images,
+      // rewrites, ...) live in the same table but are listed by their own
+      // endpoint, so active work of any type is restored after a refresh too.
+      try {
+        const universalRes = await fetch('/api/generations/universal?limit=20', { cache: 'no-store' });
+        if (universalRes.ok) {
+          const universal = await universalRes.json();
+          if (Array.isArray(universal.generations)) rows.push(...universal.generations);
+        }
+      } catch {
+        /* the chapter list alone is still a useful view */
+      }
+      if (!mounted.current) return;
       // The history query is bounded. Active jobs are returned separately so a
       // long-running generation cannot vanish from the indicator on refresh.
       const active: GenerationView[] = Array.isArray(data.activeGenerations)

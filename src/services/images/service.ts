@@ -10,11 +10,6 @@ import { coverPrompt } from '@/lib/ai/prompts';
 import { buildCoverPrompt, DEFAULT_COVER_STYLE } from '@/lib/ai/prompt-builder';
 import 'server-only';
 
-// --- UNIVERSAL GENERATION ENGINE INTEGRATION ---
-import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
-import { GenerationRequest, GenerationType } from '@/lib/ai/generation/generation-types';
-import { GenerationRegistry } from '@/lib/ai/generation/generation-registry';
-
 export interface GeneratedCover {
   imageId: string;
   url: string;
@@ -46,54 +41,9 @@ export async function generateCovers(
   variants = 2,
   options: { imageModel?: string; allowFallback?: boolean } = {},
 ): Promise<GeneratedCover[]> {
-  // --- UNIVERSAL ENGINE DISPATCH ---
-  // If the Universal Engine is registered for 'image', route it there.
-  if (GenerationRegistry.hasHandler('image')) {
-    const results: GeneratedCover[] = [];
-    for (let i = 0; i < variants; i++) {
-      const req: GenerationRequest = {
-        generationType: 'image',
-        projectId: novelId,
-        targetId: undefined,
-        userId,
-        prompt: promptOverride || buildNovelCoverPrompt(db, novel),
-        context: {
-          variant: i,
-          width: 768,
-          height: 1024,
-          ...(options.imageModel ? { model: options.imageModel } : {}),
-          allowFallback: options.allowFallback !== false,
-        },
-        stream: false,
-        metadata: {},
-        idempotencyKey: `cover:${novelId}:${i}`,
-      };
-
-      // The UniversalGenerationService handles creation and queuing via pg-boss
-      const jobId = await UniversalGenerationService.createJob(req);
-      
-      // Fetch the serialized job for response
-      const { getGenerationForUser } = await import('@/lib/jobs/generation-jobs');
-      const job = getGenerationForUser(userId, jobId);
-      if (job) {
-        // For the API response, we return the job ID and status. The actual image URL
-        // will be available once the job completes (via the event stream or polling).
-        // In this migration step, we return a placeholder GeneratedCover structure
-        // that will be populated by the UniversalGenerationService.
-        results.push({
-          imageId: jobId,
-          url: `/api/generations/${jobId}/events`, // Placeholder for SSE stream
-          provider: 'universal-engine',
-          source: 'universal-engine',
-          actualModel: job.requestedModel ?? null,
-          requestedModel: job.requestedModel ?? null,
-        });
-      }
-    }
-    return results;
-  }
-
-  // --- LEGACY DISPATCH (Fallback) ---
+  // Cover generation is synchronous and user-visible (concepts appear in the
+  // cover studio), so it stays in this service. Universal image jobs are
+  // executed by the worker instead; both go through the same provider layer.
   const db = getDb();
   const novel = db.prepare('SELECT * FROM novels WHERE id = ? AND userId = ?').get(novelId, userId) as any;
   if (!novel) throw new HttpError(404, 'Novel not found', 'novel_not_found');
