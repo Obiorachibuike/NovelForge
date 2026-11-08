@@ -66,6 +66,75 @@ export interface GenerationChunk {
   error?: string;
 }
 
+/**
+ * Runtime context handed to a registered handler by `executeJob`.
+ *
+ * It mirrors the queue's `JobHandlerContext`: the durable job id, the parsed
+ * job payload, and the cooperative-cancellation primitives. Handlers must use
+ * `jobId` (never `projectId`) when they persist or finalize job state.
+ */
+export interface GenerationExecutionContext {
+  /** The `generation_jobs` row this execution belongs to. */
+  jobId: string;
+  userId: string;
+  /** Novel id (`generation_jobs.novelId`). */
+  projectId: string;
+  /** Chapter/outline/asset id when the job targets one. */
+  targetId?: string | null;
+  /** The durable job payload, already parsed. */
+  payload: Record<string, unknown>;
+  /** Persists a stage and publishes a `generation_progress` event. */
+  setStage: (stage: string, data?: Record<string, unknown>) => void;
+  setProgress: (percent: number) => void;
+  isCancelled: () => boolean;
+  signal: AbortSignal;
+}
+
+/** A handler registered for one `GenerationType`. */
+export type GenerationHandler = (
+  request: GenerationRequest,
+  context: GenerationExecutionContext,
+) => Promise<unknown>;
+
+/**
+ * Job payloads are JSON round-tripped through the database, so every field is
+ * `unknown` at the edges. These readers keep the coercion in one place instead
+ * of scattering casts through call sites.
+ */
+export function payloadString(
+  payload: Record<string, unknown> | null | undefined,
+  key: string,
+): string | undefined {
+  const value = payload?.[key];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+export function payloadNumber(
+  payload: Record<string, unknown> | null | undefined,
+  key: string,
+): number | undefined {
+  const value = payload?.[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+export function payloadBoolean(
+  payload: Record<string, unknown> | null | undefined,
+  key: string,
+): boolean | undefined {
+  const value = payload?.[key];
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+export function payloadRecord(
+  payload: Record<string, unknown> | null | undefined,
+  key: string,
+): Record<string, unknown> {
+  const value = payload?.[key];
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
 export interface GenerationResult {
   text?: string;
   structuredData?: Record<string, unknown>;

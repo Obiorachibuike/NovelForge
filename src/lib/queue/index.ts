@@ -22,7 +22,14 @@ import 'server-only';
 
 // --- UNIVERSAL GENERATION ENGINE INTEGRATION ---
 import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
-import { GenerationRequest, GenerationType } from '@/lib/ai/generation/generation-types';
+import {
+  payloadBoolean,
+  payloadRecord,
+  payloadString,
+  type GenerationExecutionContext,
+  type GenerationRequest,
+  type GenerationType,
+} from '@/lib/ai/generation/generation-types';
 import { GenerationRegistry } from '@/lib/ai/generation/generation-registry';
 
 /**
@@ -251,28 +258,11 @@ export interface EnqueueOptions extends GenerationTask {
 }
 
 export async function enqueue(task: EnqueueOptions): Promise<string> {
-  // --- UNIVERSAL ENGINE DISPATCH ---
-  // If the task type is registered in the Universal Engine, route it there.
-  // Otherwise, fall back to the legacy queue logic.
-  if (GenerationRegistry.hasHandler(task.type as GenerationType)) {
-    const req: GenerationRequest = {
-      generationType: task.type as GenerationType,
-      projectId: task.novelId,
-      targetId: task.chapterId || undefined,
-      userId: task.userId,
-      prompt: task.payload?.prompt || '',
-      context: task.payload || {},
-      stream: task.payload?.stream ?? false,
-      metadata: task.payload?.metadata || {},
-      idempotencyKey: task.idempotencyKey,
-    };
-
-    // The UniversalGenerationService handles creation and queuing via pg-boss
-    const jobId = await UniversalGenerationService.createJob(req);
-    return jobId;
-  }
-
-  // --- LEGACY DISPATCH (Fallback) ---
+  // Every job — including one created through the universal generation API —
+  // enters through this single durable path: one insert, one idempotency guard,
+  // one dispatch. `UniversalGenerationService.createJob` calls `enqueue`, so a
+  // separate "universal" insert here would both duplicate the row and skip the
+  // dispatch that makes the job actually run.
   const db = getDb();
   const now = nowIso();
   const id = nanoid();
@@ -393,28 +383,57 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
   // If the task type is registered in the Universal Engine, route it there.
   // Otherwise, use the legacy handler registry.
   if (GenerationRegistry.hasHandler(job.taskType as GenerationType)) {
+    // Cancellation is cooperative here too: the poll aborts the in-flight
+    // provider request, exactly like the legacy handler path below.
+    const controller = new AbortController();
+    const cancelledError = () =>
+      Object.assign(new Error('Generation was cancelled.'), { retryable: false, code: 'cancelled' });
+    const cancelPoll = setInterval(() => {
+      try {
+        const row = db.prepare('SELECT status FROM generation_jobs WHERE id=?').get(id) as { status: JobStatus } | undefined;
+        if (!row || row.status === 'cancelled') {
+          if (!controller.signal.aborted) controller.abort(cancelledError());
+        }
+      } catch {
+        // A transient read must not abort a healthy job; the next tick retries.
+      }
+    }, Math.max(500, envInt('GENERATION_CANCEL_POLL_MS', 1500)));
+    if (typeof cancelPoll.unref === 'function') cancelPoll.unref();
+
     try {
-      // Map the JobRecord to a Universal GenerationRequest
+      // Map the claimed row onto a universal request. For jobs created through
+      // the universal API the payload is the round-tripped request; for jobs
+      // enqueued by a domain service it is that service's payload
+      // (`chapterNumber`, `structureType`, ...), which handlers read from
+      // `context.payload`.
+      const parsed = safeJson(job.payload ?? null);
+      const payload: Record<string, unknown> =
+        parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+          ? (parsed as Record<string, unknown>)
+          : {};
+
       const req: GenerationRequest = {
-        generationType: job.taskType as GenerationType,
+        generationType: (payloadString(payload, 'generationType') ?? job.taskType) as GenerationType,
         projectId: job.novelId,
-        targetId: job.chapterId || undefined,
+        targetId: job.chapterId || payloadString(payload, 'targetId'),
         userId: job.userId,
-        prompt: '', // Extracted from payload in UniversalGenerationService
-        context: job.payload ? JSON.parse(job.payload) : {},
-        stream: false,
-        metadata: {},
-        idempotencyKey: job.idempotencyKey,
+        prompt: payloadString(payload, 'prompt') ?? '',
+        context: payloadRecord(payload, 'context'),
+        provider: payloadString(payload, 'provider'),
+        model: payloadString(payload, 'model'),
+        stream: payloadBoolean(payload, 'stream') ?? false,
+        metadata: payloadRecord(payload, 'metadata'),
+        idempotencyKey: job.idempotencyKey ?? undefined,
       };
 
-      // The UniversalGenerationService.executeJob handles the execution and persistence
-      // We pass the JobRecord context to ensure the database row is updated correctly.
-      const context = {
-        id,
-        payload: req.context,
-        novelId: job.novelId,
+      // The engine and its handlers write progress and results against this
+      // durable job id — never against the novel id.
+      const context: GenerationExecutionContext = {
+        jobId: id,
         userId: job.userId,
-        chapterId: job.chapterId ?? null,
+        projectId: job.novelId,
+        targetId: job.chapterId ?? null,
+        payload,
         setStage: (stage: GenerationStage | string, data?: Record<string, unknown>) => {
           const stamp = nowIso();
           try {
@@ -445,6 +464,7 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
             .run(value, value, nowIso(), id);
         },
         isCancelled: () => {
+          if (controller.signal.aborted) return true;
           try {
             const row = db.prepare('SELECT status FROM generation_jobs WHERE id=?').get(id) as { status: JobStatus } | undefined;
             return !row || row.status === 'cancelled';
@@ -452,12 +472,12 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
             return false;
           }
         },
-        signal: new AbortController().signal, // UniversalGenerationService manages its own abort logic
+        signal: controller.signal,
       };
 
       // Execute via Universal Engine
       await UniversalGenerationService.executeJob(req, context);
-      
+
       // Finalize job row based on Universal Engine result (handled internally by UniversalGenerationService)
       // For now, we mark as completed if executeJob succeeds.
       const finished = nowIso();
@@ -480,11 +500,18 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
 
     } catch (err) {
       // Handle Universal Engine errors
+      if (controller.signal.aborted) {
+        // Cancellation already wrote the row (`status='cancelled'`), the chapter
+        // status and the `generation_cancelled` event; report it honestly
+        // instead of classifying the abort as a failure or a retry.
+        return { id, status: 'cancelled' };
+      }
       const classified = classifyJobError(err);
-      const attempts = (db.prepare('SELECT attempts FROM generation_jobs WHERE id=?').get(id) as { attempts: number }).attempts;
+      const attempts =
+        (db.prepare('SELECT attempts FROM generation_jobs WHERE id=?').get(id) as { attempts: number } | undefined)
+          ?.attempts ?? job.attempts ?? 1;
       const maxAttempts = job.maxAttempts || 3;
       const finished = nowIso();
-      
       if (!classified.retryable || attempts >= maxAttempts) {
         db.prepare(
           `UPDATE generation_jobs
@@ -520,6 +547,8 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
       }
       await dispatch(id, { delayMs: backoffMs, priority: job.priority ?? 0 });
       return { id, status: 'queued', reason: classified.message };
+    } finally {
+      clearInterval(cancelPoll);
     }
   }
 
@@ -812,25 +841,11 @@ export function cancelJob(id: string): boolean {
   const now = nowIso();
   const job = db.prepare('SELECT * FROM generation_jobs WHERE id=?').get(id) as JobRecord | undefined;
   if (!job) return false;
-  
-  // --- UNIVERSAL ENGINE CANCELLATION ---
-  if (GenerationRegistry.hasHandler(job.taskType as GenerationType)) {
-    // The UniversalGenerationService handles cancellation via its own persistence
-    const cancelled = UniversalGenerationService.cancelJob(id);
-    if (cancelled) {
-      if (job.taskType === 'chapter') {
-        updateChapterGenerationStatus(job.chapterId, 'CANCELLED');
-        emitLifecycle(job, GenerationEventType.CANCELLED, {
-          notify: true,
-          message: 'Generation cancelled. Existing chapter content was preserved.',
-        });
-      }
-      return true;
-    }
-    return false;
-  }
 
-  // --- LEGACY CANCELLATION (Fallback) ---
+  // One cancellation path for every job, universal or not: a universal job is a
+  // normal `generation_jobs` row, so the same guarded UPDATE, chapter status
+  // write and `generation_cancelled` event apply. The running worker observes
+  // the status and aborts the provider request.
   const res = db.prepare(
     `UPDATE generation_jobs
         SET status='cancelled', updatedAt=?, completedAt=COALESCE(completedAt, ?), claimedAt=NULL, claimedBy=NULL,
@@ -860,23 +875,9 @@ export async function retryJob(id: string, options: { priority?: number } = {}):
   const job = db.prepare('SELECT * FROM generation_jobs WHERE id=?').get(id) as JobRecord | undefined;
   if (!job) return false;
 
-  // --- UNIVERSAL ENGINE RETRY ---
-  if (GenerationRegistry.hasHandler(job.taskType as GenerationType)) {
-    const retried = await UniversalGenerationService.retryJob(id);
-    if (retried) {
-      if (job.taskType === 'chapter') {
-        updateChapterGenerationStatus(job.chapterId, 'QUEUED');
-        emitLifecycle({ ...job, attempts: 0 }, GenerationEventType.QUEUED, {
-          data: { manualRetry: true },
-        });
-      }
-      await dispatch(id, { priority: options.priority ?? job.priority ?? 0 });
-      return true;
-    }
-    return false;
-  }
-
-  // --- LEGACY RETRY (Fallback) ---
+  // One retry path for every job: re-queueing a universal job is the same
+  // guarded UPDATE as any other row, and it keeps the idempotency-conflict
+  // check below (a newer attempt for the same chapter must win).
   // A newer attempt may already be running for this chapter. Re-queueing the
   // old row would violate the active-idempotency index and could write the
   // chapter twice, so the retry is refused instead.

@@ -1,14 +1,18 @@
 import 'server-only';
-import { GenerationRequest, GenerationType } from './generation-types';
+import type { GenerationHandler, GenerationType } from './generation-types';
 
 /**
  * Registry for generation types.
  * Allows new features to register handlers without modifying the core engine.
+ *
+ * A handler receives the validated `GenerationRequest` plus the queue's
+ * `GenerationExecutionContext` (durable job id, parsed payload, cancellation),
+ * so it can persist progress against the real job row.
  */
 export const GenerationRegistry = {
-  handlers: new Map<GenerationType, (request: GenerationRequest) => Promise<unknown>>(),
+  handlers: new Map<GenerationType, GenerationHandler>(),
 
-  register(type: GenerationType, handler: (request: GenerationRequest) => Promise<unknown>) {
+  register(type: GenerationType, handler: GenerationHandler) {
     if (this.handlers.has(type)) {
       console.warn(`[generation-registry] Overwriting handler for ${type}`);
     }

@@ -1,92 +1,156 @@
 import 'server-only';
-import { GenerationRequest, GenerationResult, GenerationChunk } from './generation-types';
+import type {
+  GenerationExecutionContext,
+  GenerationRequest,
+  GenerationResult,
+} from './generation-types';
 import { GenerationRegistry } from './generation-registry';
-import { createGenerationJob, persistChunk, finalizeJob, cancelJob } from './generation-persistence';
+import { cancelJob, finalizeJob, persistChunk } from './generation-persistence';
 import { validateGenerationRequest } from './generation-validation';
-import { classifyJobError } from '@/lib/queue';
-import { generateTextDetailed, streamText, generateStructuredDetailed } from '@/lib/ai/text-generation';
-import { generateTextAgnes, generateStructuredAgnes } from '@/lib/ai/agnes-generation';
-import { generateTextHuggingFace, generateStructuredHuggingFace } from '@/lib/ai/hf-text-generation';
-import { generateImageAgnes } from '@/lib/ai/agnes-generation';
-import { agnesBackendActive, huggingFaceBackendActive, hostedBackendActive } from '@/lib/ai/text-generation';
+import { enqueue, type EnqueueOptions } from '@/lib/queue';
+import {
+  agnesBackendActive,
+  generateTextDetailed,
+  huggingFaceBackendActive,
+  type GenerationMeta,
+} from '@/lib/ai/text-generation';
+import { generateTextAgnes } from '@/lib/ai/agnes-generation';
+import { generateTextHuggingFace } from '@/lib/ai/hf-text-generation';
 import { aiConfig } from '@/lib/ai/provider';
-import { ChatMessage } from '@/types';
+import type { ChatMessage } from '@/types';
 
 /**
  * UniversalGenerationService
  *
  * Central engine that handles:
- * 1. Job creation (persistence)
- * 2. Provider selection & capability detection
- * 3. Real-time incremental streaming (where supported)
- * 4. Background execution (via pg-boss & worker)
- * 5. Chunk persistence & event publishing
- * 6. Cancellation & retry
+ * 1. Job creation — through the one durable queue (`enqueue`), so a universal
+ *    job is a normal `generation_jobs` row that is dispatched, retried,
+ *    cancelled and recovered like every other job;
+ * 2. Provider selection & capability detection;
+ * 3. Real-time incremental streaming (where supported);
+ * 4. Chunk persistence & event publishing;
+ * 5. Cancellation.
+ *
+ * Execution always receives the durable job id and payload through
+ * `GenerationExecutionContext`; nothing here derives job state from the novel id.
  */
+
+/** Generation types the built-in engine can serve without a registered handler. */
+const BUILT_IN_TEXT_TYPES = new Set<string>([
+  'chapter',
+  'chapter_outline',
+  'story_outline',
+  'novel_summary',
+  'novel_description',
+  'novel_title',
+  'story_idea',
+  'character',
+  'character_backstory',
+  'worldbuilding',
+  'location',
+  'culture',
+  'history',
+  'rewrite',
+  'expand',
+  'summarize',
+  'shorten',
+  'proofread',
+  'humanize',
+  'premise',
+  'outline',
+]);
+
+type ResultMeta = GenerationResult['meta'];
+
+/**
+ * Provider adapters report `attempts`/`latencyMs` as optional; a persisted
+ * result always states them so the UI and cost reporting never guess.
+ */
+function toResultMeta(meta: GenerationMeta): ResultMeta {
+  return {
+    source: meta.source,
+    model: meta.model,
+    ...(meta.actualModel ? { actualModel: meta.actualModel } : {}),
+    ...(meta.provider ? { provider: meta.provider } : {}),
+    usedFallback: Boolean(meta.usedFallback),
+    ...(meta.fallbackReason ? { fallbackReason: meta.fallbackReason } : {}),
+    attempts: meta.attempts ?? 1,
+    latencyMs: meta.latencyMs ?? 0,
+  };
+}
+
+/** Maps a validated universal request onto the durable queue's task shape. */
+function toEnqueueOptions(request: GenerationRequest): EnqueueOptions {
+  const payload: Record<string, unknown> = {
+    prompt: request.prompt,
+    generationType: request.generationType,
+  };
+  if (request.targetType) payload.targetType = request.targetType;
+  if (request.targetId) payload.targetId = request.targetId;
+  if (request.provider) payload.provider = request.provider;
+  if (request.model) payload.model = request.model;
+  if (request.stream) payload.stream = true;
+  if (request.metadata) payload.metadata = request.metadata;
+  if (request.context) payload.context = request.context;
+
+  // `generation_jobs.chapterId` is the chapter column (it drives the sequential
+  // gate and the API's chapter join), so only a chapter target may fill it.
+  const isChapterTarget =
+    request.generationType === 'chapter' || request.targetType === 'chapter';
+
+  return {
+    type: request.generationType,
+    novelId: request.projectId,
+    userId: request.userId,
+    chapterId: isChapterTarget ? request.targetId ?? null : null,
+    payload,
+    ...(request.idempotencyKey ? { idempotencyKey: request.idempotencyKey } : {}),
+  };
+}
+
 export class UniversalGenerationService {
   /**
-   * Creates a generation job and returns the ID.
-   * The worker will pick it up.
+   * Creates a durable generation job and returns its ID.
+   *
+   * The job row is inserted by the queue (idempotency, priority, lifecycle
+   * events with real ownership) and dispatched to pg-boss or the worker sweep,
+   * which calls `executeJob` when it claims the row.
    */
   static async createJob(request: GenerationRequest): Promise<string> {
     const validated = validateGenerationRequest(request);
-    return createGenerationJob(validated);
+    return enqueue(toEnqueueOptions(validated));
   }
 
   /**
-   * Worker handler: executes the generation.
-   * Supports streaming for text generation.
+   * Worker handler: executes the generation described by a claimed job row.
+   *
+   * Registered handlers win (they own their domain's persistence); everything
+   * else falls back to the built-in text engine.
    */
   static async executeJob(
-    jobId: string,
     request: GenerationRequest,
-    context: {
-      setStage: (stage: string, data?: Record<string, unknown>) => void;
-      setProgress: (percent: number) => void;
-      isCancelled: () => boolean;
-      signal: AbortSignal;
-    }
-  ): Promise<GenerationResult> {
-    const { generationType, prompt, context: genContext, provider, model, stream, userId, projectId, targetId } = request;
-
-    // Check if registered handler exists (allows future extensions)
-    const handler = GenerationRegistry.getHandler(generationType);
+    context: GenerationExecutionContext,
+  ): Promise<unknown> {
+    const handler = GenerationRegistry.getHandler(request.generationType);
     if (handler) {
-      // Custom registered handler
-      return await handler(request);
+      return await handler(request, context);
     }
 
-    // Fallback to core implementations for migrated types
-    switch (generationType) {
-      case 'chapter':
-      case 'chapter_outline':
-      case 'story_outline':
-      case 'novel_summary':
-      case 'novel_description':
-      case 'novel_title':
-      case 'story_idea':
-      case 'character':
-      case 'character_backstory':
-      case 'worldbuilding':
-      case 'location':
-      case 'culture':
-      case 'history':
-      case 'rewrite':
-      case 'expand':
-      case 'summarize':
-      case 'shorten':
-      case 'proofread':
-      case 'humanize':
-      case 'premise':
-      case 'outline':
-        return await this.handleTextGeneration(request, context);
-
-      case 'image':
-        return await this.handleImageGeneration(request, context);
-
-      default:
-        throw new Error(`No handler registered for generation type: ${generationType}`);
+    if (BUILT_IN_TEXT_TYPES.has(request.generationType)) {
+      return await this.handleTextGeneration(request, context);
     }
+
+    if (request.generationType === 'image') {
+      // Covers own storage, per-novel limits and honest fallback labelling in
+      // `generateCovers` (src/services/images/service.ts). The universal engine
+      // has no asset pipeline, so generating here would burn a paid image call
+      // and throw the bytes away.
+      throw new Error(
+        'Image generation runs through the cover service, not the universal generation engine.',
+      );
+    }
+
+    throw new Error(`No handler registered for generation type: ${request.generationType}`);
   }
 
   /**
@@ -94,63 +158,62 @@ export class UniversalGenerationService {
    */
   private static async handleTextGeneration(
     request: GenerationRequest,
-    context: {
-      setStage: (stage: string, data?: Record<string, unknown>) => void;
-      setProgress: (percent: number) => void;
-      isCancelled: () => boolean;
-      signal: AbortSignal;
-    }
+    context: GenerationExecutionContext,
   ): Promise<GenerationResult> {
     const { prompt, userId, projectId, targetId, generationType, provider, model, stream } = request;
 
-    // Construct messages (simplified for universal engine - services will pass specific prompts)
+    // Construct messages (simplified for universal engine — registered handlers
+    // build their own domain prompts).
     const messages: ChatMessage[] = [
-      { role: 'system', content: `You are generating content for ${generationType}. Follow the context provided.` },
+      {
+        role: 'system',
+        content: `You are generating content for ${generationType}. Follow the context provided.`,
+      },
       { role: 'user', content: prompt },
     ];
 
     // Capability detection
-    const isStreamingSupported = stream && (agnesBackendActive() || huggingFaceBackendActive());
+    const isStreamingSupported = Boolean(stream) && (agnesBackendActive() || huggingFaceBackendActive());
 
-    if (isStreamingSupported && generationType !== 'image') {
-      // Real provider streaming
+    const shared = {
+      messages,
+      userId,
+      novelId: projectId,
+      chapterId: targetId,
+      jobId: context.jobId,
+      taskType: generationType,
+      signal: context.signal,
+    };
+
+    let result: GenerationResult;
+
+    if (isStreamingSupported) {
+      // Real provider streaming. Chunks are persisted against the job row,
+      // which also acts as the worker heartbeat for a long generation.
       context.setStage('GENERATING_CONTENT');
       let accumulatedText = '';
       let sequence = 0;
-
-      // Choose provider adapter
-      const input = {
-        messages,
-        model,
-        userId,
-        novelId: projectId,
-        chapterId: targetId,
-        jobId: jobId,
-        taskType: generationType,
-        signal: context.signal,
-        onText: (chunk: string) => {
-          if (context.isCancelled()) throw new Error('Cancelled');
-          sequence++;
-          accumulatedText += chunk;
-          persistChunk(jobId, sequence, chunk);
-          context.setStage('STREAMING_CONTENT', { chunk });
-        },
+      const onText = (chunk: string) => {
+        if (context.isCancelled()) throw new Error('Generation was cancelled.');
+        sequence += 1;
+        accumulatedText += chunk;
+        persistChunk(context.jobId, sequence, chunk);
       };
 
-      // Provider routing
-      let result: GenerationResult;
       if (agnesBackendActive() && !provider?.includes('huggingface')) {
-        // Agnes streaming (via chat-stream adapter)
-        // Note: agnesChatCompletion supports onText in agnes-generation.ts
-        const agnesInput = { ...input, model: model || aiConfig.textModel, maxTokens: 4096 };
-        const completion = await generateTextAgnes(agnesInput);
+        const completion = await generateTextAgnes({
+          ...shared,
+          onText,
+          model: model || aiConfig.textModel,
+          maxTokens: 4096,
+        });
         result = {
           text: accumulatedText || completion.text,
           meta: {
             source: 'agnes',
             model: completion.model,
             actualModel: completion.model,
-            provider: 'agnes-ai',
+            provider: completion.provider || 'agnes-ai',
             usedFallback: false,
             attempts: completion.attempts,
             latencyMs: completion.latencyMs,
@@ -159,9 +222,12 @@ export class UniversalGenerationService {
           },
         };
       } else if (huggingFaceBackendActive()) {
-        // HF streaming
-        const hfInput = { ...input, model: model || 'auto', allowModelFallback: true };
-        const completion = await generateTextHuggingFace(hfInput);
+        const completion = await generateTextHuggingFace({
+          ...shared,
+          onText,
+          model: model || 'auto',
+          allowFallback: true,
+        });
         result = {
           text: accumulatedText || completion.text,
           meta: {
@@ -177,93 +243,36 @@ export class UniversalGenerationService {
           },
         };
       } else {
-        // OpenAI or fallback
-        const openaiInput = { ...input, model: model || aiConfig.textModel };
-        const completion = await generateTextDetailed(openaiInput);
+        const completion = await generateTextDetailed({
+          ...shared,
+          onText,
+          model: model || aiConfig.textModel,
+          allowFallbackOnError: false,
+        });
         result = {
           text: accumulatedText || completion.text,
-          meta: completion.meta,
+          meta: toResultMeta(completion.meta),
         };
       }
-
-      finalizeJob(jobId, 'completed', result);
-      return result;
-
     } else {
-      // Non-streaming or image generation fallback
+      // Non-streaming: no provider supports streaming for this request, so the
+      // caller gets one final result and the job row is finalized once.
       context.setStage('PROCESSING');
-      let result: GenerationResult;
-
-      switch (generationType) {
-        case 'image':
-          result = await this.handleImageGeneration(request, context);
-          break;
-        default:
-          // Standard text generation (non-streaming or provider without streaming)
-          const input = {
-            messages,
-            model,
-            userId,
-            novelId: projectId,
-            chapterId: targetId,
-            jobId,
-            taskType: generationType,
-            signal: context.signal,
-            allowFallbackOnError: false,
-          };
-          result = await generateTextDetailed(input);
-      }
-
-      finalizeJob(jobId, 'completed', result);
-      return result;
+      const completion = await generateTextDetailed({
+        ...shared,
+        model,
+        allowFallbackOnError: false,
+      });
+      result = { text: completion.text, meta: toResultMeta(completion.meta) };
     }
-  }
 
-  /**
-   * Image generation (asynchronous, no text streaming)
-   */
-  private static async handleImageGeneration(
-    request: GenerationRequest,
-    context: {
-      setStage: (stage: string, data?: Record<string, unknown>) => void;
-      setProgress: (percent: number) => void;
-      isCancelled: () => boolean;
-      signal: AbortSignal;
-    }
-  ): Promise<GenerationResult> {
-    const { prompt, userId, projectId, model } = request;
-    context.setStage('GENERATING_IMAGE');
-
-    const input = {
-      prompt,
-      model,
-      userId,
-      novelId: projectId,
-      jobId: context.signal?.aborted ? null : undefined, // injected in service
-      taskType: 'image',
-      signal: context.signal,
-    };
-
-    const output = await generateImageAgnes(input as any);
-
-    const result: GenerationResult = {
-      meta: {
-        source: 'agnes',
-        model: output.model,
-        provider: 'agnes-ai',
-        usedFallback: false,
-        attempts: output.attempts,
-        latencyMs: output.latencyMs,
-        cost: output.cost,
-      },
-    };
-
-    finalizeJob(request.projectId, 'completed', result);
+    finalizeJob(context.jobId, 'completed', result);
     return result;
   }
 
   /**
-   * Cancellation
+   * Cancellation. The queue's `cancelJob` owns the durable path (status guard,
+   * chapter status, notifications); this is the engine-level entry point.
    */
   static cancel(jobId: string, reason?: string) {
     return cancelJob(jobId, reason);

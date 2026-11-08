@@ -1,137 +1,126 @@
 /**
  * UNIVERSAL GENERATION REGISTRY INTEGRATION
  *
- * Registers existing NovelForge services into the UniversalGenerationService.
+ * Adapts the existing NovelForge domain services (chapters, outlines, premise,
+ * humanization) to the `GenerationRegistry` contract used by
+ * `UniversalGenerationService.executeJob`.
+ *
+ * STATUS: this module is intentionally **not imported anywhere yet**, so none of
+ * these handlers are registered at runtime and every job still runs through the
+ * queue's own handler registry (`registerHandler` in each service). Importing it
+ * from the worker entry point reroutes those task types through the universal
+ * engine; that switch needs its own execution, cancellation, retry and provider
+ * tests before it is enabled (see docs/audit-2026-11-01.md §2).
+ *
+ * Handlers receive the durable job id and parsed payload through
+ * `GenerationExecutionContext`, so they pass the real `jobId` to the services —
+ * never the novel id — which is what keeps crash-resumption and provenance
+ * working (`chapters.lastJobId`).
  */
 
+import 'server-only';
 import { GenerationRegistry } from '@/lib/ai/generation/generation-registry';
-import { GenerationRequest } from '@/lib/ai/generation/generation-types';
-import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
-import { registerHandler } from '@/lib/queue';
+import {
+  payloadBoolean,
+  payloadNumber,
+  payloadString,
+  type GenerationRequest,
+  type GenerationResult,
+} from '@/lib/ai/generation/generation-types';
+import type { HumanizationMode } from '@/services/humanization/service';
 
-// Import services
-import { runChapterGeneration, enqueueChapterGeneration } from '@/services/chapters/service';
-import { runOutline, enqueueOutline } from '@/services/outlines/service';
-import { runPremise, enqueuePrepareNovel } from '@/services/preparation/service';
+import { runChapterGeneration } from '@/services/chapters/service';
+import { runOutline } from '@/services/outlines/service';
+import { runPremise } from '@/services/preparation/service';
 
-// 1. Chapter Generation Handler
-GenerationRegistry.register('chapter', async (request: GenerationRequest) => {
-  const { projectId, userId, targetId, payload, context, signal, setStage, isCancelled } = request;
-  
-  // Adapt UniversalRequest to existing service signature
-  const servicePayload = {
-    chapterNumber: payload?.chapterNumber || 1,
-    confirmOverwrite: payload?.confirmOverwrite || false,
-    textModel: payload?.model || undefined,
-    allowFallback: payload?.allowFallback !== false,
-  };
+// 1. Chapter generation
+GenerationRegistry.register('chapter', async (request: GenerationRequest, context) => {
+  const payload = context.payload;
 
-  // Note: runChapterGeneration expects specific context. We map UniversalGenerationService context.
-  const handlerContext = {
-    id: request.projectId, // placeholder, actual jobId passed in payload or context
-    payload: servicePayload,
-    novelId: projectId,
-    userId,
-    chapterId: targetId,
-    setStage: context.setStage,
-    setProgress: context.setProgress,
-    isCancelled,
-    signal,
-  };
-
-  // In real integration, we would call runChapterGeneration directly with the context.
-  // The existing runChapterGeneration takes { id, novelId, userId, payload, setStage, isCancelled, signal }
-  // We adapt the UniversalGenerationService context to match.
-  
-  // Note: We need to pass the actual jobId from the universal engine into the service handler.
-  // The UniversalGenerationService.executeJob will call this handler.
-  
-  // For now, we register the handler to route to the existing service logic.
-  // The actual implementation of runChapterGeneration already handles streaming via `onText`.
-  
-  // We'll wrap the existing runChapterGeneration to match UniversalGenerationService's signature.
   return await runChapterGeneration({
-    id: request.projectId, // We'll pass the actual jobId in executeJob context
-    novelId: projectId,
-    userId,
-    payload: servicePayload,
+    id: context.jobId,
+    novelId: request.projectId,
+    userId: request.userId,
+    chapterId: request.targetId ?? null,
+    payload: {
+      chapterNumber: payloadNumber(payload, 'chapterNumber') ?? 1,
+      confirmOverwrite: payloadBoolean(payload, 'confirmOverwrite') ?? false,
+      textModel:
+        payloadString(payload, 'textModel') ??
+        payloadString(payload, 'model') ??
+        request.model,
+      allowFallback: payloadBoolean(payload, 'allowFallback') !== false,
+    },
     setStage: context.setStage,
-    isCancelled,
-    signal,
-  } as any); // Cast to match existing service signature
+    isCancelled: context.isCancelled,
+    signal: context.signal,
+  });
 });
 
-// 2. Outline Generation Handler
-GenerationRegistry.register('outline', async (request: GenerationRequest) => {
-  const { projectId, userId, payload, context, signal, setStage, isCancelled } = request;
-  
-  const servicePayload = {
-    structureType: payload?.structureType || 'three-act',
-    textModel: payload?.model || undefined,
-    allowFallback: payload?.allowFallback !== false,
-  };
+// 2. Outline generation
+GenerationRegistry.register('outline', async (request: GenerationRequest, context) => {
+  const payload = context.payload;
 
-  // Adapt UniversalRequest to existing service signature
-  // Note: runOutline takes { id, novelId, userId, payload }
   return await runOutline({
-    id: request.projectId, // placeholder
-    novelId: projectId,
-    userId,
-    payload: servicePayload,
-  } as any);
+    id: context.jobId,
+    novelId: request.projectId,
+    userId: request.userId,
+    payload: {
+      structureType: payloadString(payload, 'structureType') ?? 'three-act',
+      textModel: payloadString(payload, 'textModel') ?? request.model,
+      allowFallback: payloadBoolean(payload, 'allowFallback') !== false,
+    },
+  });
 });
 
-// 3. Premise Generation Handler
-GenerationRegistry.register('premise', async (request: GenerationRequest) => {
-  const { projectId, userId, payload, context, signal, setStage, isCancelled } = request;
-  
-  const servicePayload = {
-    textModel: payload?.model || undefined,
-    allowFallback: payload?.allowFallback !== false,
-  };
+// 3. Premise generation
+GenerationRegistry.register('premise', async (request: GenerationRequest, context) => {
+  const payload = context.payload;
 
   return await runPremise({
-    id: request.projectId,
-    novelId: projectId,
-    userId,
-    payload: servicePayload,
-  } as any);
+    id: context.jobId,
+    novelId: request.projectId,
+    userId: request.userId,
+    payload: {
+      textModel: payloadString(payload, 'textModel') ?? request.model,
+      allowFallback: payloadBoolean(payload, 'allowFallback') !== false,
+    },
+  });
 });
 
-// 4. Humanize Handler (Migration)
-GenerationRegistry.register('humanize', async (request: GenerationRequest) => {
-  const { prompt, context, userId, projectId, targetId, model, signal, isCancelled, setStage } = request;
+// 4. Humanization (synchronous request/response; no durable domain row)
+GenerationRegistry.register('humanize', async (request: GenerationRequest, context) => {
+  // Imported lazily: the humanization service pulls in the provider clients and
+  // is only needed when this handler actually runs.
   const { humanizePassage } = await import('@/services/humanization/service');
-  
-  setStage('PROCESSING_HUMANIZE');
-  
-  const result = await humanizePassage({
-    text: prompt,
-    modelId: model,
-    mode: context?.mode || 'natural',
-    instructions: context?.instructions || '',
-    context: context?.context || '',
+
+  context.setStage('PROCESSING_HUMANIZE');
+
+  const requestedMode = payloadString(request.context, 'mode');
+  const mode: HumanizationMode =
+    requestedMode === 'light' || requestedMode === 'deep' ? requestedMode : 'natural';
+
+  const rewritten = await humanizePassage({
+    text: request.prompt,
+    modelId: request.model,
+    mode,
+    instructions: payloadString(request.context, 'instructions') ?? '',
+    context: payloadString(request.context, 'context') ?? '',
   });
 
-  // Persist result via UniversalGenerationService logic (handled in executeJob)
-  // We return the result structure
-  return {
-    text: result.revised,
+  const result: GenerationResult = {
+    text: rewritten.revised,
     meta: {
-      source: result.provider?.includes('agnes') ? 'agnes' : 'huggingface',
-      model: result.modelId,
-      actualModel: result.modelId,
-      provider: result.provider,
+      source: rewritten.provider?.includes('agnes') ? 'agnes' : 'huggingface',
+      model: rewritten.modelId,
+      actualModel: rewritten.modelId,
+      provider: rewritten.provider,
       usedFallback: false,
       attempts: 1,
-      latencyMs: result.latencyMs,
-      usage: result.usage,
+      latencyMs: rewritten.latencyMs ?? 0,
+      usage: rewritten.usage,
     },
   };
+
+  return result;
 });
-
-// Register existing chapter handler in queue.ts as well (for backward compatibility during transition)
-// We'll keep the existing queue/worker logic but route everything through UniversalGenerationService.
-
-// Update existing queue/index.ts runJob to call UniversalGenerationService.executeJob
-// This will be done in the next step (modifying src/lib/queue/index.ts)
