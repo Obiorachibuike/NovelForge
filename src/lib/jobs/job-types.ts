@@ -33,6 +33,9 @@ export type InternalJobStatus =
  * performs; they are not synthetic timers.
  */
 export const GenerationStage = {
+  QUEUED: 'QUEUED',
+  STARTING: 'STARTING',
+  PREPARING_GENERATION: 'PREPARING_GENERATION',
   PREPARING_CHAPTER: 'PREPARING_CHAPTER',
   LOADING_NOVEL_CONTEXT: 'LOADING_NOVEL_CONTEXT',
   PREPARING_AI_PROMPT: 'PREPARING_AI_PROMPT',
@@ -41,6 +44,11 @@ export const GenerationStage = {
   PROCESSING_AI_RESPONSE: 'PROCESSING_AI_RESPONSE',
   VALIDATING_CHAPTER: 'VALIDATING_CHAPTER',
   SAVING_CHAPTER: 'SAVING_CHAPTER',
+  // Universal engine stages (any generation type that is not a chapter).
+  GENERATING_CONTENT: 'GENERATING_CONTENT',
+  STREAMING_CONTENT: 'STREAMING_CONTENT',
+  GENERATING_IMAGE: 'GENERATING_IMAGE',
+  SAVING_RESULT: 'SAVING_RESULT',
   COMPLETED: 'COMPLETED',
 } as const;
 
@@ -48,6 +56,9 @@ export type GenerationStage = (typeof GenerationStage)[keyof typeof GenerationSt
 
 /** Human-readable stage labels shown by the global indicator and chapter list. */
 export const STAGE_LABELS: Record<string, string> = {
+  QUEUED: 'Queued',
+  STARTING: 'Starting',
+  PREPARING_GENERATION: 'Preparing generation',
   PREPARING_CHAPTER: 'Preparing chapter',
   LOADING_NOVEL_CONTEXT: 'Loading novel context',
   PREPARING_AI_PROMPT: 'Preparing AI prompt',
@@ -56,8 +67,59 @@ export const STAGE_LABELS: Record<string, string> = {
   PROCESSING_AI_RESPONSE: 'Processing AI response',
   VALIDATING_CHAPTER: 'Validating chapter',
   SAVING_CHAPTER: 'Saving chapter',
+  GENERATING_CONTENT: 'Generating content',
+  STREAMING_CONTENT: 'Streaming content',
+  GENERATING_IMAGE: 'Generating image',
+  SAVING_RESULT: 'Saving',
   COMPLETED: 'Completed',
 };
+
+/**
+ * Human label for a generation/task type.
+ *
+ * Client-safe (no `server-only` import) so the global generation indicator can
+ * name every kind of background work — a chapter, a novel title, a cover image,
+ * a rewrite — without importing the server-side generation vocabulary.
+ */
+export const TASK_TYPE_LABELS: Record<string, string> = {
+  novel_title: 'Novel title',
+  novel_description: 'Novel description',
+  novel_summary: 'Novel summary',
+  story_idea: 'Story idea',
+  story_outline: 'Story outline',
+  chapter_outline: 'Chapter outline',
+  premise: 'Premise',
+  outline: 'Outline',
+  book_blurb: 'Book blurb',
+  author_bio: 'Author biography',
+  marketing_copy: 'Marketing copy',
+  chapter: 'Chapter',
+  page: 'Page',
+  scene: 'Scene',
+  memory: 'Story memory',
+  character: 'Character',
+  character_backstory: 'Character backstory',
+  character_relationship: 'Character relationship',
+  worldbuilding: 'Worldbuilding',
+  location: 'Location',
+  culture: 'Culture',
+  history: 'History',
+  rewrite: 'Rewrite',
+  expand: 'Expansion',
+  summarize: 'Summary',
+  shorten: 'Shortened text',
+  proofread: 'Proofread text',
+  humanize: 'Humanized text',
+  image: 'Image',
+  custom: 'Custom generation',
+  export: 'Export',
+  consistency: 'Consistency check',
+};
+
+export function taskTypeLabel(taskType?: string | null): string {
+  if (!taskType) return 'Generation';
+  return TASK_TYPE_LABELS[taskType] || taskType.replace(/[_-]+/g, ' ');
+}
 
 export function stageLabel(stage?: string | null): string | null {
   if (!stage) return null;
@@ -101,6 +163,12 @@ export const GenerationEventType = {
   QUEUED: 'generation_queued',
   STARTED: 'generation_started',
   PROGRESS: 'generation_progress',
+  /**
+   * One incremental chunk of generated text. `data.delta` is the new text and
+   * `data.sequence` is monotonic per job, which is what lets a reconnecting
+   * client rebuild the content without duplicating it.
+   */
+  CONTENT: 'generation_content',
   COMPLETED: 'generation_completed',
   FAILED: 'generation_failed',
   CANCELLED: 'generation_cancelled',

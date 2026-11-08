@@ -41,12 +41,9 @@ export async function generateCovers(
   variants = 2,
   options: { imageModel?: string; allowFallback?: boolean } = {},
 ): Promise<GeneratedCover[]> {
-  // Cover generation deliberately does NOT route through the universal engine:
-  // this function owns the per-novel cover limit, the storage write, the
-  // `image_assets` row and the honest labelling of a substituted SVG concept
-  // (`source: 'svg-fallback'`). A queued job id cannot stand in for a stored
-  // cover, and `GeneratedCover.source` has no 'universal-engine' member — a
-  // placeholder here would be served to the UI as if it were a real cover.
+  // Cover generation is synchronous and user-visible (concepts appear in the
+  // cover studio), so it stays in this service. Universal image jobs are
+  // executed by the worker instead; both go through the same provider layer.
   const db = getDb();
   const novel = db.prepare('SELECT * FROM novels WHERE id = ? AND userId = ?').get(novelId, userId) as any;
   if (!novel) throw new HttpError(404, 'Novel not found', 'novel_not_found');

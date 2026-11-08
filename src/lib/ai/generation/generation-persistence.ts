@@ -1,203 +1,428 @@
 import 'server-only';
 import { getDb } from '@/lib/db';
-import type { GenerationResult } from './generation-types';
+import { nanoid } from 'nanoid';
 import {
   GenerationEventType,
-  GenerationStatus,
-  type GenerationStage,
+  type GenerationJobRow,
 } from '@/lib/jobs/job-types';
-import { safePublishGenerationEvent } from '@/lib/jobs/events';
+import { publishGenerationEvent, safePublishGenerationEvent } from '@/lib/jobs/events';
+import type {
+  GenerationRequest,
+  GenerationResultMeta,
+} from './generation-types';
+import { parseGenerationType } from './generation-types';
 
 /**
- * Durable writes for the universal generation engine.
+ * Durable persistence for universal generations.
  *
- * Job *creation* is not part of this module: a universal job is a row in
- * `generation_jobs` like any other, so it is inserted and dispatched by
- * `enqueue()` in `@/lib/queue` (see `UniversalGenerationService.createJob`).
- * What lives here is the write path an executing job needs — streamed chunk
- * bookkeeping, finalization and cancellation — always against the real job row
- * so events carry the owning user and novel.
+ * Responsibilities (and nothing else):
+ *  - the single row-insert used by the queue when a job is created;
+ *  - durable chunk persistence (incremental text + monotonic sequence numbers);
+ *  - the single, idempotent job *finalisation* primitives used by the worker.
+ *
+ * Finalisation deliberately lives here and is called by the worker only, so the
+ * service and the worker cannot both finalise the same job. Every terminal
+ * UPDATE is guarded on `status='processing'`, which makes it idempotent and
+ * means a cancelled/finished job can never be overwritten by a later update.
  */
 
-interface JobOwnership {
+/** Marks a persisted job as owned by the universal engine. */
+export const UNIVERSAL_ENGINE = 'universal';
+
+export interface InsertGenerationJobInput {
+  id?: string;
   userId: string;
   novelId: string;
-  chapterId: string | null;
-  currentStage: string | null;
+  chapterId?: string | null;
+  taskType: string;
+  payload: Record<string, unknown>;
+  status?: string;
+  maxAttempts?: number;
+  idempotencyKey?: string | null;
+  scheduledAt?: string | null;
+  priority?: number;
+  provider?: string | null;
+  model?: string | null;
 }
 
 /**
- * Reads the ownership columns for a job so published events are attributed to
- * the right user/novel. A missing row yields empty ownership rather than
- * throwing: event writes are best-effort and must never fail a generation.
+ * Inserts one durable generation row. The queue is the only caller: creation,
+ * deduplication and dispatch must stay in one place.
  */
-function jobOwnership(jobId: string): JobOwnership {
+export function insertGenerationJobRow(input: InsertGenerationJobInput): string {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const id = input.id ?? nanoid();
+
+  db.prepare(
+    `INSERT INTO generation_jobs (
+       id, userId, novelId, chapterId, taskType, payload, status, attempts, maxAttempts,
+       idempotencyKey, createdAt, updatedAt, scheduledAt, progress, retryable, priority,
+       provider, requestedModel
+     )
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run(
+    id,
+    input.userId,
+    input.novelId,
+    input.chapterId ?? null,
+    input.taskType,
+    JSON.stringify(input.payload ?? {}),
+    input.status ?? 'queued',
+    0,
+    input.maxAttempts ?? 3,
+    input.idempotencyKey ?? null,
+    now,
+    now,
+    input.scheduledAt ?? now,
+    0,
+    1,
+    input.priority ?? 0,
+    input.provider ?? null,
+    input.model ?? null,
+  );
+
+  return id;
+}
+
+/** Parses a persisted payload defensively (a corrupt row must not crash a worker). */
+export function parseJobPayload(payload: string | null | undefined): Record<string, unknown> {
+  if (!payload) return {};
   try {
-    const row = getDb()
-      .prepare('SELECT userId, novelId, chapterId, currentStage FROM generation_jobs WHERE id=?')
-      .get(jobId) as
-      | { userId: string; novelId: string; chapterId: string | null; currentStage: string | null }
-      | undefined;
-    return {
-      userId: row?.userId ?? '',
-      novelId: row?.novelId ?? '',
-      chapterId: row?.chapterId ?? null,
-      currentStage: row?.currentStage ?? null,
-    };
-  } catch (err) {
-    console.error('[generation-persistence] could not read job ownership', jobId, err);
-    return { userId: '', novelId: '', chapterId: null, currentStage: null };
+    const parsed = JSON.parse(payload);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
   }
 }
 
 /**
- * Records one streamed chunk against the durable job row.
+ * True when the persisted row was created by the universal engine.
  *
- * The row update doubles as a heartbeat: a long stream that keeps producing
- * text must not look stale to the recovery sweep. The chunk is published as a
- * `generation_progress` event (the only incremental event type the SSE stream
- * and client hook understand) carrying the job's current stage, so the UI keeps
- * showing the stage it was already showing.
+ * The discriminator is written into the job payload at creation time, so it is
+ * durable, survives restarts and is available to the worker and the SSE route
+ * without a handler lookup. Legacy jobs (created by the existing services) never
+ * carry it, so they can never be misrouted into the universal engine.
  */
-export function persistChunk(jobId: string, sequence: number, content: string, isComplete = false) {
-  const db = getDb();
-  const now = new Date().toISOString();
+export function isUniversalEngineJob(job: Pick<GenerationJobRow, 'payload'> | null | undefined): boolean {
+  if (!job) return false;
+  return parseJobPayload(job.payload).engine === UNIVERSAL_ENGINE;
+}
 
+/** Rebuilds the validated request an engine needs from a persisted job row. */
+export function generationRequestFromJobRow(job: GenerationJobRow): GenerationRequest {
+  const payload = parseJobPayload(job.payload);
+  const generationType = parseGenerationType(job.taskType) ?? 'custom';
+  const prompt = typeof payload.prompt === 'string' && payload.prompt.length > 0
+    ? payload.prompt
+    : `Generate the requested ${job.taskType.replace(/_/g, ' ')} for this project.`;
+
+  const provider = payload.provider;
+  return {
+    projectId: job.novelId,
+    userId: job.userId,
+    generationType,
+    ...(typeof payload.customType === 'string' ? { customType: payload.customType } : {}),
+    ...(typeof payload.targetType === 'string' ? { targetType: payload.targetType } : {}),
+    ...(job.chapterId ? { targetId: job.chapterId } : {}),
+    prompt,
+    context:
+      payload.context && typeof payload.context === 'object' && !Array.isArray(payload.context)
+        ? (payload.context as Record<string, unknown>)
+        : {},
+    ...(typeof provider === 'string' ? { provider: provider as GenerationRequest['provider'] } : {}),
+    ...(typeof payload.model === 'string' ? { model: payload.model } : {}),
+    stream: payload.stream === true,
+    metadata:
+      payload.metadata && typeof payload.metadata === 'object' && !Array.isArray(payload.metadata)
+        ? (payload.metadata as Record<string, unknown>)
+        : {},
+    ...(job.idempotencyKey ? { idempotencyKey: job.idempotencyKey } : {}),
+  };
+}
+
+// ─── Chunk persistence ───────────────────────────────────────────────────────
+
+export interface ChunkSink {
+  readonly jobId: string;
+  readonly text: string;
+  readonly sequence: number;
+  /** Persists one delta and publishes a durable content event. Returns the sequence. */
+  append(delta: string): number;
+}
+
+/**
+ * Opens a durable chunk sink for one job.
+ *
+ * - every chunk is appended to `generation_jobs.result.partialText`, so the
+ *   accumulated prose survives a process restart (it is not kept in memory);
+ * - every chunk is also a `generation_events` row, which is what the SSE route
+ *   replays after a reconnect;
+ * - sequence numbers are monotonic per job and continue across a worker
+ *   restart (they resume from the job's highest persisted event sequence).
+ */
+export function openChunkSink(jobId: string): ChunkSink {
+  const db = getDb();
+  const job = db
+    .prepare('SELECT id,userId,novelId,chapterId,result FROM generation_jobs WHERE id=?')
+    .get(jobId) as Pick<GenerationJobRow, 'id' | 'userId' | 'novelId' | 'chapterId' | 'result'> | undefined;
+
+  let text = '';
+  if (job?.result) {
+    try {
+      const parsed = JSON.parse(job.result);
+      if (typeof parsed?.partialText === 'string') text = parsed.partialText;
+    } catch {
+      /* a malformed partial result must not block a fresh stream */
+    }
+  }
+
+  const maxSeq = Number(
+    (
+      db.prepare('SELECT COALESCE(MAX(seq),0) AS maxSeq FROM generation_events WHERE jobId=?').get(jobId) as {
+        maxSeq: number;
+      }
+    ).maxSeq ?? 0,
+  );
+
+  let sequence = maxSeq;
+
+  return {
+    jobId,
+    get text() {
+      return text;
+    },
+    get sequence() {
+      return sequence;
+    },
+    append(delta: string) {
+      if (!delta) return sequence;
+      sequence += 1;
+      text += delta;
+      const now = new Date().toISOString();
+
+      // The accumulated text is written on every chunk: the row is the durable
+      // copy, the event below is the replayable one.
+      try {
+        db.prepare(
+          `UPDATE generation_jobs
+              SET result=?, updatedAt=?, lastHeartbeatAt=?
+            WHERE id=? AND status='processing'`,
+        ).run(JSON.stringify({ partialText: text }), now, now, jobId);
+      } catch (err) {
+        console.error('[generation-persistence] could not persist chunk text', jobId, err);
+      }
+
+      safePublishGenerationEvent({
+        jobId,
+        userId: job?.userId ?? '',
+        novelId: job?.novelId ?? null,
+        chapterId: job?.chapterId ?? null,
+        type: GenerationEventType.CONTENT,
+        status: 'PROCESSING',
+        data: {
+          sequence,
+          content: delta,
+          delta,
+          totalLength: text.length,
+        },
+      });
+
+      return sequence;
+    },
+  };
+}
+
+/**
+ * Persists provider provenance for a job (requested vs actual model/provider).
+ * Never changes the job status, so it can never race a finalisation.
+ */
+export function recordGenerationProvenance(jobId: string, meta: GenerationResultMeta): void {
+  if (!meta) return;
   try {
-    db.prepare(
-      `UPDATE generation_jobs
-         SET progress = progress + 1,
-             lastHeartbeatAt = ?,
-             updatedAt = ?
-       WHERE id = ? AND status = 'processing'`
-    ).run(now, now, jobId);
+    getDb()
+      .prepare(
+        `UPDATE generation_jobs
+            SET provider=?, requestedModel=COALESCE(requestedModel, ?), actualModel=?,
+                fallbackCount=?, durationMs=?, updatedAt=?
+          WHERE id=? AND status='processing'`,
+      )
+      .run(
+        meta.provider ?? meta.source,
+        meta.model ?? null,
+        meta.actualModel ?? meta.model ?? null,
+        meta.usedFallback ? 1 : 0,
+        typeof meta.latencyMs === 'number' ? Math.round(meta.latencyMs) : null,
+        new Date().toISOString(),
+        jobId,
+      );
   } catch (err) {
-    // A missing row (or a job cancelled mid-stream) must not break the caller:
-    // the provider stream is aborted through `isCancelled()` instead.
-    console.error('[generation-persistence] could not record chunk', jobId, err);
+    console.error('[generation-persistence] could not record provenance', jobId, err);
+  }
+}
+
+// ─── Finalisation primitives (worker-owned) ─────────────────────────────────
+
+export interface CompleteGenerationInput {
+  result: unknown;
+  /** `awaiting_review` is used by handlers that produce a draft. */
+  status?: 'completed' | 'awaiting_review';
+  chapterId?: string | null;
+  /**
+   * Chapter generation is stage-based and has no real percentage, so its
+   * `progressPercentage` stays NULL instead of fabricating one.
+   */
+  indeterminate?: boolean;
+}
+
+/**
+ * Marks a claimed job as completed. Returns false when the job is no longer
+ * `processing` (cancelled, or already finalised by a previous attempt), which
+ * is what makes finalisation idempotent.
+ */
+export function completeGenerationJob(jobId: string, input: CompleteGenerationInput): boolean {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const status = input.status ?? 'completed';
+
+  // Text results are also exposed as `partialText`, which is what
+  // `serializeGeneration()` and therefore the API/SSE snapshot read.
+  let serialized: string | null = null;
+  if (input.result !== undefined && input.result !== null) {
+    const value = input.result as Record<string, unknown>;
+    if (
+      typeof value === 'object' &&
+      typeof value.text === 'string' &&
+      typeof value.partialText !== 'string'
+    ) {
+      serialized = JSON.stringify({ ...value, partialText: value.text });
+    } else {
+      serialized = JSON.stringify(input.result);
+    }
   }
 
-  const owner = jobOwnership(jobId);
-  safePublishGenerationEvent({
-    jobId,
-    userId: owner.userId,
-    novelId: owner.novelId,
-    chapterId: owner.chapterId,
-    type: isComplete ? GenerationEventType.COMPLETED : GenerationEventType.PROGRESS,
-    status: isComplete ? GenerationStatus.COMPLETED : GenerationStatus.PROCESSING,
-    stage: owner.currentStage,
-    data: {
-      sequence,
-      content,
-      isComplete,
-      ...(owner.currentStage ? { stage: owner.currentStage } : {}),
-    },
-  });
-}
 
-/**
- * Finalizes job status and result.
- */
-export function finalizeJob(
-  jobId: string,
-  status: 'completed' | 'failed',
-  result?: GenerationResult,
-  error?: string,
-) {
-  const db = getDb();
-  const now = new Date().toISOString();
-  const meta = result?.meta;
-
-  const update = db.prepare(
-    `UPDATE generation_jobs
-       SET status = ?,
-           result = ?,
-           error = ?,
-           completedAt = ?,
-           updatedAt = ?,
-           lastHeartbeatAt = ?,
-           progressPercentage = ?,
-           currentStage = ?,
-           stageUpdatedAt = ?,
-           claimedAt = NULL,
-           claimedBy = NULL,
-           provider = COALESCE(?, provider),
-           requestedModel = COALESCE(?, requestedModel),
-           actualModel = COALESCE(?, actualModel),
-           durationMs = COALESCE(?, durationMs)
-     WHERE id = ? AND status IN ('queued', 'processing', 'awaiting_review')`
-  );
-
-  const res = update.run(
-    status,
-    result ? JSON.stringify(result) : null,
-    error || null,
-    now,
-    now,
-    now,
-    status === 'completed' ? 100 : null,
-    status === 'completed' ? 'COMPLETED' : null,
-    now,
-    meta?.provider || meta?.source || null,
-    meta?.model || null,
-    meta?.actualModel || meta?.model || null,
-    typeof meta?.latencyMs === 'number' ? Math.round(meta.latencyMs) : null,
-    jobId
-  );
-
-  // A cancelled job stays cancelled and gets no terminal event of its own:
-  // `cancelJob` already published `generation_cancelled`.
-  if (res.changes === 0) return;
-
-  // Emit terminal event
-  const owner = jobOwnership(jobId);
-  const type = status === 'completed' ? GenerationEventType.COMPLETED : GenerationEventType.FAILED;
-  safePublishGenerationEvent({
-    jobId,
-    userId: owner.userId,
-    novelId: owner.novelId,
-    chapterId: owner.chapterId,
-    type,
-    status: status === 'completed' ? GenerationStatus.COMPLETED : GenerationStatus.FAILED,
-    stage: status === 'completed' ? ('COMPLETED' as GenerationStage) : null,
-    data: {
-      result,
-      error,
-    },
-  });
-}
-
-/**
- * Cancels job.
- */
-export function cancelJob(jobId: string, reason?: string) {
-  const db = getDb();
-  const now = new Date().toISOString();
-
-  const res = db.prepare(
-    `UPDATE generation_jobs
-       SET status = 'cancelled',
-           error = ?,
-           completedAt = ?,
-           updatedAt = ?,
-           claimedAt = NULL,
-           claimedBy = NULL,
-           cancelRequestedAt = ?,
-           progressPercentage = NULL
-     WHERE id = ? AND status IN ('queued', 'processing', 'awaiting_review')`
-  ).run(reason || 'Cancelled by user', now, now, now, jobId);
-
-  if (res.changes > 0) {
-    const owner = jobOwnership(jobId);
-    safePublishGenerationEvent({
+  const res = db
+    .prepare(
+      `UPDATE generation_jobs
+          SET status=?, result=?, error=NULL, errorCode=NULL, completedAt=?, updatedAt=?,
+              claimedAt=NULL, claimedBy=NULL, progress=100, progressPercentage=?,
+              currentStage=?, stageUpdatedAt=?, lastHeartbeatAt=?
+        WHERE id=? AND status='processing'`,
+    )
+    .run(
+      status,
+      serialized,
+      now,
+      now,
+      input.indeterminate ? null : 100,
+      'COMPLETED',
+      now,
+      now,
       jobId,
-      userId: owner.userId,
-      novelId: owner.novelId,
-      chapterId: owner.chapterId,
-      type: GenerationEventType.CANCELLED,
-      status: GenerationStatus.CANCELLED,
-      data: { reason: reason || null },
-    });
+    );
+
+  if (res.changes === 0) return false;
+
+  if (input.chapterId) {
+    try {
+      db.prepare('UPDATE generation_jobs SET chapterId=? WHERE id=?').run(input.chapterId, jobId);
+    } catch (err) {
+      console.error('[generation-persistence] could not record chapterId', jobId, err);
+    }
   }
+  return true;
+}
+
+/** Marks a claimed job as failed. Idempotent; never revives a cancelled job. */
+export function failGenerationJob(
+  jobId: string,
+  input: { message: string; code?: string | null; retryable?: boolean },
+): boolean {
+  const now = new Date().toISOString();
+  const res = getDb()
+    .prepare(
+      `UPDATE generation_jobs
+          SET status='failed', error=?, errorCode=?, retryable=?, completedAt=?, updatedAt=?,
+              claimedAt=NULL, claimedBy=NULL, progressPercentage=NULL
+        WHERE id=? AND status='processing'`,
+    )
+    .run(
+      input.message,
+      input.code ?? null,
+      input.retryable === false ? 0 : 1,
+      now,
+      now,
+      jobId,
+    );
   return res.changes > 0;
+}
+
+/** Returns a failed/abandoned attempt to the queue with a backoff. */
+export function requeueGenerationJob(
+  jobId: string,
+  input: { message: string; code?: string | null; delayMs: number },
+): boolean {
+  const now = new Date().toISOString();
+  const res = getDb()
+    .prepare(
+      `UPDATE generation_jobs
+          SET status='queued', error=?, errorCode=?, retryable=1, scheduledAt=?, updatedAt=?,
+              claimedAt=NULL, claimedBy=NULL, progressPercentage=NULL, currentStage=NULL
+        WHERE id=? AND status='processing'`,
+    )
+    .run(
+      input.message,
+      input.code ?? null,
+      new Date(Date.now() + Math.max(0, input.delayMs)).toISOString(),
+      now,
+      jobId,
+    );
+  return res.changes > 0;
+}
+
+/**
+ * Publishes the terminal event for a job. Kept next to the finalisation
+ * primitives so a caller that finalises also announces it exactly once.
+ */
+export function publishTerminalEvent(
+  job: Pick<GenerationJobRow, 'id' | 'userId' | 'novelId' | 'chapterId'>,
+  outcome: 'completed' | 'failed' | 'cancelled',
+  data: Record<string, unknown>,
+): void {
+  const type =
+    outcome === 'completed'
+      ? GenerationEventType.COMPLETED
+      : outcome === 'failed'
+        ? GenerationEventType.FAILED
+        : GenerationEventType.CANCELLED;
+  safePublishGenerationEvent({
+    jobId: job.id,
+    userId: job.userId,
+    novelId: job.novelId ?? null,
+    chapterId: job.chapterId ?? null,
+    type,
+    status: outcome.toUpperCase(),
+    data,
+  });
+}
+
+/** Persists one progress/content event outside the chunk stream. */
+export function publishProgressEvent(
+  job: Pick<GenerationJobRow, 'id' | 'userId' | 'novelId' | 'chapterId'>,
+  stage: string,
+  data: Record<string, unknown> = {},
+): void {
+  publishGenerationEvent({
+    jobId: job.id,
+    userId: job.userId,
+    novelId: job.novelId ?? null,
+    chapterId: job.chapterId ?? null,
+    type: GenerationEventType.PROGRESS,
+    status: 'PROCESSING',
+    stage,
+    data,
+  });
 }

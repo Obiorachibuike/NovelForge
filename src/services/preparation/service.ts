@@ -9,11 +9,6 @@ import { HttpError } from '@/lib/api/http';
 import { z } from 'zod';
 import 'server-only';
 
-// --- UNIVERSAL GENERATION ENGINE INTEGRATION ---
-import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
-import { GenerationRequest, GenerationType } from '@/lib/ai/generation/generation-types';
-import { GenerationRegistry } from '@/lib/ai/generation/generation-registry';
-
 const premiseShape = z.object({
   logline: z.string(),
   shortSynopsis: z.string(),
@@ -44,26 +39,8 @@ export async function enqueuePrepareNovel(
   novelId: string,
   options: { textModel?: string; allowFallback?: boolean } = {},
 ) {
-  // --- UNIVERSAL ENGINE DISPATCH ---
-  if (GenerationRegistry.hasHandler('premise')) {
-    const req: GenerationRequest = {
-      generationType: 'premise',
-      projectId: novelId,
-      targetId: undefined,
-      userId,
-      prompt: '',
-      context: {
-        ...(options.textModel ? { textModel: options.textModel } : {}),
-        allowFallback: options.allowFallback !== false,
-      },
-      stream: false,
-      metadata: {},
-      idempotencyKey: `premise:${novelId}`,
-    };
-    return await UniversalGenerationService.createJob(req);
-  }
-
-  // --- LEGACY DISPATCH (Fallback) ---
+  // Executed by this service's registered `premise` handler via the durable
+  // queue (structured output + story-bible writes).
   const { enqueue } = await import('@/lib/queue');
   return enqueue({
     type: 'premise', userId, novelId,
