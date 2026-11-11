@@ -20,8 +20,8 @@ export interface ChatCompletionPayload {
   model?: string;
   usage?: ChatCompletionUsage;
   choices?: Array<{
-    message?: { content?: string | null };
-    delta?: { content?: string | null };
+    message?: { content?: unknown };
+    delta?: { content?: unknown };
     text?: string | null;
   }>;
 }
@@ -30,13 +30,32 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
+/**
+ * Reads the text of a completion object in any of the shapes providers use.
+ * `message.content` may be a plain string or an array of content parts
+ * (OpenAI-compatible multimodal shape); both are accepted.
+ */
+function contentText(content: unknown): string {
+  if (typeof content === 'string' && content) return content;
+  if (Array.isArray(content)) {
+    return content
+      .map(part => {
+        if (typeof part === 'string') return part;
+        if (isRecord(part) && typeof part.text === 'string') return part.text;
+        return '';
+      })
+      .join('');
+  }
+  return '';
+}
+
 /** Reads the text of a completion object in any of the shapes providers use. */
 function completionText(payload: ChatCompletionPayload): string {
   const choice = payload.choices?.[0];
-  const fromMessage = choice?.message?.content;
-  if (typeof fromMessage === 'string' && fromMessage) return fromMessage;
-  const fromDelta = choice?.delta?.content;
-  if (typeof fromDelta === 'string' && fromDelta) return fromDelta;
+  const fromMessage = contentText(choice?.message?.content);
+  if (fromMessage) return fromMessage;
+  const fromDelta = contentText(choice?.delta?.content);
+  if (fromDelta) return fromDelta;
   const fromText = choice?.text;
   if (typeof fromText === 'string' && fromText) return fromText;
   return '';
@@ -68,8 +87,8 @@ export async function readChatStream(
     // A streamed delta replaces nothing: append. A buffered completion carries
     // the whole answer, so it is used as-is.
     if (!piece) return;
-    const delta = payload.choices?.[0]?.delta?.content;
-    text = typeof delta === 'string' ? text + delta : piece;
+    const isDeltaFrame = payload.choices?.[0]?.delta !== undefined;
+    text = isDeltaFrame ? text + piece : piece;
     onText(text);
   };
 

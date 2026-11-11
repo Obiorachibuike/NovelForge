@@ -170,6 +170,9 @@ export function useAgnesBackend(options: { fallback?: boolean } = {}) {
   delete process.env.AGNES_BASE_URL;
   delete process.env.AGNES_TEXT_MODEL;
   delete process.env.AGNES_IMAGE_MODEL;
+  // Hosted inference cannot run while forced demo mode is on; the global test
+  // setup enables demo mode so no test reaches a paid provider by accident.
+  delete process.env.AI_DEMO_MODE;
   if (options.fallback === false) {
     delete process.env.HF_TOKEN;
     process.env.AI_BACKEND = 'agnes';

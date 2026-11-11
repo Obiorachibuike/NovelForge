@@ -239,6 +239,27 @@ export function GenerationProvider({ children }: { children: React.ReactNode }) 
     [applyGeneration, refresh],
   );
 
+  const deleteGeneration = useCallback(
+    async (jobId: string) => {
+      // Optimistic removal: the task disappears from the queue immediately and
+      // is reconciled with the durable rows below (or on the next refresh).
+      setGenerations(prev => prev.filter(g => g.id !== jobId));
+      terminalHandled.current.delete(`${jobId}:FAILED`);
+      terminalHandled.current.delete(`${jobId}:CANCELLED`);
+      try {
+        const res = await fetch(`/api/generations/${jobId}`, { method: 'DELETE' });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'Could not delete task');
+        toast.message(data.wasActive ? 'Task cancelled and deleted' : 'Task deleted');
+        void refresh();
+      } catch (err: any) {
+        toast.error(err?.message || 'Could not delete task');
+        void refresh();
+      }
+    },
+    [refresh],
+  );
+
   const markNotificationRead = useCallback(async (id: string) => {
     setNotifications(prev => prev.map(n => (n.id === id ? { ...n, isRead: true } : n)));
     setUnreadCount(prev => Math.max(0, prev - 1));
@@ -279,6 +300,7 @@ export function GenerationProvider({ children }: { children: React.ReactNode }) 
       refresh,
       cancelGeneration,
       retryGeneration,
+      deleteGeneration,
       markNotificationRead,
       markAllNotificationsRead,
     }),
@@ -292,6 +314,7 @@ export function GenerationProvider({ children }: { children: React.ReactNode }) 
       refresh,
       cancelGeneration,
       retryGeneration,
+      deleteGeneration,
       markNotificationRead,
       markAllNotificationsRead,
     ],

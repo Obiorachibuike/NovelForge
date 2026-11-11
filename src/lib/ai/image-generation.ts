@@ -9,6 +9,7 @@
  */
 import 'server-only';
 import { aiPolicy, agnesConfigured, huggingFaceConfigured, isExplicitAgnesModel, isExplicitHuggingFaceModel } from './config';
+import { aiConfig } from './provider';
 import { orchestrateGeneration, toImageResult } from './fallback-orchestrator';
 import { classifyAiError } from './error-classifier';
 import { hfGenerateImage, sniffImageMime } from './huggingface-client';
@@ -42,6 +43,16 @@ export interface GenerateImageOutput extends ImageGenerationResult {
  * purpose); an explicit Agnes model id skips the Hugging Face registry lookup.
  */
 export async function generateImage(input: GenerateImageInput): Promise<GenerateImageOutput> {
+  // AI_DEMO_MODE=true performs no paid calls anywhere. Demo covers are
+  // produced as labelled SVGs by the images service without reaching this
+  // provider layer.
+  if (aiConfig.forcedDemo) {
+    throw new HttpError(
+      503,
+      'Image generation is disabled because AI_DEMO_MODE=true in this deployment. Set AI_DEMO_MODE=false to enable real image generation.',
+      'demo_mode',
+    );
+  }
   const hfAvailable = huggingFaceConfigured();
   const explicitAgnesModel = isExplicitAgnesModel(input.modelId);
   if (explicitAgnesModel && !agnesConfigured()) {

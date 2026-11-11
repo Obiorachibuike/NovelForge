@@ -101,6 +101,7 @@ invented.
 | `GET` | `/api/generations/[jobId]/events` | SSE stream (snapshot, replay, progress, heartbeat) |
 | `POST` | `/api/generations/[jobId]/cancel` | cooperative cancellation (`409` once finished) |
 | `POST` | `/api/generations/[jobId]/retry` | retry `FAILED`/`CANCELLED` only |
+| `DELETE` | `/api/generations/[jobId]` | delete a task from the queue/history in any state (active tasks are cancelled first; the row and its events are removed) |
 | `GET` | `/api/notifications` | notification centre + unread count |
 | `PATCH` | `/api/notifications/[id]` | mark one read |
 | `POST` | `/api/notifications/read-all` | mark all read |

@@ -50,8 +50,9 @@ import type { ChatMessage } from '@/types';
 export function resolveProviderChain(
   request: Pick<GenerationRequest, 'provider' | 'metadata'>,
   env: { agnes: boolean; huggingface: boolean; openai: boolean } = {
-    agnes: agnesConfigured(),
-    huggingface: huggingFaceConfigured(),
+    // AI_DEMO_MODE=true performs no paid calls anywhere, even with keys set.
+    agnes: agnesConfigured() && !aiConfig.forcedDemo,
+    huggingface: huggingFaceConfigured() && !aiConfig.forcedDemo,
     openai: aiConfig.hasApiKey && !aiConfig.forcedDemo,
   },
 ): GenerationProvider[] {

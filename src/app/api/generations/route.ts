@@ -160,13 +160,24 @@ export const GET = apiHandler(async (req: Request) => {
         status === 'failed' ? 'FAILED' :
         status === 'cancelled' ? 'CANCELLED' : 'NOT_STARTED';
 
+      // The chapters join only sees the chapter row once the worker created it;
+      // the queued job's payload carries the chapter number meanwhile.
+      let payloadChapterNumber: number | null = null;
+      try {
+        const parsed = row.payload ? JSON.parse(row.payload) : null;
+        const value = Number(parsed?.chapterNumber);
+        if (Number.isInteger(value) && value > 0) payloadChapterNumber = value;
+      } catch {
+        /* payload is advisory here */ }
+      const chapterNumber = row.chapterNumber ?? payloadChapterNumber;
+
       return {
         id: row.id,
         novelId: row.novelId,
         novelTitle: row.novelTitle ?? null,
         chapterId: row.chapterId ?? null,
         chapterTitle: row.chapterTitle ?? null,
-        chapterNumber: row.chapterNumber ?? null,
+        chapterNumber,
         taskType: row.taskType,
         status: publicStatus,
         progressPercentage: row.progressPercentage ?? null,

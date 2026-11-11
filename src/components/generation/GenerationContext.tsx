@@ -26,6 +26,8 @@ export interface GenerationContextValue {
   refresh: () => Promise<void>;
   cancelGeneration: (jobId: string) => Promise<void>;
   retryGeneration: (jobId: string) => Promise<void>;
+  /** Removes a task from the queue/history (active tasks are cancelled first). */
+  deleteGeneration: (jobId: string) => Promise<void>;
   markNotificationRead: (id: string) => Promise<void>;
   markAllNotificationsRead: () => Promise<void>;
 }

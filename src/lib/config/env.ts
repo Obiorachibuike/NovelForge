@@ -171,8 +171,8 @@ export function validateEnvConfig(env: NodeJS.ProcessEnv = process.env): Validat
     hasBrevoKey,
     emailDeliveryConfigured,
     aiBackend: aiBackend(),
-    allowPaidInference: env.AI_ALLOW_PAID_INFERENCE !== 'false',
-    requireConfirmedPricing: env.AI_REQUIRE_CONFIRMED_PRICING !== 'false',
+    allowPaidInference: env.AI_ALLOW_PAID_INFERENCE === 'true',
+    requireConfirmedPricing: env.AI_REQUIRE_CONFIRMED_PRICING === 'true',
     aiProblems,
   };
 }

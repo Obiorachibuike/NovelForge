@@ -92,6 +92,23 @@ async function readErrorBody(res: Response): Promise<string> {
   }
 }
 
+/** Normalises `message.content` (string or array-of-parts) into plain text. */
+function completionContentText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map(part => {
+        if (typeof part === 'string') return part;
+        if (part && typeof part === 'object' && typeof (part as { text?: unknown }).text === 'string') {
+          return (part as { text: string }).text;
+        }
+        return '';
+      })
+      .join('');
+  }
+  return '';
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Text generation (chat completions)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -159,11 +176,31 @@ export async function agnesChatCompletion(req: AgnesChatRequest): Promise<AgnesC
   const json = req.onText
     ? await readChatStream(res, req.onText, req.timeoutMs ?? policy.requestTimeoutMs)
     : (await res.json().catch(() => ({}))) as any;
-  const text: string = json?.choices?.[0]?.message?.content ?? '';
+  // A 200 response may still carry an error object (some gateways do).
+  if (json?.error) {
+    const message =
+      typeof json.error === 'string'
+        ? json.error
+        : json.error?.message
+          ? String(json.error.message)
+          : 'Agnes AI returned an error payload.';
+    throw new AgnesHttpError(502, message, res.headers);
+  }
+  const text: string = completionContentText(json?.choices?.[0]?.message?.content);
   const usage = json?.usage
     ? {
-        inputTokens: typeof json.usage.prompt_tokens === 'number' ? json.usage.prompt_tokens : undefined,
-        outputTokens: typeof json.usage.completion_tokens === 'number' ? json.usage.completion_tokens : undefined,
+        inputTokens:
+          typeof json.usage.prompt_tokens === 'number'
+            ? json.usage.prompt_tokens
+            : typeof json.usage.input_tokens === 'number'
+              ? json.usage.input_tokens
+              : undefined,
+        outputTokens:
+          typeof json.usage.completion_tokens === 'number'
+            ? json.usage.completion_tokens
+            : typeof json.usage.output_tokens === 'number'
+              ? json.usage.output_tokens
+              : undefined,
       }
     : undefined;
 
