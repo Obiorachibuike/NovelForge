@@ -61,7 +61,14 @@ const DEFAULTS = {
   maxRetriesPerModel: 1,
   requestTimeoutMs: 120_000,
   allowPaidInference: false,
-  requireConfirmedPricing: true,
+  // Unknown pricing is *attemptable* by default (cost is recorded as
+  // `unknown` and budgets use conservative estimates). Requiring confirmed
+  // pricing is available for operators who want verification-first fleets,
+  // but it must never be the silent default: every registry model starts with
+  // `pricingStatus='unknown'`, so a strict default would refuse every request
+  // until an admin ran verification — making generation look "configured but
+  // broken" on a fresh deployment.
+  requireConfirmedPricing: false,
   healthCheckEnabled: true,
   healthCheckIntervalHours: 24,
   modelCacheTtlSeconds: 3_600,

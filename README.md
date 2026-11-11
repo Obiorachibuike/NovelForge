@@ -58,7 +58,7 @@ Configure the following in `.env` / `.env.local`:
 | `AGNES_TEXT_MODEL` / `AGNES_IMAGE_MODEL` / `AGNES_BASE_URL` | Optional Agnes overrides (defaults: `agnes-2.5-flash`, `agnes-image-2.5-flash`, `https://apihub.agnes-ai.com/v1`) |
 | `HF_TOKEN` | Hugging Face token with *Inference Providers* permission. **Fallback provider**: 50 text + 20 image models that serve requests when Agnes AI fails (or the primary backend when Agnes is unset). Server-side only — see [`docs/AI_INFERENCE.md`](docs/AI_INFERENCE.md) |
 | `AI_BACKEND` | `auto` (default: Agnes if `AGNES_API_KEY`, else Hugging Face if `HF_TOKEN`, else OpenAI, else demo) · `agnes` · `huggingface` · `openai` |
-| `AI_ALLOW_PAID_INFERENCE` / `AI_REQUIRE_CONFIRMED_PRICING` | Pricing guardrails for hosted inference (default `false` / `true`) |
+| `AI_ALLOW_PAID_INFERENCE` / `AI_REQUIRE_CONFIRMED_PRICING` | Pricing guardrails for hosted inference (default `false` / `false` — paid models are never called unless opted in; unknown pricing is attemptable and recorded as `unknown`) |
 | `AUTH_GOOGLE_ID` / `AUTH_GOOGLE_SECRET` | Google OAuth (both required) - see [`docs/google-signin.md`](docs/google-signin.md) |
 | `AUTH_SECRET` | **Required in production** (≥32 chars). The app refuses production requests with a placeholder or missing secret. |
 | `QUEUE_PROVIDER` | Leave empty for PostgreSQL/pg-boss. `database` forces the SQLite development/test transport (no worker queue daemon, the worker polls the table). |

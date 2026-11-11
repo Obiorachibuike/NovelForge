@@ -13,6 +13,7 @@ import {
   Loader2,
   RotateCcw,
   Sparkles,
+  Trash2,
   X,
 } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
@@ -49,6 +50,7 @@ export function GenerationDock() {
     unreadCount,
     cancelGeneration,
     retryGeneration,
+    deleteGeneration,
     markNotificationRead,
     markAllNotificationsRead,
   } = useGeneration();
@@ -157,6 +159,7 @@ export function GenerationDock() {
                   job={job}
                   onCancel={() => void cancelGeneration(job.id)}
                   onRetry={() => void retryGeneration(job.id)}
+                  onDelete={() => void deleteGeneration(job.id)}
                 />
               ))}
               {recent.length > 0 && (
@@ -170,6 +173,7 @@ export function GenerationDock() {
                         compact
                         onCancel={() => void cancelGeneration(job.id)}
                         onRetry={() => void retryGeneration(job.id)}
+                        onDelete={() => void deleteGeneration(job.id)}
                       />
                     ))}
                   </div>
@@ -273,11 +277,13 @@ function JobRow({
   compact,
   onCancel,
   onRetry,
+  onDelete,
 }: {
   job: GenerationView;
   compact?: boolean;
   onCancel: () => void;
   onRetry: () => void;
+  onDelete: () => void;
 }) {
   const active = isActive(job);
   const href = chapterHref(job);
@@ -302,7 +308,18 @@ function JobRow({
             {isChapterJob && job.chapterNumber ? ` · Chapter ${job.chapterNumber}` : ''}
           </div>
         </div>
-        <GenerationStatusBadge status={job.status} />
+        <div className="flex items-center gap-1.5 shrink-0">
+          <GenerationStatusBadge status={job.status} />
+          <button
+            type="button"
+            onClick={onDelete}
+            className="p-1 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+            aria-label={active ? 'Cancel and delete this task' : 'Delete this task'}
+            title={active ? 'Cancel and delete this task' : 'Delete this task'}
+          >
+            <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
+          </button>
+        </div>
       </div>
 
       {active && (
@@ -368,6 +385,13 @@ function JobRow({
               <RotateCcw className="w-3 h-3" aria-hidden="true" /> Retry
             </button>
           )}
+          <button
+            type="button"
+            onClick={onDelete}
+            className="text-[11px] inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-muted-foreground hover:border-destructive/40 hover:text-destructive"
+          >
+            <Trash2 className="w-3 h-3" aria-hidden="true" /> Delete
+          </button>
         </div>
       )}
       {!active && (

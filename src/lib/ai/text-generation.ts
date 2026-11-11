@@ -53,9 +53,34 @@ export function agnesBackendActive(): boolean {
 /**
  * True when a real hosted provider (Agnes primary, Hugging Face fallback) can
  * serve hosted inference. The direct generation endpoints gate on this.
+ * Forced demo mode (`AI_DEMO_MODE=true`) suppresses every paid call, so the
+ * hosted backends are never active while it is on — even with a key set.
  */
 export function hostedBackendActive(): boolean {
+  if (aiConfig.forcedDemo) return false;
   return agnesBackendActive() || huggingFaceBackendActive();
+}
+
+/**
+ * True when this deployment is a demo deployment: either `AI_DEMO_MODE=true`
+ * (explicit) or no provider key of any kind is configured. Demo prose is only
+ * ever substituted on demo deployments; a deployment with a provider key that
+ * cannot serve *this* request gets a precise configuration error instead of
+ * silently writing placeholder text into the author's story.
+ */
+function isDemoDeployment(): boolean {
+  return aiConfig.forcedDemo || aiBackend() === 'demo';
+}
+
+/** Explains which credential is missing for the requested model path. */
+function missingProviderMessage(model?: string): string {
+  if (model && isExplicitHuggingFaceModel(model)) {
+    return `The selected model "${model}" is served by Hugging Face, but HF_TOKEN is not configured on the server. Choose "auto" or an Agnes AI model, or set HF_TOKEN.`;
+  }
+  if (model && isExplicitAgnesModel(model)) {
+    return `The selected model "${model}" is served by Agnes AI, but AGNES_API_KEY is not configured on the server. Choose "auto" or set AGNES_API_KEY.`;
+  }
+  return 'No AI provider can serve this request. Set AGNES_API_KEY (primary), HF_TOKEN (fallback) or OPENAI_API_KEY on the server.';
 }
 
 /**
@@ -137,8 +162,10 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
   let hfChainRequested = forced
     ? forced === 'huggingface'
     : huggingFaceBackendActive() || (huggingFaceFallbackAvailable() && explicitHfModel);
+  // AI_DEMO_MODE=true performs no paid calls anywhere, even with a key set.
+  if (aiConfig.forcedDemo) hfChainRequested = false;
 
-  if (tryAgnes && agnesBackendActive() && !explicitHfModel) {
+  if (tryAgnes && agnesBackendActive() && !explicitHfModel && !aiConfig.forcedDemo) {
     try {
       const result = await generateTextAgnes({
         messages: input.messages,
@@ -253,15 +280,36 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
         { status: 400, code: 'provider_not_configured', retryable: false },
       );
     }
-    // No provider key at all: this deployment is a demo deployment. The result
-    // is labelled `source: 'demo'` (and persisted with generationSource='demo'),
-    // so it never claims to be a provider response. Chapter generation applies
-    // its own, stricter gate: it only accepts demo text when the deployment
-    // opted in with AI_DEMO_MODE=true and no key is configured.
-    return {
-      text: input.fallbackText ?? demoTextResponse(input.messages),
-      meta: { source: 'demo', model, usedFallback: false },
-    };
+    if (isDemoDeployment()) {
+      // Demo deployment (AI_DEMO_MODE=true, or no provider key at all): the
+      // result is labelled `source: 'demo'` (and persisted with
+      // generationSource='demo'), so it never claims to be a provider
+      // response. Chapter generation applies its own, stricter gate: it only
+      // accepts demo text when the deployment explicitly opted in with
+      // AI_DEMO_MODE=true and no key is configured.
+      return {
+        text: input.fallbackText ?? demoTextResponse(input.messages),
+        meta: { source: 'demo', model, usedFallback: false },
+      };
+    }
+    // A provider key exists, but not one that can serve this request (e.g. an
+    // explicitly selected Hugging Face model with no HF_TOKEN). Never
+    // substitute placeholder prose into a deployment that can write real text:
+    // tolerant callers get a labelled fallback, everyone else gets a precise
+    // configuration error naming what is missing.
+    const reason = missingProviderMessage(input.model);
+    if (input.allowFallbackOnError) {
+      console.warn(`[ai] ${input.taskType}: ${reason} Using labelled fallback.`);
+      return {
+        text: input.fallbackText ?? demoTextResponse(input.messages),
+        meta: { source: 'fallback', model: input.model || 'auto', usedFallback: true, fallbackReason: reason },
+      };
+    }
+    throw Object.assign(new Error(reason), {
+      status: 503,
+      code: 'provider_not_configured',
+      retryable: false,
+    });
   }
 
   const maxTokens = clampCompletionTokens(input.maxTokens);
@@ -382,8 +430,10 @@ export async function generateStructuredDetailed<T>(
   const explicitHfModel = isExplicitHuggingFaceModel(input.model);
   let agnesFailure: string | undefined;
   let hfChainRequested = huggingFaceBackendActive() || (huggingFaceFallbackAvailable() && explicitHfModel);
+  // AI_DEMO_MODE=true performs no paid calls anywhere, even with a key set.
+  if (aiConfig.forcedDemo) hfChainRequested = false;
 
-  if (agnesBackendActive() && !explicitHfModel) {
+  if (agnesBackendActive() && !explicitHfModel && !aiConfig.forcedDemo) {
     try {
       const { data, meta } = await generateStructuredAgnes<T>({
         schema,

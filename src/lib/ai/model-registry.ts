@@ -322,6 +322,11 @@ export function recordModelSuccess(modelId: string, input: RecordSuccessInput): 
     previousAverage && previousAverage > 0
       ? Math.round(previousAverage * 0.7 + Math.max(0, input.latencyMs) * 0.3)
       : Math.round(Math.max(0, input.latencyMs));
+  // A successful live inference is evidence the account can serve the model on
+  // its current plan — the same promotion the verification service applies
+  // after a successful smoke test. Unknown pricing becomes confirmed-free;
+  // `paid` is never downgraded, and `free` is left untouched.
+  const promotesPricing = row.pricingStatus === 'unknown';
 
   db.prepare(
     `UPDATE ai_model_registry
@@ -335,6 +340,7 @@ export function recordModelSuccess(modelId: string, input: RecordSuccessInput): 
             failureCount=0,
             averageLatencyMs=?,
             provider=COALESCE(?, provider),
+            pricingStatus=CASE WHEN ? THEN 'free' ELSE pricingStatus END,
             updatedAt=?
       WHERE id=?`,
   ).run(
@@ -344,6 +350,7 @@ export function recordModelSuccess(modelId: string, input: RecordSuccessInput): 
     now,
     nextAverage,
     input.provider ?? null,
+    promotesPricing ? 1 : 0,
     now,
     modelId,
   );
@@ -354,7 +361,9 @@ export function recordModelSuccess(modelId: string, input: RecordSuccessInput): 
     ok: true,
     provider: input.provider,
     latencyMs: Math.round(input.latencyMs),
-    message: 'Successful inference',
+    message: promotesPricing
+      ? 'Successful inference (pricing confirmed free by live use)'
+      : 'Successful inference',
   });
 }
 

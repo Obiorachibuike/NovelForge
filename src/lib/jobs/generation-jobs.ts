@@ -1,7 +1,7 @@
 import 'server-only';
 import { getDb } from '@/lib/db';
 import { HttpError } from '@/lib/api/http';
-import { cancelJob, retryJob } from '@/lib/queue';
+import { cancelJob, deleteJob, retryJob } from '@/lib/queue';
 import { enqueueChapterGeneration } from '@/services/chapters/service';
 import {
   GenerationStatus,
@@ -113,16 +113,35 @@ export function latestGenerationsForNovel(userId: string, novelId: string): Gene
     .all(userId, novelId) as GenerationWithContext[];
 }
 
+/**
+ * Chapter number recorded in the job payload. The `chapters` join in
+ * `GENERATION_SELECT` only sees the chapter row once the worker has created it,
+ * so a queued/in-flight generation serialises `chapterNumber: null` without
+ * this fallback — which breaks the writing workspace's job matching and shows
+ * an untitled "Chapter" entry in the queue.
+ */
+function payloadChapterNumber(job: Pick<GenerationWithContext, 'payload'>): number | null {
+  if (!job.payload) return null;
+  try {
+    const parsed = JSON.parse(job.payload) as { chapterNumber?: unknown };
+    const value = Number(parsed?.chapterNumber);
+    return Number.isInteger(value) && value > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 export function serializeGeneration(job: GenerationWithContext) {
   const status = toPublicStatus(job.status);
   const isChapterJob = job.taskType === 'chapter';
+  const chapterNumber = job.chapterNumber ?? payloadChapterNumber(job);
   return {
     id: job.id,
     novelId: job.novelId,
     novelTitle: job.novelTitle ?? null,
     chapterId: job.chapterId ?? null,
     chapterTitle: job.chapterTitle ?? null,
-    chapterNumber: job.chapterNumber ?? null,
+    chapterNumber,
     taskType: job.taskType,
     status,
     /**
@@ -253,6 +272,22 @@ export async function retryGeneration(userId: string, jobId: string) {
   }
   const updated = getGenerationForUser(userId, jobId);
   return updated ? serializeGeneration(updated) : null;
+}
+
+/**
+ * Deletes a generation task from the queue/history.
+ *
+ * Owner-scoped. Any state can be deleted: an active (queued/processing) task is
+ * cancelled first — the worker then refuses to write its output — and the row
+ * plus its durable events are removed. Chapter content that already exists is
+ * never touched.
+ */
+export async function deleteGeneration(userId: string, jobId: string) {
+  const job = getGenerationForUser(userId, jobId);
+  if (!job) throw new HttpError(404, 'Generation not found', 'generation_not_found');
+  const deleted = deleteJob(jobId);
+  if (!deleted) throw new HttpError(404, 'Generation not found', 'generation_not_found');
+  return { id: jobId, deleted: true, wasActive: ['QUEUED', 'PROCESSING'].includes(toPublicStatus(job.status)) };
 }
 
 /** Snapshot used by the SSE stream before replaying persisted events. */

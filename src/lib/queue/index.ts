@@ -767,6 +767,38 @@ export function cancelJob(id: string): boolean {
 }
 
 /**
+ * Deletes a job and everything the queue owns for it (its durable event log).
+ *
+ * Any state can be deleted. An active job is cancelled first — cooperatively,
+ * exactly like `cancelJob`, so the worker observes the cancellation and never
+ * writes generated content afterwards — and then removed together with its
+ * events. Notifications and usage accounting are deliberately kept: they are
+ * the author's history and the billing record, not queue state.
+ *
+ * Returns false when the job does not exist (already deleted or never owned).
+ */
+export function deleteJob(id: string): boolean {
+  const db = getDb();
+  const job = db.prepare('SELECT * FROM generation_jobs WHERE id=?').get(id) as JobRecord | undefined;
+  if (!job) return false;
+
+  const active = ['queued', 'processing', 'awaiting_review'].includes(job.status);
+  if (active) {
+    // Cancel first so chapter status, lifecycle events and the worker's
+    // cancellation checks all observe the same transition they would for a
+    // plain cancel; the row is removed immediately afterwards.
+    cancelJob(id);
+  }
+
+  const tx = db.transaction(() => {
+    db.prepare('DELETE FROM generation_events WHERE jobId=?').run(id);
+    const res = db.prepare('DELETE FROM generation_jobs WHERE id=?').run(id);
+    return res.changes > 0;
+  });
+  return tx();
+}
+
+/**
  * Re-queues a failed or cancelled job so the user can retry it safely.
  * Retrying never duplicates a chapter: the worker checks whether the chapter
  * was already completed by another attempt before writing.

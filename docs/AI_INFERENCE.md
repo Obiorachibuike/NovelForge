@@ -167,7 +167,7 @@ Add to `.env.local` (server-side only — never `NEXT_PUBLIC_*`):
 | `AI_MAX_RETRIES_PER_MODEL` | `1` | Retries per model for transient errors |
 | `AI_REQUEST_TIMEOUT_MS` | `120000` | Per-request deadline |
 | `AI_ALLOW_PAID_INFERENCE` | `false` | Allow models confirmed as paid |
-| `AI_REQUIRE_CONFIRMED_PRICING` | `true` | Skip models whose pricing is unknown |
+| `AI_REQUIRE_CONFIRMED_PRICING` | `false` | Strict mode: skip models whose pricing is unknown |
 | `AI_MODEL_HEALTH_CHECK_ENABLED` | `true` | Allow registry verification |
 | `AI_MODEL_HEALTH_CHECK_INTERVAL_HOURS` | `24` | How long a stored verification result stays fresh |
 | `AI_MODEL_CACHE_TTL_SECONDS` | `3600` | In-process cache for verification results |
@@ -182,14 +182,24 @@ Add to `.env.local` (server-side only — never `NEXT_PUBLIC_*`):
 that does not start with `hf_`, or a rejected `HF_PROVIDER`) at startup instead
 of surfacing them as a confusing runtime failure.
 
-### Defaults are conservative on purpose
+### Unknown pricing is attemptable; paid pricing never is
 
-With `AI_REQUIRE_CONFIRMED_PRICING=true` (the default), a model whose pricing is
-**unknown** is not eligible. Because a fresh registry marks all 70 models as
-`unverified`/`unknown`, **run `npm run ai:verify` once after setting `HF_TOKEN`**;
-until then the honest answer is "no model has been confirmed". Setting
-`AI_REQUIRE_CONFIRMED_PRICING=false` relaxes this and lets unverified models be
-tried, which is useful on a personal account where you accept the risk.
+Paid models (`pricingStatus='paid'`) are never called unless
+`AI_ALLOW_PAID_INFERENCE=true`. Models whose pricing is **unknown** are
+attemptable by default (`AI_REQUIRE_CONFIRMED_PRICING=false`): every request's
+cost is recorded with status `unknown` and budgets use conservative estimates,
+so nothing is ever *reported* as confirmed that was not evidenced. A successful
+live inference promotes the model's pricing to confirmed-free — the fleet
+verifies itself as it is used, and `npm run ai:verify` remains available for
+pre-verification.
+
+Setting `AI_REQUIRE_CONFIRMED_PRICING=true` is the strict, verification-first
+mode: a model whose pricing is unknown is not eligible at all, so **run
+`npm run ai:verify` (or the admin AI console) before anything can generate**.
+This is intended for shared/production fleets where every attempted model must
+be pre-verified; it is deliberately not the default, because a fresh registry
+marks all 70 models `unverified`/`unknown` and the strict policy would make
+generation look "configured but broken" on every new deployment.
 
 ---
 
