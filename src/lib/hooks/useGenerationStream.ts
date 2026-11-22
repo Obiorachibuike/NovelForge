@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import type { ModelUsage } from '@/lib/ai/model-provenance';
 
 /**
  * One job-specific SSE subscription.
@@ -41,6 +42,13 @@ export interface GenerationView {
   eventsUrl?: string;
   /** Real partial text emitted by the provider, when it streams one. */
   partialText?: string | null;
+  /** Last content sequence included in the durable partial text. */
+  partialSequence?: number | null;
+  requestedModel?: string | null;
+  actualModel?: string | null;
+  provider?: string | null;
+  fallbackCount?: number | null;
+  modelUsages?: ModelUsage[] | null;
   /** Which engine executed the job (persisted on the job row). */
   engine?: 'universal' | 'legacy';
 }
@@ -103,15 +111,22 @@ export function useGenerationStream(
       }
     };
 
-    const apply = (data: any) => {
+    const apply = (data: any, snapshot: boolean) => {
       if (!data || closed) return;
-      const incoming = data as Partial<GenerationView> & { partialText?: string | null };
-      // A snapshot/replay carries the durable accumulated text: trust it over
-      // local accumulation (it is the copy that survived any disconnect).
-      if (typeof incoming.partialText === 'string' && incoming.partialText.length >= streamed.length) {
+      const incoming = data as Partial<GenerationView>;
+      const seq = typeof incoming.partialSequence === 'number' ? incoming.partialSequence : null;
+      // The snapshot's text and sequence are stored together. Replayed chunks
+      // at or before that sequence are already reflected in the snapshot.
+      // Terminal text may also be shorter after provider-side deduplication.
+      if (snapshot && (seq === null || seq >= lastSequence)) {
+        streamed = typeof incoming.partialText === 'string' ? incoming.partialText : '';
+        if (seq !== null) lastSequence = seq;
+      } else if (typeof incoming.partialText === 'string' &&
+        (seq !== null ? seq >= lastSequence : !streamed || isTerminalStatus(incoming.status))) {
         streamed = incoming.partialText;
+        if (seq !== null) lastSequence = seq;
       }
-      emit({ ...(incoming as GenerationView), partialText: streamed || incoming.partialText || null });
+      emit({ ...(incoming as GenerationView), partialText: streamed || null, partialSequence: lastSequence >= 0 ? lastSequence : null });
     };
 
     const applyContent = (data: any) => {
@@ -125,12 +140,13 @@ export function useGenerationStream(
           ? data.content
           : '';
       if (!delta) return;
-      streamed += delta;
+      streamed = data.replace === true ? delta : streamed + delta;
       emit({
         status: (data.status as GenerationView['status']) ?? latest?.status ?? 'PROCESSING',
         currentStage: data.stage ?? 'STREAMING_CONTENT',
         currentStageLabel: data.stageLabel ?? 'Streaming content',
         partialText: streamed,
+        partialSequence: sequence,
       });
     };
 
@@ -155,7 +171,7 @@ export function useGenerationStream(
           try {
             const data = JSON.parse((event as MessageEvent).data);
             if (type === 'generation_content') applyContent(data);
-            else apply(data);
+            else apply(data, type === 'generation_snapshot');
           } catch {
             /* ignore malformed frame */
           }

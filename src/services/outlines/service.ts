@@ -1,6 +1,7 @@
 import { getDb } from '@/lib/db';
 import { nanoid } from 'nanoid';
 import { generateStructuredDetailed } from '@/lib/ai/text-generation';
+import { recordGenerationProvenance } from '@/lib/ai/generation/generation-persistence';
 import { outlinePrompt } from '@/lib/ai/prompts';
 import { registerHandler } from '@/lib/queue';
 import { HttpError } from '@/lib/api/http';
@@ -87,6 +88,7 @@ export async function runOutline({ id, novelId, userId, payload }: any) {
   if (meta.usedFallback) {
     throw new Error(`Outline generation failed: ${meta.fallbackReason || 'the AI provider did not return usable output'}. No changes were saved.`);
   }
+  if (id) recordGenerationProvenance(id, { ...meta, usedFallback: meta.modelFallbackUsed === true });
 
   const now = new Date().toISOString();
   const tx = db.transaction(() => {

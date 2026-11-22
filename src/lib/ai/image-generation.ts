@@ -30,6 +30,8 @@ export interface GenerateImageInput {
   novelId?: string;
   jobId?: string;
   taskType?: string;
+  /** Original model request, retained for cross-provider fallback accounting. */
+  provenance?: { requestedModelId: string; fallbackUsed: boolean };
 }
 
 export interface GenerateImageOutput extends ImageGenerationResult {
@@ -82,6 +84,7 @@ export async function generateImage(input: GenerateImageInput): Promise<Generate
         requestedModelId: input.modelId && input.modelId !== 'auto' ? input.modelId : 'auto',
         actualModelId: generated.model,
         provider: generated.provider,
+        // A versioned ID reported by Agnes is not necessarily a fallback.
         fallbackUsed: false,
         attempts: generated.attempts,
         latencyMs: generated.latencyMs,
@@ -90,11 +93,18 @@ export async function generateImage(input: GenerateImageInput): Promise<Generate
         cost: generated.cost,
       };
     } catch (err) {
-      if (!hfAvailable || input.allowFallback === false) {
+      if (!hfAvailable || input.allowFallback === false || !aiPolicy().fallbackEnabled) {
         const info = classifyAiError(err, { modelId: input.modelId || 'agnes-image-2.5-flash', task: 'text-to-image' });
         throw new HttpError(info.status ?? 502, info.userMessage, info.category, { requestedModelId: input.modelId ?? 'auto' });
       }
       console.warn(`[ai] ${input.taskType ?? 'image'}: Agnes AI image generation failed, falling back to Hugging Face — ${err instanceof Error ? err.message : String(err)}`);
+      // An Agnes id is not a Hugging Face repository. Select an eligible HF
+      // fallback, while retaining the author's original request in the result.
+      return generateImageHuggingFace({
+        ...input,
+        modelId: undefined,
+        provenance: { requestedModelId: input.modelId || 'auto', fallbackUsed: true },
+      });
     }
   }
 
@@ -113,10 +123,12 @@ export async function generateImageHuggingFace(input: GenerateImageInput): Promi
   const width = clampEdge(input.width ?? 768, policy.maxImageEdge);
   const height = clampEdge(input.height ?? 1024, policy.maxImageEdge);
 
-  const result = await orchestrateGeneration<{ buffer: Buffer; mimeType: string; width: number; height: number; transport: string; provider?: string }>({
+  const result = await orchestrateGeneration<{ buffer: Buffer; mimeType: string; width: number; height: number; transport: string; model: string; provider?: string }>({
     task: 'text-to-image',
     requestedModelId: input.modelId && input.modelId !== 'auto' ? input.modelId : 'auto',
     allowFallback: input.allowFallback,
+    provenance: input.provenance,
+    acceptsModel: model => !isExplicitAgnesModel(model.id),
     signal: input.signal,
     requiredSize: { width, height },
     context: {
@@ -125,14 +137,15 @@ export async function generateImageHuggingFace(input: GenerateImageInput): Promi
       jobId: input.jobId ?? null,
       taskType: input.taskType ?? 'cover',
     },
-    run: async model => {
+    run: async (model, attempt) => {
       const generated = await hfGenerateImage({
         modelId: model.id,
         prompt: input.prompt,
         negativePrompt: input.negativePrompt,
         width,
         height,
-        signal: input.signal,
+        signal: attempt.signal,
+        timeoutMs: attempt.timeoutMs,
       });
       return {
         buffer: generated.buffer,
@@ -140,6 +153,7 @@ export async function generateImageHuggingFace(input: GenerateImageInput): Promi
         width: generated.width ?? width,
         height: generated.height ?? height,
         transport: generated.transport,
+        model: generated.model,
         provider: generated.provider,
       };
     },
@@ -147,7 +161,7 @@ export async function generateImageHuggingFace(input: GenerateImageInput): Promi
       const check = validateImageBuffer(value.buffer, { minBytes: 1_000 });
       return { ok: check.ok, reason: check.reason, category: check.category };
     },
-    extract: value => ({ provider: value.provider, imageWidth: value.width, imageHeight: value.height }),
+    extract: value => ({ provider: value.provider, modelId: value.model, imageWidth: value.width, imageHeight: value.height }),
   });
 
   return { ...toImageResult(result), transport: result.value?.transport };

@@ -124,6 +124,7 @@ export async function generateTextAgnes(input: AgnesTextInput): Promise<AgnesTex
 
   const attempts = Math.max(1, Math.min(input.retries ?? 2, 4));
   let lastErr: unknown;
+  let emittedText = false;
 
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
@@ -135,7 +136,10 @@ export async function generateTextAgnes(input: AgnesTextInput): Promise<AgnesTex
         maxNewTokens: maxTokens,
         ...(typeof input.topP === 'number' ? { topP: input.topP } : {}),
         signal: input.signal,
-        onText: input.onText,
+        onText: input.onText ? text => {
+          if (text) emittedText = true;
+          input.onText?.(text);
+        } : undefined,
       });
       const check = validateTextOutput(completion.text, { minChars: 1 });
       if (!check.ok) throw Object.assign(new Error(check.reason || 'The model returned no text.'), { status: 502 });
@@ -166,7 +170,8 @@ export async function generateTextAgnes(input: AgnesTextInput): Promise<AgnesTex
       };
     } catch (err) {
       lastErr = err;
-      if (attempt + 1 < attempts && isRetryableAgnesError(err)) {
+      // A second response cannot be safely concatenated to visible prose.
+      if (!emittedText && attempt + 1 < attempts && isRetryableAgnesError(err)) {
         await sleepWithJitter(attempt);
         continue;
       }
@@ -215,6 +220,7 @@ export async function generateStructuredAgnes<T>(input: AgnesStructuredInput<T>)
     try {
       if (input.signal?.aborted) throw new Error('Generation request was cancelled.');
       let raw = '';
+      let actualModel = model;
       let usage: { inputTokens?: number; outputTokens?: number } | undefined;
       try {
         const completion = await agnesChatCompletion({
@@ -226,6 +232,7 @@ export async function generateStructuredAgnes<T>(input: AgnesStructuredInput<T>)
           signal: input.signal,
         });
         raw = completion.text;
+        actualModel = completion.model;
         usage = completion.usage;
       } catch (err) {
         const status = err instanceof AgnesHttpError ? err.status : (err as { status?: number })?.status;
@@ -239,6 +246,7 @@ export async function generateStructuredAgnes<T>(input: AgnesStructuredInput<T>)
           signal: input.signal,
         });
         raw = completion.text;
+        actualModel = completion.model;
         usage = completion.usage;
       }
 
@@ -267,7 +275,7 @@ export async function generateStructuredAgnes<T>(input: AgnesStructuredInput<T>)
         chapterId: input.chapterId,
         jobId: input.jobId,
         taskType: input.taskType,
-        model,
+        model: actualModel,
         provider: 'agnes-ai',
         promptTokens: usage?.inputTokens ?? estPrompt,
         completionTokens: usage?.outputTokens ?? Math.ceil(raw.length / 4),
@@ -279,7 +287,7 @@ export async function generateStructuredAgnes<T>(input: AgnesStructuredInput<T>)
         data: validated.data,
         meta: {
           text: raw,
-          model,
+          model: actualModel,
           requestedModel: model,
           provider: 'agnes-ai',
           attempts: attempt + 1,

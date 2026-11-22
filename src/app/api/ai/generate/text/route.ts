@@ -6,7 +6,7 @@ import { generateTextHuggingFace } from '@/lib/ai/hf-text-generation';
 import { generateTextAgnes, AgnesHttpError } from '@/lib/ai/agnes-generation';
 import { classifyAiError } from '@/lib/ai/error-classifier';
 import { agnesBackendActive, hostedBackendActive, isExplicitHuggingFaceModel } from '@/lib/ai/text-generation';
-import { huggingFaceConfigured } from '@/lib/ai/config';
+import { agnesConfigured, aiPolicy, huggingFaceConfigured, isExplicitAgnesModel } from '@/lib/ai/config';
 import { HttpError } from '@/lib/api/http';
 import { z } from 'zod';
 
@@ -62,7 +62,11 @@ export const POST = apiHandler(async (req: Request) => {
 
   // ── Agnes AI (primary) ─────────────────────────────────────────────────────
   // Skipped when the caller explicitly picked a Hugging Face repository.
-  if (agnesBackendActive() && !isExplicitHuggingFaceModel(modelId)) {
+  let agnesFailed = isExplicitAgnesModel(modelId) && !agnesConfigured();
+  if (agnesFailed && (!body.allowFallback || !aiPolicy().fallbackEnabled || !huggingFaceConfigured())) {
+    throw new HttpError(503, 'The selected Agnes AI model requires AGNES_API_KEY.', 'provider_not_configured');
+  }
+  if ((agnesBackendActive() || (isExplicitAgnesModel(modelId) && agnesConfigured())) && !isExplicitHuggingFaceModel(modelId)) {
     try {
       const result = await generateTextAgnes({
         messages,
@@ -76,7 +80,7 @@ export const POST = apiHandler(async (req: Request) => {
       });
       return Response.json({
         text: result.text,
-        requestedModelId: result.requestedModel,
+        requestedModelId: modelId,
         actualModelId: result.model,
         provider: result.provider,
         fallbackUsed: false,
@@ -88,9 +92,10 @@ export const POST = apiHandler(async (req: Request) => {
       });
     } catch (err) {
       const reason = err instanceof AgnesHttpError ? `Agnes AI request failed (${err.status})` : err instanceof Error ? err.message : String(err);
-      if (!body.allowFallback || !huggingFaceConfigured()) {
+      if (!body.allowFallback || !aiPolicy().fallbackEnabled || !huggingFaceConfigured()) {
         throw asHttpError(err);
       }
+      agnesFailed = true;
       console.warn(`[ai] ${body.taskType ?? 'api:text'}: Agnes AI failed, falling back to Hugging Face — ${reason}`);
     }
   }
@@ -108,14 +113,15 @@ export const POST = apiHandler(async (req: Request) => {
     novelId: body.novelId,
     taskType: body.taskType ?? 'api:text',
     allowFallback: body.allowFallback,
+    ...(agnesFailed ? { provenance: { requestedModelId: modelId, fallbackUsed: true } } : {}),
   });
 
   return Response.json({
     text: result.text,
-    requestedModelId: result.requestedModel,
+    requestedModelId: modelId,
     actualModelId: result.model,
     provider: result.provider ?? null,
-    fallbackUsed: result.fallbackUsed,
+    fallbackUsed: agnesFailed || result.fallbackUsed,
     attempts: result.attempts,
     latencyMs: result.latencyMs,
     usage: result.usage ?? null,

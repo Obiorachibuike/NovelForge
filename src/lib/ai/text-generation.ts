@@ -2,7 +2,7 @@ import { z, type ZodType, type ZodTypeDef } from 'zod';
 import {
   getOpenAI, aiConfig, withTimeout, recordUsage, assertAiBudget, clampCompletionTokens, estimateCostUsd,
 } from './provider';
-import { aiBackend, agnesConfigured, huggingFaceConfigured, isExplicitAgnesModel, isExplicitHuggingFaceModel } from './config';
+import { aiBackend, aiPolicy, agnesConfigured, huggingFaceConfigured, isExplicitAgnesModel, isExplicitHuggingFaceModel } from './config';
 import { generateStructuredHuggingFace, generateTextHuggingFace } from './hf-text-generation';
 import { generateStructuredAgnes, generateTextAgnes } from './agnes-generation';
 import type { ChatMessage } from '@/types';
@@ -97,6 +97,13 @@ export interface StructuredResult<T> { data: T; meta: GenerationMeta }
 /** A provider the caller can pin explicitly. */
 export type ForcedProvider = 'agnes' | 'huggingface' | 'openai';
 
+function modelConflictsWithProvider(model: string | undefined, provider: ForcedProvider | undefined): boolean {
+  if (!provider || !model || model === 'auto') return false;
+  if (provider === 'agnes') return !isExplicitAgnesModel(model);
+  if (provider === 'huggingface') return !isExplicitHuggingFaceModel(model);
+  return isExplicitAgnesModel(model) || isExplicitHuggingFaceModel(model);
+}
+
 export interface GenerateTextInput {
   onText?: (text: string) => void;
   messages: ChatMessage[];
@@ -126,6 +133,8 @@ export interface GenerateTextInput {
    * a different model (recorded in `meta.actualModel`), not a stub substitute.
    */
   allowModelFallback?: boolean;
+  /** Original request when an outer provider chain is trying a fallback. */
+  provenance?: { requestedModelId: string; fallbackUsed: boolean };
   /** Used only when `allowFallbackOnError` is true; defaults to demo prose. */
   fallbackText?: string;
 }
@@ -156,6 +165,11 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
   // An explicit Hugging Face repo id overrides the default provider (the user
   // chose that model on purpose); everything else goes to Agnes first.
   const forced = input.forceProvider;
+  let emittedText = false;
+  const onText = input.onText ? (text: string) => {
+    if (text) emittedText = true;
+    input.onText?.(text);
+  } : undefined;
   const explicitHfModel = isExplicitHuggingFaceModel(input.model);
   const tryAgnes = forced ? forced === 'agnes' : true;
   let agnesFailure: string | undefined;
@@ -165,7 +179,28 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
   // AI_DEMO_MODE=true performs no paid calls anywhere, even with a key set.
   if (aiConfig.forcedDemo) hfChainRequested = false;
 
-  if (tryAgnes && agnesBackendActive() && !explicitHfModel && !aiConfig.forcedDemo) {
+  if (!isDemoDeployment() && modelConflictsWithProvider(input.model, forced) && (input.allowModelFallback === false || !aiPolicy().fallbackEnabled)) {
+    throw Object.assign(new Error('The selected model is not supported by the requested provider.'), { code: 'provider_model_mismatch', retryable: false });
+  }
+  if (!isDemoDeployment() && forced === 'agnes' && !agnesConfigured()) {
+    throw Object.assign(new Error('Agnes AI was requested but AGNES_API_KEY is not configured.'), { code: 'provider_not_configured', retryable: false });
+  }
+  if (!isDemoDeployment() && forced === 'huggingface' && !huggingFaceFallbackAvailable()) {
+    throw Object.assign(new Error('Hugging Face was requested but HF_TOKEN is not configured.'), { code: 'provider_not_configured', retryable: false });
+  }
+  if (!forced && isExplicitAgnesModel(input.model) && !agnesConfigured() && !isDemoDeployment()) {
+    const reason = missingProviderMessage(input.model);
+    if (input.allowModelFallback !== false && aiPolicy().fallbackEnabled && huggingFaceFallbackAvailable()) {
+      agnesFailure = reason;
+      hfChainRequested = true;
+    } else if (input.allowFallbackOnError) {
+      return { text: input.fallbackText ?? demoTextResponse(input.messages), meta: { source: 'fallback', model: input.model || 'auto', usedFallback: true, fallbackReason: reason } };
+    } else {
+      throw Object.assign(new Error(reason), { status: 503, code: 'provider_not_configured', retryable: false });
+    }
+  }
+
+  if (tryAgnes && (agnesBackendActive() || (isExplicitAgnesModel(input.model) && agnesConfigured()) || (forced === 'agnes' && agnesConfigured())) && (!explicitHfModel || forced === 'agnes') && !aiConfig.forcedDemo) {
     try {
       const result = await generateTextAgnes({
         messages: input.messages,
@@ -178,7 +213,7 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
         jobId: input.jobId,
         taskType: input.taskType,
         signal: input.signal,
-        onText: input.onText,
+        onText,
       });
       return {
         text: result.text,
@@ -187,17 +222,19 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
           model: result.model,
           usedFallback: false,
           actualModel: result.model,
+          modelFallbackUsed: forced === 'agnes' && !!input.model && input.model !== 'auto' && !isExplicitAgnesModel(input.model),
           provider: result.provider,
           attempts: result.attempts,
           latencyMs: result.latencyMs,
         },
       };
     } catch (err) {
+      // Never mix a partially streamed answer with a second provider or stub.
+      if (emittedText || input.signal?.aborted) throw err;
       agnesFailure = errorMessage(err);
-      // A pinned provider never switches implicitly: the caller owns the chain.
-      if (forced || !huggingFaceFallbackAvailable()) {
-        // No Hugging Face token configured: the caller decides (labelled
-        // fallback for tolerant callers, a real error for chapters etc.).
+      // A pinned provider or disabled fallback never silently switches.
+      if (forced || input.allowModelFallback === false || !aiPolicy().fallbackEnabled || !huggingFaceFallbackAvailable()) {
+        // The caller decides whether a labelled placeholder is acceptable.
         if (input.allowFallbackOnError) {
           console.warn(`[ai] ${input.taskType}: Agnes AI generation failed, using labelled fallback — ${agnesFailure}`);
           return {
@@ -212,7 +249,7 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
         }
         throw err;
       }
-      if (input.allowModelFallback !== false) hfChainRequested = true;
+      hfChainRequested = true;
       console.warn(`[ai] ${input.taskType}: Agnes AI generation failed, falling back to Hugging Face — ${agnesFailure}`);
     }
   }
@@ -224,7 +261,9 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
     try {
       const result = await generateTextHuggingFace({
         messages: input.messages,
-        ...(input.model ? { model: input.model } : {}),
+        // Only HF repository ids can be selected in the HF registry; an Agnes
+        // model that failed above must not be treated as an HF repository.
+        ...(explicitHfModel ? { model: input.model } : {}),
         temperature: input.temperature ?? 0.8,
         maxTokens: input.maxTokens,
         userId: input.userId,
@@ -233,8 +272,11 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
         jobId: input.jobId,
         taskType: input.taskType,
         signal: input.signal,
-        onText: input.onText,
+        onText,
         allowFallback: input.allowModelFallback !== false,
+        ...((input.provenance?.fallbackUsed || agnesFailure || (forced === 'huggingface' && input.model && input.model !== 'auto' && !explicitHfModel))
+          ? { provenance: { requestedModelId: input.provenance?.requestedModelId || input.model || 'auto', fallbackUsed: true } }
+          : {}),
         deduplicate: true,
       });
       if (!result.text.trim()) throw new Error('The model returned an empty response.');
@@ -252,6 +294,8 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
         },
       };
     } catch (err) {
+      // Do not replace already streamed provider text with a placeholder.
+      if (emittedText || input.signal?.aborted) throw err;
       // Interactive editing and chapters must never silently receive stub
       // prose: a real failure is reported so the caller can retry.
       if (input.allowFallbackOnError) {
@@ -271,8 +315,20 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
     }
   }
 
+  // An unavailable explicit HF request must not be routed to OpenAI or
+  // presented as demo output just because another provider is configured.
+  if (!forced && explicitHfModel && !huggingFaceFallbackAvailable() && !isDemoDeployment()) {
+    const reason = missingProviderMessage(input.model);
+    if (input.allowFallbackOnError) {
+      return { text: input.fallbackText ?? demoTextResponse(input.messages), meta: { source: 'fallback', model: input.model || 'auto', usedFallback: true, fallbackReason: reason } };
+    }
+    throw Object.assign(new Error(reason), { status: 503, code: 'provider_not_configured', retryable: false });
+  }
+
   const client = getOpenAI();
-  const model = input.model || aiConfig.textModel;
+  const requestedOpenAiModel = input.model && input.model !== 'auto' && !(forced === 'openai' && (isExplicitAgnesModel(input.model) || explicitHfModel))
+    ? input.model : undefined;
+  const model = requestedOpenAiModel || aiConfig.textModel;
   if (!client) {
     if (forced === 'openai' && !input.allowFallbackOnError) {
       throw Object.assign(
@@ -322,20 +378,22 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
       if (input.signal?.aborted) throw new Error('Generation request was cancelled.');
-      input.onText?.('');
-      const resp = input.onText ? await (async () => {
+      onText?.('');
+      const resp = onText ? await (async () => {
         const stream = await client.chat.completions.create({
           model, messages: input.messages, temperature: input.temperature ?? 0.8,
           max_tokens: maxTokens, stream: true, stream_options: { include_usage: true },
         }, { timeout: aiConfig.timeoutMs, signal: input.signal });
         let text = '';
         let usage;
+        let reportedModel = model;
         for await (const part of stream) {
           if (part.usage) usage = part.usage;
+          if (part.model) reportedModel = part.model;
           const delta = part.choices[0]?.delta?.content;
-          if (delta) { text += delta; input.onText?.(text); }
+          if (delta) { text += delta; onText(text); }
         }
-        return { choices: [{ message: { content: text } }], usage };
+        return { choices: [{ message: { content: text } }], usage, model: reportedModel };
       })() : await withTimeout(
         client.chat.completions.create({
           model,
@@ -348,22 +406,23 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
       );
       const text = resp.choices[0]?.message?.content || '';
       const usage = resp.usage;
+      const actualModel = resp.model || model;
       recordUsage({
         userId: input.userId,
         novelId: input.novelId,
         chapterId: input.chapterId,
         jobId: input.jobId,
         taskType: input.taskType,
-        model,
+        model: actualModel,
         promptTokens: usage?.prompt_tokens ?? estPrompt,
         completionTokens: usage?.completion_tokens ?? estimateCompletionTokens(text),
         estimatedCostBeforeUsd,
         source: 'openai',
       });
-      return { text, meta: { source: 'openai', model, usedFallback: false } };
+      return { text, meta: { source: 'openai', model: actualModel, actualModel, provider: 'openai', usedFallback: false, modelFallbackUsed: forced === 'openai' && (isExplicitAgnesModel(input.model) || explicitHfModel) } };
     } catch (err) {
       lastErr = err;
-      if (attempt + 1 < maxAttempts && isRetryableProviderError(err)) {
+      if (!emittedText && !input.signal?.aborted && attempt + 1 < maxAttempts && isRetryableProviderError(err)) {
         await sleepWithJitter(attempt);
         continue;
       }
@@ -372,7 +431,7 @@ export async function generateTextDetailed(input: GenerateTextInput): Promise<Te
   }
 
   const reason = errorMessage(lastErr);
-  if (!input.allowFallbackOnError) throw lastErr;
+  if (emittedText || input.signal?.aborted || !input.allowFallbackOnError) throw lastErr;
   console.warn(`[ai] ${input.taskType}: provider call failed, using labelled fallback — ${reason}`);
   recordUsage({
     userId: input.userId,
@@ -410,8 +469,12 @@ export interface GenerateStructuredInput<T> {
   signal?: AbortSignal;
   /** Deterministic demo/stub value used in demo mode or after parse failures. */
   fallback: T;
+  /** Pin one provider; an outer orchestrator may choose whether to try another. */
+  forceProvider?: ForcedProvider;
   /** Allow another eligible hosted model to serve the request (HF backend). */
   allowModelFallback?: boolean;
+  /** Original request when an outer provider chain is trying a fallback. */
+  provenance?: { requestedModelId: string; fallbackUsed: boolean };
   /** Total provider attempts before the fallback is returned (default 2). */
   retries?: number;
 }
@@ -427,13 +490,41 @@ export async function generateStructuredDetailed<T>(
   input: GenerateStructuredInput<T>,
 ): Promise<StructuredResult<T>> {
   // ── Agnes AI: the primary provider ────────────────────────────────────────
+  const forced = input.forceProvider;
   const explicitHfModel = isExplicitHuggingFaceModel(input.model);
+  const explicitAgnesModel = isExplicitAgnesModel(input.model);
   let agnesFailure: string | undefined;
-  let hfChainRequested = huggingFaceBackendActive() || (huggingFaceFallbackAvailable() && explicitHfModel);
+  let hfChainRequested = forced
+    ? forced === 'huggingface'
+    : huggingFaceBackendActive() || (huggingFaceFallbackAvailable() && explicitHfModel);
   // AI_DEMO_MODE=true performs no paid calls anywhere, even with a key set.
   if (aiConfig.forcedDemo) hfChainRequested = false;
 
-  if (agnesBackendActive() && !explicitHfModel && !aiConfig.forcedDemo) {
+  if (!isDemoDeployment() && modelConflictsWithProvider(input.model, forced) && (input.allowModelFallback === false || !aiPolicy().fallbackEnabled)) {
+    return { data: input.fallback, meta: { source: 'fallback', model: input.model || 'auto', usedFallback: true, fallbackReason: 'The selected model is not supported by the requested provider.' } };
+  }
+  if (!isDemoDeployment() && ((forced === 'agnes' && !agnesConfigured()) || (forced === 'huggingface' && !huggingFaceFallbackAvailable()) || (forced === 'openai' && !aiConfig.hasApiKey))) {
+    const reason = `${forced === 'agnes' ? 'Agnes AI' : forced === 'huggingface' ? 'Hugging Face' : 'OpenAI'} was requested but is not configured.`;
+    return { data: input.fallback, meta: { source: 'fallback', model: input.model || 'auto', usedFallback: true, fallbackReason: reason } };
+  }
+  if (!forced && explicitAgnesModel && !agnesConfigured() && !isDemoDeployment()) {
+    const reason = missingProviderMessage(input.model);
+    if (input.allowModelFallback !== false && aiPolicy().fallbackEnabled && huggingFaceFallbackAvailable()) {
+      agnesFailure = reason;
+      hfChainRequested = true;
+    } else {
+      return { data: input.fallback, meta: { source: 'fallback', model: input.model || 'auto', usedFallback: true, fallbackReason: reason } };
+    }
+  }
+  if (!forced && explicitHfModel && !huggingFaceFallbackAvailable() && !isDemoDeployment()) {
+    const reason = missingProviderMessage(input.model);
+    return { data: input.fallback, meta: { source: 'fallback', model: input.model || 'auto', usedFallback: true, fallbackReason: reason } };
+  }
+
+  const tryAgnes = forced
+    ? forced === 'agnes' && agnesConfigured()
+    : (agnesBackendActive() || (explicitAgnesModel && agnesConfigured())) && !explicitHfModel;
+  if (tryAgnes && !aiConfig.forcedDemo) {
     try {
       const { data, meta } = await generateStructuredAgnes<T>({
         schema,
@@ -455,6 +546,7 @@ export async function generateStructuredDetailed<T>(
           model: meta.model,
           usedFallback: false,
           actualModel: meta.model,
+          modelFallbackUsed: input.provenance?.fallbackUsed === true || (forced === 'agnes' && !!input.model && input.model !== 'auto' && !explicitAgnesModel),
           provider: meta.provider,
           attempts: meta.attempts,
           latencyMs: meta.latencyMs,
@@ -462,7 +554,7 @@ export async function generateStructuredDetailed<T>(
       };
     } catch (err) {
       agnesFailure = errorMessage(err);
-      if (!huggingFaceFallbackAvailable()) {
+      if (forced || input.allowModelFallback === false || !aiPolicy().fallbackEnabled || !huggingFaceFallbackAvailable()) {
         // Structured output is never invented: an unusable response is a
         // failure and the caller decides (outline/premise generation aborts,
         // so no placeholder content is written into the author's story).
@@ -472,7 +564,7 @@ export async function generateStructuredDetailed<T>(
           meta: { source: 'fallback', model: input.model || 'auto', usedFallback: true, fallbackReason: agnesFailure },
         };
       }
-      if (input.allowModelFallback !== false) hfChainRequested = true;
+      hfChainRequested = true;
       console.warn(`[ai] ${input.taskType}: Agnes AI structured generation failed, falling back to Hugging Face — ${agnesFailure}`);
     }
   }
@@ -483,7 +575,7 @@ export async function generateStructuredDetailed<T>(
       const { data, meta } = await generateStructuredHuggingFace<T>({
         schema,
         messages: input.messages,
-        ...(input.model ? { model: input.model } : {}),
+        ...(explicitHfModel ? { model: input.model } : {}),
         temperature: input.temperature ?? 0.4,
         userId: input.userId,
         novelId: input.novelId,
@@ -492,6 +584,9 @@ export async function generateStructuredDetailed<T>(
         taskType: input.taskType,
         signal: input.signal,
         allowFallback: input.allowModelFallback !== false,
+        ...((input.provenance?.fallbackUsed || agnesFailure || (forced === 'huggingface' && input.model && input.model !== 'auto' && !explicitHfModel))
+          ? { provenance: { requestedModelId: input.provenance?.requestedModelId || input.model || 'auto', fallbackUsed: true } }
+          : {}),
       });
       return {
         data,
@@ -520,9 +615,12 @@ export async function generateStructuredDetailed<T>(
   }
 
   const client = getOpenAI();
-  const model = input.model || aiConfig.structuredModel;
+  const useDefaultOpenAiModel = forced === 'openai' && (explicitAgnesModel || explicitHfModel);
+  const model = input.model && input.model !== 'auto' && !useDefaultOpenAiModel ? input.model : aiConfig.structuredModel;
   if (!client) {
-    return { data: input.fallback, meta: { source: 'demo', model, usedFallback: false } };
+    if (isDemoDeployment()) return { data: input.fallback, meta: { source: 'demo', model, usedFallback: false } };
+    const reason = missingProviderMessage(input.model);
+    return { data: input.fallback, meta: { source: 'fallback', model, usedFallback: true, fallbackReason: reason } };
   }
 
   const attempts = Math.max(1, Math.min(input.retries ?? 2, 4));
@@ -537,6 +635,7 @@ export async function generateStructuredDetailed<T>(
   let lastReason = 'unknown error';
   for (let attempt = 0; attempt < attempts; attempt++) {
     let raw = '{}';
+    let actualModel = model;
     try {
       if (input.signal?.aborted) throw new Error('Generation request was cancelled.');
       const resp = await withTimeout(
@@ -550,6 +649,7 @@ export async function generateStructuredDetailed<T>(
         `structured generation (${input.taskType})`,
       );
       raw = resp.choices[0]?.message?.content || '{}';
+      actualModel = resp.model || model;
       const usage = resp.usage;
       recordUsage({
         userId: input.userId,
@@ -557,7 +657,7 @@ export async function generateStructuredDetailed<T>(
         chapterId: input.chapterId,
         jobId: input.jobId,
         taskType: input.taskType,
-        model,
+        model: actualModel,
         promptTokens: usage?.prompt_tokens ?? estPrompt,
         completionTokens: usage?.completion_tokens ?? estimateCompletionTokens(raw),
         estimatedCostBeforeUsd,
@@ -575,7 +675,7 @@ export async function generateStructuredDetailed<T>(
     try {
       const parsed = JSON.parse(extractJson(raw));
       const result = schema.safeParse(parsed);
-      if (result.success) return { data: result.data, meta: { source: 'openai', model, usedFallback: false } };
+      if (result.success) return { data: result.data, meta: { source: 'openai', model: actualModel, actualModel, provider: 'openai', usedFallback: false, modelFallbackUsed: input.provenance?.fallbackUsed === true || useDefaultOpenAiModel } };
       lastReason = `schema validation failed: ${result.error.errors[0]?.message ?? 'unknown'}`;
     } catch (err) {
       lastReason = `invalid JSON: ${errorMessage(err)}`;

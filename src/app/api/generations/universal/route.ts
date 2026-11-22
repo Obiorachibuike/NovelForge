@@ -83,16 +83,22 @@ export const GET = apiHandler(async (req: Request) => {
   const query = parsed.data;
   if (query.projectId) await requireNovel(query.projectId, user.id);
 
-  const rows = listGenerationsForUser(user.id, {
-    ...(query.active === 'true' || query.active === '1' ? { active: true } : {}),
+  const filters = {
+    aiOnly: true,
     ...(query.projectId ? { novelId: query.projectId } : {}),
     ...(query.targetId ? { chapterId: query.targetId } : {}),
     ...(query.generationType ? { taskType: query.generationType } : {}),
-    limit: query.limit ?? 25,
+  };
+  const active = query.active === 'true' || query.active === '1';
+  const rows = listGenerationsForUser(user.id, {
+    ...filters, ...(active ? { active: true } : {}), limit: query.limit ?? 25,
   });
+  // History is bounded, but an older active job must still reappear after a
+  // page refresh even if many more recent generations have since completed.
+  const activeRows = active ? rows : listGenerationsForUser(user.id, { ...filters, active: true, limit: 100 });
 
   return Response.json(
-    { generations: rows.map(serializeGeneration), count: rows.length },
+    { generations: rows.map(serializeGeneration), activeGenerations: activeRows.map(serializeGeneration), count: rows.length },
     { headers: { 'Cache-Control': 'no-store' } },
   );
 });

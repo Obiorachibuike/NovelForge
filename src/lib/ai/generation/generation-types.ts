@@ -209,7 +209,7 @@ export interface GenerationChunk {
 
 /** Provenance of a generated result. Never fabricated. */
 export interface GenerationResultMeta {
-  source: 'agnes' | 'huggingface' | 'openai' | 'demo' | 'fallback';
+  source: 'agnes' | 'huggingface' | 'openai' | 'demo' | 'fallback' | 'unknown';
   model: string;
   actualModel?: string;
   provider?: string;

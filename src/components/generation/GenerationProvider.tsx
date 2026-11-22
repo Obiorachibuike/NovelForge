@@ -7,6 +7,7 @@ import {
   useGenerationStream,
   type GenerationView,
 } from '@/lib/hooks/useGenerationStream';
+import { taskTypeLabel } from '@/lib/jobs/job-types';
 import {
   GenerationContext,
   type GenerationContextValue,
@@ -62,10 +63,12 @@ export function GenerationProvider({ children }: { children: React.ReactNode }) 
       terminalHandled.current.add(key);
       applyGeneration(job);
 
+      const isChapter = !job.taskType || job.taskType === 'chapter';
+      const task = isChapter ? 'Chapter' : taskTypeLabel(job.taskType);
       if (job.status === 'COMPLETED') {
-        toast.success(job.chapterTitle ? `${job.chapterTitle} is ready` : 'Chapter ready', {
-          description: 'Generated in the background and saved. Open it to read or edit.',
-          action: job.chapterId
+        toast.success(isChapter && job.chapterTitle ? `${job.chapterTitle} is ready` : `${task} ready`, {
+          description: 'Generated in the background and saved.',
+          action: isChapter && job.chapterId
             ? {
                 label: 'View chapter',
                 onClick: () => router.push(`/novels/${job.novelId}/write/${job.chapterId}`),
@@ -73,12 +76,12 @@ export function GenerationProvider({ children }: { children: React.ReactNode }) 
             : undefined,
         });
       } else if (job.status === 'FAILED') {
-        toast.error('Chapter generation failed', {
+        toast.error(`${task} generation failed`, {
           description: job.errorMessage || 'You can retry from the generation panel.',
         });
       } else if (job.status === 'CANCELLED') {
         toast.message('Generation cancelled', {
-          description: 'Existing chapter content was preserved.',
+          description: isChapter ? 'Existing chapter content was preserved.' : 'Existing content was preserved.',
         });
       }
 
@@ -119,6 +122,7 @@ export function GenerationProvider({ children }: { children: React.ReactNode }) 
       if (!mounted.current) return;
       setAuthenticated(true);
       const rows: GenerationView[] = Array.isArray(data.generations) ? data.generations : [];
+      const active: GenerationView[] = Array.isArray(data.activeGenerations) ? [...data.activeGenerations] : [];
 
       // Universal generations (titles, outlines, scenes, characters, images,
       // rewrites, ...) live in the same table but are listed by their own
@@ -128,6 +132,7 @@ export function GenerationProvider({ children }: { children: React.ReactNode }) 
         if (universalRes.ok) {
           const universal = await universalRes.json();
           if (Array.isArray(universal.generations)) rows.push(...universal.generations);
+          if (Array.isArray(universal.activeGenerations)) active.push(...universal.activeGenerations);
         }
       } catch {
         /* the chapter list alone is still a useful view */
@@ -135,9 +140,6 @@ export function GenerationProvider({ children }: { children: React.ReactNode }) 
       if (!mounted.current) return;
       // The history query is bounded. Active jobs are returned separately so a
       // long-running generation cannot vanish from the indicator on refresh.
-      const active: GenerationView[] = Array.isArray(data.activeGenerations)
-        ? data.activeGenerations
-        : [];
       setGenerations(prev => {
         const byId = new Map(rows.map(r => [r.id, r]));
         for (const job of active) {

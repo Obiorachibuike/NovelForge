@@ -345,6 +345,37 @@ describe('cancel and retry endpoints', () => {
     expect(again.status).toBe(409);
   });
 
+  it('replays a manual retry without delivering an earlier terminal event or stale model', async () => {
+    registerHandler('chapter', async ({ id }) => {
+      db().prepare('UPDATE generation_jobs SET actualModel=?,provider=?,fallbackCount=1,result=? WHERE id=?')
+        .run('previous-model', 'together', JSON.stringify({ partialText: 'Keep me', modelUsages: [{ actualModel: 'previous-model', provider: 'together' }] }), id);
+      throw new Error('temporary provider failure');
+    });
+    const id = await enqueue({ type: 'chapter', userId: user.id, novelId: novel.id, chapterId,
+      payload: { chapterNumber: 1, textModel: 'agnes-2.5-flash' }, maxAttempts: 1 });
+    await runJob(id);
+    const oldFailure = listGenerationEvents(id).find(e => e.type === 'generation_failed')!;
+    const retry = await retryRoute(req(`/api/generations/${id}/retry`, { method: 'POST' }), { params: { jobId: id } });
+    expect(retry.status).toBe(200);
+    const retried = (await retry.json()).generation;
+    expect(retried).toMatchObject({ status: 'QUEUED', requestedModel: 'agnes-2.5-flash', actualModel: null, provider: null, fallbackCount: 0, modelUsages: null, partialText: 'Keep me' });
+
+    for (const suffix of ['', `?lastEventId=${oldFailure.seq}`]) {
+      const response = await eventsRoute(req(`/api/generations/${id}/events${suffix}`), { params: { jobId: id } });
+      const reader = response.body!.getReader();
+      let text = '';
+      for (let i = 0; i < 3 && !text.includes('event: generation_queued'); i++) {
+        const chunk = await reader.read();
+        text += new TextDecoder().decode(chunk.value);
+      }
+      expect(text).toContain('event: generation_snapshot');
+      expect(text).toContain('event: generation_queued');
+      expect(text).not.toContain('event: generation_failed');
+      expect(text).not.toContain('previous-model');
+      await reader.cancel();
+    }
+  });
+
   it('retries only failed or cancelled generations', async () => {
     registerHandler('chapter', async () => {
       throw new Error('temporary provider failure');

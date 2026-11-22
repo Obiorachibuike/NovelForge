@@ -97,6 +97,41 @@ describe('global generation stream (client)', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it('clears retry provenance and applies models reported during a multi-step job', () => {
+    const { result } = renderHook(() => useGenerationStream('job-1'));
+    const source = MockEventSource.instances[0];
+    act(() => source.emit('generation_snapshot', job({ requestedModel: 'auto', actualModel: 'old-model', provider: 'together', fallbackCount: 1,
+      modelUsages: [{ actualModel: 'old-model', provider: 'together' }] })));
+    act(() => source.emit('generation_queued', job({ status: 'QUEUED', actualModel: null, provider: null, fallbackCount: 0, modelUsages: null })));
+    expect(result.current.generation).toMatchObject({ status: 'QUEUED', requestedModel: 'auto', actualModel: null, provider: null, fallbackCount: 0, modelUsages: null });
+    act(() => source.emit('generation_progress', job({ modelUsages: [{ actualModel: 'new-model', provider: 'agnes-ai', fallbackUsed: false }] })));
+    expect(result.current.generation?.modelUsages).toEqual([{ actualModel: 'new-model', provider: 'agnes-ai', fallbackUsed: false }]);
+  });
+
+  it('deduplicates snapshot replay and replaces, rather than appends, a new attempt', () => {
+    const { result } = renderHook(() => useGenerationStream('job-1'));
+    const source = MockEventSource.instances[0];
+    act(() => source.emit('generation_snapshot', job({ partialText: 'First draft', partialSequence: 5 })));
+    act(() => source.emit('generation_content', { sequence: 4, delta: 'First ', status: 'PROCESSING' }));
+    act(() => source.emit('generation_content', { sequence: 5, delta: 'draft', status: 'PROCESSING' }));
+    expect(result.current.generation?.partialText).toBe('First draft');
+
+    act(() => source.emit('generation_queued', job({ status: 'QUEUED', partialText: 'First draft', partialSequence: 5 })));
+    act(() => source.emit('generation_content', { sequence: 12, delta: 'Fresh ', replace: true, status: 'PROCESSING' }));
+    act(() => source.emit('generation_content', { sequence: 13, delta: 'answer', status: 'PROCESSING' }));
+    expect(result.current.generation?.partialText).toBe('Fresh answer');
+
+    // Reconnection sends the current snapshot before replaying old events.
+    act(() => source.emit('generation_snapshot', job({ partialText: 'Fresh answer', partialSequence: 13 })));
+    act(() => source.emit('generation_content', { sequence: 12, delta: 'Fresh ', replace: true, status: 'PROCESSING' }));
+    act(() => source.emit('generation_content', { sequence: 13, delta: 'answer', status: 'PROCESSING' }));
+    expect(result.current.generation?.partialText).toBe('Fresh answer');
+
+    // Final provider validation can shorten the answer (e.g. deduplication).
+    act(() => source.emit('generation_completed', job({ status: 'COMPLETED', partialText: 'Fresh', partialSequence: 13, actualModel: 'actual-model' })));
+    expect(result.current.generation).toMatchObject({ partialText: 'Fresh', actualModel: 'actual-model' });
+  });
+
   it('reconnects through a new EventSource and reports disconnects without failing the job', () => {
     const onUpdate = vi.fn();
     const first = renderHook(() => useGenerationStream('job-1', { onUpdate }));

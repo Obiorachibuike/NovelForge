@@ -1,9 +1,12 @@
 import { getDb } from '@/lib/db';
 import { nanoid } from 'nanoid';
 import { generateStructuredDetailed } from '@/lib/ai/text-generation';
+import { recordGenerationProvenance } from '@/lib/ai/generation/generation-persistence';
+import type { ModelUsage } from '@/lib/ai/model-provenance';
 import { HttpError } from '@/lib/api/http';
 import { consistencyCheckPrompt } from '@/lib/ai/prompts';
 import { registerHandler } from '@/lib/queue';
+import { GenerationStage } from '@/lib/jobs/job-types';
 import { z } from 'zod';
 import 'server-only';
 
@@ -27,7 +30,7 @@ export async function enqueueConsistencyCheck(userId: string, novelId: string, c
   });
 }
 
-async function runConsistency({ novelId, userId, payload }: any) {
+async function runConsistency({ id, novelId, userId, payload, setStage }: any) {
   const db = getDb();
   const novel = db.prepare('SELECT * FROM novels WHERE id=?').get(novelId) as any;
   if (!novel) throw new Error('Novel not found');
@@ -47,6 +50,8 @@ async function runConsistency({ novelId, userId, payload }: any) {
 
   const now = new Date().toISOString();
   let aiUnavailable = 0;
+  // Each chapter can independently fall back to a different model.
+  const modelUsages: ModelUsage[] = [];
   for (const ch of chapters) {
     if (!ch?.plainText) continue;
     const prompt = consistencyCheckPrompt(novel, { number: ch.chapterNumber, title: ch.title }, ch.plainText, bibleText);
@@ -57,7 +62,24 @@ async function runConsistency({ novelId, userId, payload }: any) {
     const { data: aiResult, meta } = await generateStructuredDetailed(issueShape, {
       messages: [{ role:'system', content: prompt.system }, { role:'user', content: prompt.user }],
       temperature: 0.1, userId, novelId, taskType: 'consistency', fallback,
+      ...(id ? { jobId: id } : {}),
     });
+    const placeholder = meta.source === 'demo' || meta.source === 'fallback';
+    const usage: ModelUsage = {
+      actualModel: placeholder ? null : (meta.actualModel ?? meta.model),
+      provider: placeholder ? meta.source : (meta.provider ?? meta.source),
+      fallbackUsed: meta.usedFallback || meta.modelFallbackUsed === true,
+    };
+    if (!modelUsages.some(existing => existing.actualModel === usage.actualModel && existing.provider === usage.provider && existing.fallbackUsed === usage.fallbackUsed)) {
+      modelUsages.push(usage);
+    }
+    if (id) {
+      recordGenerationProvenance(id, { ...meta, usedFallback: usage.fallbackUsed });
+      // Expose the models already used while a long, multi-chapter check runs.
+      const updated = db.prepare("UPDATE generation_jobs SET result=?, updatedAt=? WHERE id=? AND status='processing'")
+        .run(JSON.stringify({ modelUsages }), new Date().toISOString(), id);
+      if (updated.changes) setStage?.(GenerationStage.PROCESSING_AI_RESPONSE, { modelUsages });
+    }
     if (meta.usedFallback) {
       // Report the degraded run instead of presenting an empty result as "clean".
       aiUnavailable++;
@@ -77,6 +99,7 @@ async function runConsistency({ novelId, userId, payload }: any) {
   return {
     chaptersChecked: chapters.length,
     aiUnavailable,
+    modelUsages,
     note: 'Consistency findings are advisory. Chapter text is never modified automatically.',
   };
 }

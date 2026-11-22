@@ -7,7 +7,9 @@
  * end to end.
  */
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
-import { freshDatabase, seedUser, db } from '../helpers/db';
+import { freshDatabase, seedUser, seedNovel, db } from '../helpers/db';
+import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
+import { getJob, runJob } from '@/lib/queue';
 import { __setFetchForTests as setHfFetch } from '@/lib/ai/huggingface-client';
 import { __setFetchForTests as setAgnesFetch } from '@/lib/ai/agnes-client';
 import { __setRetrySleepForTests } from '@/lib/ai/retry-policy';
@@ -196,6 +198,22 @@ describe('Agnes AI generation', () => {
     expect(data.chapters).toBe(12);
   });
 
+  it('records the provider-reported model for structured output without inventing a fallback', async () => {
+    fetchMock = mockFetch([agnesHandler(() => jsonResponse({
+      model: 'agnes-2.5-flash-2026',
+      choices: [{ message: { content: '{"ok":true}' } }],
+    }))]);
+    setAgnesFetch(fetchMock as unknown as typeof fetch);
+    const result = await generateStructuredDetailed(z.object({ ok: z.boolean() }), {
+      messages: [{ role: 'user', content: 'Return a flag.' }],
+      model: 'agnes-2.5-flash', userId: USER_ID, taskType: 'outline', fallback: { ok: false },
+    });
+    expect(result.data.ok).toBe(true);
+    expect(result.meta).toMatchObject({ actualModel: 'agnes-2.5-flash-2026', provider: 'agnes-ai', modelFallbackUsed: false });
+    const usage = db().prepare('SELECT model FROM ai_usage WHERE taskType=?').get('outline') as any;
+    expect(usage.model).toBe('agnes-2.5-flash-2026');
+  });
+
   it('throws (never invents) when the structured response is unusable', async () => {
     fetchMock = mockFetch([agnesHandler(() => agnesChatSuccess('No JSON here, sorry.'))]);
     setAgnesFetch(fetchMock as unknown as typeof fetch);
@@ -223,6 +241,13 @@ describe('Agnes AI generation', () => {
 });
 
 describe('Agnes primary → Hugging Face fallback chains', () => {
+  it('reports the image model returned by Agnes, even when it differs from the request ID', async () => {
+    fetchMock = mockFetch([agnesHandler(() => jsonResponse({ model: 'agnes-image-2.5-flash-2026', data: [{ b64_json: BIG_PNG_BASE64 }] }))]);
+    setAgnesFetch(fetchMock as unknown as typeof fetch);
+    const result = await generateImage({ prompt: 'A cover', modelId: 'agnes-image-2.5-flash', userId: USER_ID });
+    expect(result).toMatchObject({ requestedModelId: 'agnes-image-2.5-flash', actualModelId: 'agnes-image-2.5-flash-2026', fallbackUsed: false, provider: 'agnes-ai' });
+  });
+
   it('uses Agnes for text first and labels the source', async () => {
     fetchMock = mockFetch([agnesHandler(() => agnesChatSuccess('Agnes wrote this line.'))]);
     setAgnesFetch(fetchMock as unknown as typeof fetch);
@@ -259,8 +284,11 @@ describe('Agnes primary → Hugging Face fallback chains', () => {
     expect(result.text).toContain('fallback model');
     expect(result.meta.source).toBe('huggingface');
     expect(result.meta.actualModel).toBe('Qwen/Qwen2.5-7B-Instruct');
+    expect(result.meta.modelFallbackUsed).toBe(true);
     expect(fetchMock.callsTo('apihub.agnes-ai.com')).toBeGreaterThan(0);
     expect(fetchMock.callsTo('router.huggingface.co')).toBeGreaterThan(0);
+    const usage = db().prepare('SELECT requestedModel, actualModel, fallbackCount FROM ai_usage WHERE taskType=? AND source=?').get('chapter', 'huggingface') as any;
+    expect(usage).toMatchObject({ requestedModel: 'auto', actualModel: 'Qwen/Qwen2.5-7B-Instruct', fallbackCount: 1 });
   });
 
   it('falls back to Hugging Face for structured output when Agnes returns garbage', async () => {
@@ -282,6 +310,74 @@ describe('Agnes primary → Hugging Face fallback chains', () => {
 
     expect(data.ok).toBe(true);
     expect(meta.source).toBe('huggingface');
+    expect(meta.modelFallbackUsed).toBe(true);
+    const usage = db().prepare('SELECT requestedModel, actualModel, fallbackCount FROM ai_usage WHERE taskType=? AND source=?').get('outline', 'huggingface') as any;
+    expect(usage).toMatchObject({ requestedModel: 'auto', actualModel: 'Qwen/Qwen2.5-7B-Instruct', fallbackCount: 1 });
+  });
+
+  it('honours an explicitly pinned structured provider instead of using the default backend', async () => {
+    makeEligible(['Qwen/Qwen2.5-7B-Instruct']);
+    fetchMock = mockFetch([
+      agnesHandler(() => agnesChatSuccess('{"ok":false}')),
+      chatHandler(() => chatSuccess('{"ok":true}', {}, 'together')),
+    ]);
+    setAgnesFetch(fetchMock as unknown as typeof fetch);
+    setHfFetch(fetchMock as unknown as typeof fetch);
+    const result = await generateStructuredDetailed(z.object({ ok: z.boolean() }), {
+      messages: [{ role: 'user', content: 'Return the flag.' }], userId: USER_ID, taskType: 'outline',
+      forceProvider: 'huggingface', model: 'Qwen/Qwen2.5-7B-Instruct', allowModelFallback: false, fallback: { ok: false },
+    });
+    expect(result.data.ok).toBe(true);
+    expect(result.meta).toMatchObject({ source: 'huggingface', actualModel: 'Qwen/Qwen2.5-7B-Instruct', modelFallbackUsed: false });
+    expect(fetchMock.callsTo('apihub.agnes-ai.com')).toBe(0);
+  });
+
+  it('uses the pinned provider in a universal structured background job', async () => {
+    makeEligible(['Qwen/Qwen2.5-7B-Instruct']);
+    const novel = seedNovel(USER_ID);
+    fetchMock = mockFetch([
+      agnesHandler(() => agnesChatSuccess('{"ok":false}')),
+      chatHandler(() => chatSuccess('{"ok":true}', {}, 'together')),
+    ]);
+    setAgnesFetch(fetchMock as unknown as typeof fetch);
+    setHfFetch(fetchMock as unknown as typeof fetch);
+    const id = await UniversalGenerationService.createJob({
+      projectId: novel.id, userId: USER_ID, generationType: 'character', prompt: 'A character',
+      provider: 'huggingface', model: 'Qwen/Qwen2.5-7B-Instruct', metadata: { responseFormat: 'json', allowFallback: false },
+    });
+    expect((await runJob(id)).status).toBe('completed');
+    expect(await getJob(id)).toMatchObject({ provider: 'together', requestedModel: 'Qwen/Qwen2.5-7B-Instruct', actualModel: 'Qwen/Qwen2.5-7B-Instruct', fallbackCount: 0 });
+    expect(fetchMock.callsTo('apihub.agnes-ai.com')).toBe(0);
+  });
+
+  it('records a cross-provider fallback for a universal structured background job', async () => {
+    makeEligible(['Qwen/Qwen2.5-7B-Instruct']);
+    const novel = seedNovel(USER_ID);
+    fetchMock = mockFetch([
+      agnesHandler(() => jsonResponse({ error: 'upstream overload' }, 503)),
+      chatHandler(() => chatSuccess('{"ok":true}', {}, 'together')),
+    ]);
+    setAgnesFetch(fetchMock as unknown as typeof fetch);
+    setHfFetch(fetchMock as unknown as typeof fetch);
+    const id = await UniversalGenerationService.createJob({
+      projectId: novel.id, userId: USER_ID, generationType: 'character', prompt: 'A character',
+      model: 'agnes-2.5-flash', metadata: { responseFormat: 'json', allowFallback: true },
+    });
+    expect((await runJob(id)).status).toBe('completed');
+    expect(await getJob(id)).toMatchObject({ provider: 'together', requestedModel: 'agnes-2.5-flash', actualModel: 'Qwen/Qwen2.5-7B-Instruct', fallbackCount: 1 });
+    const usage = db().prepare('SELECT requestedModel,actualModel,fallbackCount FROM ai_usage WHERE jobId=? AND source=?').get(id, 'huggingface') as any;
+    expect(usage).toMatchObject({ requestedModel: 'agnes-2.5-flash', actualModel: 'Qwen/Qwen2.5-7B-Instruct', fallbackCount: 1 });
+  });
+
+  it('does not silently replace an incompatible model with fallback disabled', async () => {
+    fetchMock = mockFetch([agnesHandler(() => agnesChatSuccess('{"ok":true}'))]);
+    setAgnesFetch(fetchMock as unknown as typeof fetch);
+    const input = { messages: [{ role: 'user' as const, content: 'Return the flag.' }], userId: USER_ID, taskType: 'outline',
+      forceProvider: 'agnes' as const, model: 'Qwen/Qwen2.5-7B-Instruct', allowModelFallback: false };
+    const result = await generateStructuredDetailed(z.object({ ok: z.boolean() }), { ...input, fallback: { ok: false } });
+    expect(result.meta.source).toBe('fallback');
+    await expect(generateTextDetailed(input)).rejects.toMatchObject({ code: 'provider_model_mismatch' });
+    expect(fetchMock.calls).toHaveLength(0);
   });
 
   it('falls back to a Hugging Face image model when Agnes image generation fails', async () => {
@@ -303,8 +399,56 @@ describe('Agnes primary → Hugging Face fallback chains', () => {
 
     expect(result.image.length).toBeGreaterThan(1_000);
     expect(result.actualModelId).toBe('black-forest-labs/FLUX.1-schnell');
+    expect(result.requestedModelId).toBe('auto');
+    expect(result.fallbackUsed).toBe(true);
     expect(result.provider).toBe('hf-inference');
     expect(fetchMock.callsTo('router.huggingface.co')).toBeGreaterThan(0);
+  });
+
+  it('retains an explicit Agnes image request when Hugging Face serves the fallback', async () => {
+    makeEligible(['black-forest-labs/FLUX.1-schnell']);
+    fetchMock = mockFetch([
+      agnesHandler(() => jsonResponse({ error: 'capacity exhausted' }, 503)),
+      imageHandler(() => imageSuccessBase64()),
+    ]);
+    setAgnesFetch(fetchMock as unknown as typeof fetch);
+    setHfFetch(fetchMock as unknown as typeof fetch);
+    const result = await generateImage({ prompt: 'A cover', modelId: 'agnes-image-2.5-flash', userId: USER_ID, taskType: 'cover' });
+    expect(result).toMatchObject({ requestedModelId: 'agnes-image-2.5-flash', actualModelId: 'black-forest-labs/FLUX.1-schnell', fallbackUsed: true });
+    const usage = db().prepare('SELECT requestedModel, actualModel, fallbackCount FROM ai_usage WHERE taskType=? AND source=?').get('cover', 'huggingface') as any;
+    expect(usage).toMatchObject({ requestedModel: 'agnes-image-2.5-flash', actualModel: 'black-forest-labs/FLUX.1-schnell', fallbackCount: 1 });
+  });
+
+  it('does not switch providers when model fallback is disabled', async () => {
+    makeEligible(['Qwen/Qwen2.5-7B-Instruct', 'black-forest-labs/FLUX.1-schnell']);
+    fetchMock = mockFetch([
+      agnesHandler(() => jsonResponse({ error: 'upstream overload' }, 503)),
+      chatHandler(() => chatSuccess('{"ok":true}')),
+      imageHandler(() => imageSuccessBase64()),
+    ]);
+    setAgnesFetch(fetchMock as unknown as typeof fetch);
+    setHfFetch(fetchMock as unknown as typeof fetch);
+    const input = { messages: [{ role: 'user' as const, content: 'Write a sentence.' }], userId: USER_ID, taskType: 'outline', allowModelFallback: false };
+    await expect(generateTextDetailed(input)).rejects.toThrow();
+    const structured = await generateStructuredDetailed(z.object({ ok: z.boolean() }), { ...input, fallback: { ok: false } });
+    expect(structured.meta.source).toBe('fallback');
+    await expect(generateImage({ prompt: 'A cover', userId: USER_ID, allowFallback: false })).rejects.toThrow();
+    expect(fetchMock.callsTo('router.huggingface.co')).toBe(0);
+  });
+
+  it('respects the global fallback policy for text and images', async () => {
+    process.env.AI_FALLBACK_ENABLED = 'false';
+    makeEligible(['Qwen/Qwen2.5-7B-Instruct', 'black-forest-labs/FLUX.1-schnell']);
+    fetchMock = mockFetch([
+      agnesHandler(() => jsonResponse({ error: 'upstream overload' }, 503)),
+      chatHandler(() => chatSuccess('Unexpected fallback')),
+      imageHandler(() => imageSuccessBase64()),
+    ]);
+    setAgnesFetch(fetchMock as unknown as typeof fetch);
+    setHfFetch(fetchMock as unknown as typeof fetch);
+    await expect(generateTextDetailed({ messages: [{ role: 'user', content: 'Write.' }], userId: USER_ID, taskType: 'chapter' })).rejects.toThrow();
+    await expect(generateImage({ prompt: 'A cover', userId: USER_ID })).rejects.toThrow();
+    expect(fetchMock.callsTo('router.huggingface.co')).toBe(0);
   });
 
   it('routes an explicit Agnes image model through Agnes even when Hugging Face is pinned', async () => {

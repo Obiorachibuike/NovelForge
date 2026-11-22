@@ -21,6 +21,7 @@ import {
 import { cn } from '@/lib/utils/cn';
 import { useOptionalGeneration } from '@/components/generation/GenerationContext';
 import { GenerationStatusBadge, generationStatusLabel } from '@/components/generation/GenerationStatusBadge';
+import { ModelIndicator } from '@/components/ai/ModelIndicator';
 import {
   createAutosaveController,
   loadLocalDraft,
@@ -56,6 +57,7 @@ export default function WritingWorkspace({
   const qc = useQueryClient();
   const generation = useOptionalGeneration();
   const [aiState, setAiState] = useState<'idle' | 'thinking' | 'streaming'>('idle');
+  const [editorModel, setEditorModel] = useState<{ requestedModel?: string | null; actualModel?: string | null; provider?: string | null; fallbackUsed?: boolean } | null>(null);
   const [selection, setSelection] = useState<string>('');
   const [versions, setVersions] = useState<any[]>(initialVersions);
   const [showCompareRecovery, setShowCompareRecovery] = useState(false);
@@ -357,6 +359,7 @@ export default function WritingWorkspace({
   const aiAction = useMutation({
     mutationFn: async (action: string) => {
       if (!editor || !chapter) return;
+      setEditorModel(null);
       setAiState('thinking');
       const res = await fetch(`/api/ai/editor-action`, {
         method: 'POST',
@@ -366,6 +369,12 @@ export default function WritingWorkspace({
       if (!res.ok) throw new Error((await res.json()).error || 'AI action failed');
       setAiState('streaming');
       const data = await res.json();
+      setEditorModel({
+        requestedModel: data.requestedModel ?? 'auto',
+        actualModel: data.actualModel ?? null,
+        provider: data.provider ?? data.source,
+        fallbackUsed: data.fallbackUsed === true,
+      });
       // insert or replace
       const { from, to } = editor.state.selection;
       if (editor.state.selection.empty) {
@@ -387,8 +396,9 @@ export default function WritingWorkspace({
   const chapterGeneration = (generation?.generations || [])
     .filter(
       (g: any) =>
-        (chapter?.id && g.chapterId === chapter.id) ||
-        (!chapter?.id && g.chapterNumber === chapterNum),
+        g.novelId === novel.id && g.taskType === 'chapter' && g.engine !== 'universal' &&
+        ((chapter?.id && g.chapterId === chapter.id) ||
+        (!chapter?.id && g.chapterNumber === chapterNum)),
     )
     .sort((a: any, b: any) => {
       const aActive = a.status === 'QUEUED' || a.status === 'PROCESSING' ? 0 : 1;
@@ -398,6 +408,8 @@ export default function WritingWorkspace({
     })[0];
   const isWritingJob =
     chapterGeneration?.status === 'QUEUED' || chapterGeneration?.status === 'PROCESSING';
+  const jobProducedSavedChapter = !!chapter?.lastJobId && chapterGeneration?.id === chapter.lastJobId;
+  const useJobModel = isWritingJob || !chapter?.generationSource;
 
   const autoStarted = useRef(false);
   useEffect(() => {
@@ -453,6 +465,30 @@ export default function WritingWorkspace({
                 </div>
                 <h1 className="font-serif text-4xl font-semibold leading-tight mb-2">{title}</h1>
                 {outline?.summary && <p className="text-sm text-muted-foreground max-w-xl">{outline.summary}</p>}
+                {(chapter?.generationSource || chapterGeneration) && (
+                  <ModelIndicator
+                    className="mt-3"
+                    status={useJobModel ? chapterGeneration?.status : 'completed'}
+                    requestedModel={useJobModel ? chapterGeneration?.requestedModel : chapter?.modelRequested}
+                    actualModel={useJobModel ? chapterGeneration?.actualModel : (chapter?.modelUsed ?? (jobProducedSavedChapter ? chapterGeneration?.actualModel : null))}
+                    provider={useJobModel ? chapterGeneration?.provider : (chapter?.generationProvider ?? (jobProducedSavedChapter ? chapterGeneration?.provider : null) ?? chapter?.generationSource)}
+                    fallbackUsed={useJobModel ? (chapterGeneration?.fallbackCount ?? 0) > 0 : chapter?.generationFallbackCount != null
+                      ? chapter.generationFallbackCount > 0
+                      : jobProducedSavedChapter && (chapterGeneration?.fallbackCount ?? 0) > 0}
+                  />
+                )}
+                {(aiState !== 'idle' || editorModel) && (
+                  <div className="mt-3 text-xs text-muted-foreground" role="status" aria-live="polite">
+                    <span className="block mb-1">Latest editor action</span>
+                    <ModelIndicator
+                      status={aiState !== 'idle' ? 'processing' : 'completed'}
+                      requestedModel={aiState !== 'idle' ? 'auto' : editorModel?.requestedModel}
+                      actualModel={aiState !== 'idle' ? null : editorModel?.actualModel}
+                      provider={aiState !== 'idle' ? null : editorModel?.provider}
+                      fallbackUsed={editorModel?.fallbackUsed}
+                    />
+                  </div>
+                )}
               </div>
             </div>
 
@@ -708,6 +744,7 @@ export default function WritingWorkspace({
                     <><Sparkles className="w-4 h-4" /> Generate Chapter {chapterNum}</>
                   )}
                 </button>
+                <ModelIndicator className="mt-4 justify-center" status="idle" requestedModel="auto" />
                 {isLocked && <p className="text-xs text-amber-400 mt-4"><Lock className="w-3 h-3 inline mr-1" />Previous chapter must be approved first.</p>}
               </div>
             ) : isLocked ? (
@@ -780,6 +817,13 @@ export default function WritingWorkspace({
           {chapter && !isApproved && (
             <div className="space-y-2">
               <div className="label mb-2">Editor actions</div>
+              <ModelIndicator
+                status={aiState !== 'idle' ? 'processing' : editorModel ? 'completed' : 'idle'}
+                requestedModel={aiState !== 'idle' ? 'auto' : (editorModel?.requestedModel ?? 'auto')}
+                actualModel={aiState !== 'idle' ? null : editorModel?.actualModel}
+                provider={aiState !== 'idle' ? null : editorModel?.provider}
+                fallbackUsed={editorModel?.fallbackUsed}
+              />
               {[
                 { k: 'continue', label: 'Continue scene', icon: Zap },
                 { k: 'rewrite', label: 'Rewrite selection', icon: RefreshCw },

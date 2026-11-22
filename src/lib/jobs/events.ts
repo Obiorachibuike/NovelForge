@@ -110,6 +110,19 @@ export function safePublishGenerationEvent(input: PublishGenerationEventInput): 
   }
 }
 
+/**
+ * A manual retry reuses the same job id, but its old terminal events belong to
+ * the preceding attempt. Keep them in the audit log without replaying them as
+ * the current attempt's outcome on a newly opened stream.
+ */
+export function latestManualRetrySequence(jobId: string): number | null {
+  const row = getDb().prepare(
+    'SELECT MAX(seq) AS latest FROM generation_events WHERE jobId=? AND type=? AND payload LIKE ?',
+  ).get(jobId, GenerationEventType.QUEUED, '%"manualRetry":true%') as { latest: number | null } | undefined;
+  const latest = Number(row?.latest ?? 0);
+  return latest > 0 ? latest : null;
+}
+
 /** The seq of the last event the client has seen. */
 export type EventCursor = number;
 

@@ -26,6 +26,7 @@ import {
   resolveProviderChain,
 } from '@/lib/ai/generation/generation-service';
 import { validateGenerationRequest } from '@/lib/ai/generation/generation-validation';
+import { generateImage } from '@/lib/ai/image-generation';
 import {
   cancelJob,
   enqueue,
@@ -37,6 +38,7 @@ import {
 import { listGenerationEvents } from '@/lib/jobs/events';
 import {
   getGenerationForUser,
+  listGenerations,
   listGenerationsForUser,
   serializeGeneration,
 } from '@/lib/jobs/generation-jobs';
@@ -342,6 +344,15 @@ describe('job creation and execution', () => {
     expect(JSON.parse(job.result!).text).toBe('custom:Titl');
   });
 
+  it('does not invent a provider for an unannotated custom-handler result', async () => {
+    GenerationRegistry.register('novel_title', async () => 'A title of unknown origin');
+    const jobId = await UniversalGenerationService.createJob(request());
+    await runJob(jobId, 'test-worker');
+    const job = (await getJob(jobId))!;
+    expect(JSON.parse(job.result!).meta).toMatchObject({ source: 'unknown', model: 'unknown' });
+    expect(job).toMatchObject({ provider: null, actualModel: null });
+  });
+
   it('never executes a job whose row does not match the request', async () => {
     const jobId = await UniversalGenerationService.createJob(request());
     await expect(
@@ -357,6 +368,19 @@ describe('job creation and execution', () => {
 });
 
 describe('image generation', () => {
+  it('retains the Hugging Face source when the router names an upstream provider', async () => {
+    vi.mocked(generateImage).mockResolvedValueOnce({
+      image: Buffer.from('89504e470d0a1a0a', 'hex'), mimeType: 'image/png', provider: 'together',
+      requestedModelId: 'agnes-image-2.5-flash', actualModelId: 'black-forest-labs/FLUX.1-schnell',
+      fallbackUsed: true, attempts: 1, latencyMs: 20, width: 1024, height: 1024,
+    });
+    const jobId = await UniversalGenerationService.createJob(request({ generationType: 'image', model: 'agnes-image-2.5-flash' }));
+    await runJob(jobId, 'test-worker');
+    const job = (await getJob(jobId))!;
+    expect(job).toMatchObject({ provider: 'together', actualModel: 'black-forest-labs/FLUX.1-schnell', fallbackCount: 1 });
+    expect(JSON.parse(job.result!).meta).toMatchObject({ source: 'huggingface', provider: 'together', usedFallback: true });
+  });
+
   it('finalises the image job itself (never the project id) and records the asset', async () => {
     const jobId = await UniversalGenerationService.createJob(request({
       generationType: 'image',
@@ -546,6 +570,20 @@ describe('universal HTTP API', () => {
     expect(response.status).toBe(400);
   });
 
+  it('restores older active AI jobs but excludes unrelated queue work from the activity list', async () => {
+    const older = await UniversalGenerationService.createJob(request({ generationType: 'scene' }));
+    const newer = await UniversalGenerationService.createJob(request({ generationType: 'novel_title' }));
+    const unrelated = await enqueue({ type: 'export', userId: user.id, novelId: novel.id, payload: {} });
+    db().prepare('UPDATE generation_jobs SET createdAt=? WHERE id=?').run('2020-01-01T00:00:00Z', older);
+    db().prepare("UPDATE generation_jobs SET createdAt=?, status='completed' WHERE id=?").run('2021-01-01T00:00:00Z', newer);
+    db().prepare('UPDATE generation_jobs SET createdAt=? WHERE id=?').run('2022-01-01T00:00:00Z', unrelated);
+    const response = await universalList(new Request('http://localhost:3000/api/generations/universal?limit=1'));
+    const body = await response.json();
+    expect(body.generations.map((g: any) => g.id)).toEqual([newer]);
+    expect(body.activeGenerations.map((g: any) => g.id)).toEqual([older]);
+    expect(body.activeGenerations[0].engine).toBe('universal');
+  });
+
   it('lists every generation type the caller owns', async () => {
     await UniversalGenerationService.createJob(request({ generationType: 'novel_title', idempotencyKey: 'a' }));
     await UniversalGenerationService.createJob(request({ generationType: 'scene', idempotencyKey: 'b' }));
@@ -561,6 +599,21 @@ describe('universal HTTP API', () => {
 });
 
 describe('legacy jobs stay on the legacy engine', () => {
+  it('restores the latest task-specific legacy job rather than a newer generic generation', async () => {
+    const premise = await enqueue({ type: 'premise', userId: user.id, novelId: novel.id, payload: {} });
+    const outline = await enqueue({ type: 'outline', userId: user.id, novelId: novel.id, payload: {} });
+    const universalOutline = await UniversalGenerationService.createJob(request({ generationType: 'outline' }));
+    const unrelated = await enqueue({ type: 'outline', userId: other.id, novelId: seedNovel(other.id).id, payload: {} });
+    db().prepare('UPDATE generation_jobs SET createdAt=? WHERE id=?').run('2020-01-01T00:00:00Z', premise);
+    db().prepare('UPDATE generation_jobs SET createdAt=? WHERE id=?').run('2021-01-01T00:00:00Z', outline);
+    db().prepare('UPDATE generation_jobs SET createdAt=? WHERE id=?').run('2022-01-01T00:00:00Z', universalOutline);
+    db().prepare('UPDATE generation_jobs SET createdAt=? WHERE id=?').run('2023-01-01T00:00:00Z', unrelated);
+    const filter = { allTaskTypes: true, legacyOnly: true, novelId: novel.id, limit: 1 };
+    expect(listGenerations(user.id, { ...filter, taskType: 'premise' }).map(j => j.id)).toEqual([premise]);
+    expect(listGenerations(user.id, { ...filter, taskType: 'outline' }).map(j => j.id)).toEqual([outline]);
+    expect(listGenerations(user.id, { ...filter, taskType: 'consistency' })).toEqual([]);
+  });
+
   it('does not route a legacy row into the universal engine', async () => {
     registerHandler('outline', async ctx => {
       ctx.setStage('PREPARING_AI_PROMPT');

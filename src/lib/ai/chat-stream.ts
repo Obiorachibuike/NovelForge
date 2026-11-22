@@ -65,6 +65,7 @@ export async function readChatStream(
   response: Response,
   onText: (text: string) => void,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<ChatCompletionPayload> {
   if (!response.body) throw new Error('The provider returned no response stream.');
   const reader = response.body.getReader();
@@ -77,8 +78,9 @@ export async function readChatStream(
   let usage: ChatCompletionUsage | undefined;
   let doneEvent = false;
   let timedOut = false;
-  const timer = setTimeout(() => { timedOut = true; void reader.cancel(); }, timeoutMs);
-  onText('');
+  const timer = setTimeout(() => { timedOut = true; void reader.cancel().catch(() => {}); }, timeoutMs);
+  const onAbort = () => { void reader.cancel().catch(() => {}); };
+  signal?.addEventListener('abort', onAbort, { once: true });
 
   const consume = (payload: ChatCompletionPayload) => {
     model = payload.model ?? model;
@@ -116,8 +118,11 @@ export async function readChatStream(
   };
 
   try {
+    if (signal?.aborted) throw Object.assign(new Error('Generation request was cancelled.'), { name: 'AbortError' });
+    onText('');
     while (!doneEvent) {
       const { value, done } = await reader.read();
+      if (signal?.aborted) throw Object.assign(new Error('Generation request was cancelled.'), { name: 'AbortError' });
       if (timedOut) throw new Error('Text generation timed out.');
       const chunk = decoder.decode(value, { stream: !done });
       raw += chunk;
@@ -152,6 +157,7 @@ export async function readChatStream(
     return { model, usage, choices: [{ message: { content: text } }] };
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
     await reader.cancel().catch(() => {});
     reader.releaseLock();
   }

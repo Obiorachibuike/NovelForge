@@ -8,12 +8,16 @@ import { cn } from '@/lib/utils/cn';
 import { useJobWatcher } from '@/lib/hooks/useJobWatcher';
 import { useOptionalGeneration } from '@/components/generation/GenerationContext';
 import { GenerationStatusBadge } from '@/components/generation/GenerationStatusBadge';
+import ModelSelector from '@/components/ai/ModelSelector';
+import { ModelIndicator } from '@/components/ai/ModelIndicator';
 
-export default function OutlineEditor({ novel, outlines, acts, chapters, navigation }: any) {
+export default function OutlineEditor({ novel, outlines, acts, chapters, navigation, initialJob }: any) {
   const router = useRouter();
   const qc = useQueryClient();
   const generation = useOptionalGeneration();
   const [structure, setStructure] = useState('three-act');
+  const [textModel, setTextModel] = useState('auto');
+  const [allowFallback, setAllowFallback] = useState(true);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState<{ title: string; summary: string; targetWords: number }>({
     title: '',
@@ -23,6 +27,7 @@ export default function OutlineEditor({ novel, outlines, acts, chapters, navigat
   const hasOutline = outlines.length > 0;
 
   const { job: outlineJob, watch } = useJobWatcher({
+    initialJob,
     onComplete: () => {
       toast.success('Outline generated.');
       qc.invalidateQueries();
@@ -34,14 +39,14 @@ export default function OutlineEditor({ novel, outlines, acts, chapters, navigat
 
   const gen = useMutation({
     mutationFn: async () => {
-      const res = await fetch(`/api/novels/${novel.id}/outline`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ structure }) });
+      const res = await fetch(`/api/novels/${novel.id}/outline`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ structure, textModel, allowFallback }) });
       if (!res.ok) throw new Error((await res.json()).error || 'Failed');
       return res.json();
     },
     onSuccess: (data: any) => {
       if (data?.jobId) {
         toast.message('Generating chapter outline…');
-        watch(data.jobId);
+        watch(data.jobId, { requestedModel: textModel });
       } else {
         toast.success('Outline generated.');
         qc.invalidateQueries();
@@ -89,6 +94,7 @@ export default function OutlineEditor({ novel, outlines, acts, chapters, navigat
     const candidates = (generation?.generations || []).filter(
       (g: any) =>
         g.novelId === novel.id &&
+        g.taskType === 'chapter' && g.engine !== 'universal' &&
         ((c.chapterId && g.chapterId === c.chapterId) || g.chapterNumber === c.chapterNumber),
     );
     return candidates.sort((a: any, b: any) => {
@@ -145,6 +151,26 @@ export default function OutlineEditor({ novel, outlines, acts, chapters, navigat
             </button>
           </div>
         )}
+      </div>
+
+      <div className="surface p-4 mb-6">
+        <ModelSelector
+          task="text-generation"
+          value={textModel}
+          allowFallback={allowFallback}
+          onChange={setTextModel}
+          onAllowFallbackChange={setAllowFallback}
+          disabled={gen.isPending || isGeneratingOutline}
+          compact
+        />
+        <ModelIndicator
+          className="mt-3 pt-3 border-t border-border"
+          status={gen.isPending ? 'pending' : (outlineJob?.status ?? 'idle')}
+          requestedModel={gen.isPending ? textModel : (outlineJob?.requestedModel ?? textModel)}
+          actualModel={gen.isPending ? null : outlineJob?.actualModel}
+          provider={gen.isPending ? null : outlineJob?.provider}
+          fallbackUsed={!gen.isPending && (outlineJob?.fallbackCount ?? 0) > 0}
+        />
       </div>
 
       {hasOutline && (
@@ -228,6 +254,21 @@ export default function OutlineEditor({ novel, outlines, acts, chapters, navigat
                       <StatusChip status={c.status} />
                     </div>
                     {c.summary && <p className="text-xs text-muted-foreground mt-1 line-clamp-2">{c.summary}</p>}
+                    {(() => {
+                      const job = generationFor(c);
+                      if (!job && !c.generationSource) return null;
+                      const useJob = job && (job.status === 'QUEUED' || job.status === 'PROCESSING' || !c.generationSource);
+                      return <ModelIndicator
+                        className="mt-1"
+                        status={useJob ? job.status : 'completed'}
+                        requestedModel={useJob ? job.requestedModel : c.modelRequested}
+                        actualModel={useJob ? job.actualModel : c.modelUsed}
+                        provider={useJob ? job.provider : (c.generationProvider ?? c.generationSource)}
+                        fallbackUsed={useJob ? (job.fallbackCount ?? 0) > 0 : c.generationFallbackCount != null
+                          ? c.generationFallbackCount > 0
+                          : !!job && job.actualModel === c.modelUsed && (job.fallbackCount ?? 0) > 0}
+                      />;
+                    })()}
                   </div>
                   <div className="text-right shrink-0">
                     <div className="font-serif text-base">{c.targetWords.toLocaleString()}</div>

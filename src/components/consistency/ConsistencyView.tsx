@@ -5,12 +5,14 @@ import { useRouter } from 'next/navigation';
 import { Loader2, Play, CheckCircle, AlertTriangle, Info, XCircle, ArrowRight } from 'lucide-react';
 import { cn } from '@/lib/utils/cn';
 import { useJobWatcher } from '@/lib/hooks/useJobWatcher';
+import { ModelIndicator } from '@/components/ai/ModelIndicator';
 
-export default function ConsistencyView({ novel, score, issues, chapterCount, approvedCount, issueCount }: any) {
+export default function ConsistencyView({ novel, score, issues, chapterCount, approvedCount, issueCount, initialJob }: any) {
   const router = useRouter();
   const qc = useQueryClient();
 
   const { job: checkJob, watch } = useJobWatcher({
+    initialJob,
     onComplete: () => {
       toast.success('Consistency check complete');
       qc.invalidateQueries();
@@ -29,7 +31,7 @@ export default function ConsistencyView({ novel, score, issues, chapterCount, ap
     onSuccess: (data: any) => {
       if (data?.jobId) {
         toast.message('Running consistency check…');
-        watch(data.jobId);
+        watch(data.jobId, { requestedModel: 'auto' });
       } else {
         toast.success('Consistency check complete');
         qc.invalidateQueries();
@@ -55,9 +57,19 @@ export default function ConsistencyView({ novel, score, issues, chapterCount, ap
           <h1 className="font-serif text-3xl font-semibold">Keep every detail true.</h1>
           <p className="text-muted-foreground mt-2 max-w-xl">The consistency engine checks your manuscript against the Story Bible for timeline clashes, world-rule violations, and forgotten threads.</p>
         </div>
-        <button className="btn-primary" onClick={()=>run.mutate()} disabled={run.isPending || isChecking}>
-          {(run.isPending || isChecking) ? <Loader2 className="w-4 h-4 animate-spin"/> : <Play className="w-4 h-4"/>} {isChecking ? 'Checking…' : 'Run check'}
-        </button>
+        <div className="space-y-2">
+          <button className="btn-primary" onClick={()=>run.mutate()} disabled={run.isPending || isChecking}>
+            {(run.isPending || isChecking) ? <Loader2 className="w-4 h-4 animate-spin"/> : <Play className="w-4 h-4"/>} {isChecking ? 'Checking…' : 'Run check'}
+          </button>
+          <ModelIndicator
+            status={run.isPending ? 'pending' : (checkJob?.status ?? 'idle')}
+            requestedModel={run.isPending ? 'auto' : (checkJob?.requestedModel ?? 'auto')}
+            actualModel={run.isPending ? null : checkJob?.actualModel}
+            provider={run.isPending ? null : checkJob?.provider}
+            fallbackUsed={!run.isPending && (checkJob?.fallbackCount ?? 0) > 0}
+            modelUsages={run.isPending ? undefined : checkJob?.modelUsages}
+          />
+        </div>
       </div>
 
       <div className="surface p-8 mb-6 flex items-center gap-8 flex-wrap">

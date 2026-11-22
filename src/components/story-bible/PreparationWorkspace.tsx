@@ -7,8 +7,9 @@ import { Loader2, Sparkles, ArrowRight, Wand2, RefreshCw, User, MapPin, Scroll }
 import { cn } from '@/lib/utils/cn';
 import { useJobWatcher } from '@/lib/hooks/useJobWatcher';
 import ModelSelector from '@/components/ai/ModelSelector';
+import { ModelIndicator } from '@/components/ai/ModelIndicator';
 
-export default function PreparationWorkspace({ novel, premise, characters, worldRules }: any) {
+export default function PreparationWorkspace({ novel, premise, characters, worldRules, initialJob }: any) {
   const router = useRouter();
   const qc = useQueryClient();
   const [activeSection, setActiveSection] = useState('logline');
@@ -19,6 +20,7 @@ export default function PreparationWorkspace({ novel, premise, characters, world
   // Preparation runs as a durable background job: follow the job row instead of
   // assuming the work finished when the POST returns.
   const { job: prepJob, watch } = useJobWatcher({
+    initialJob,
     onComplete: () => {
       toast.success('Premise, characters, and Story Bible ready.');
       qc.invalidateQueries();
@@ -38,7 +40,7 @@ export default function PreparationWorkspace({ novel, premise, characters, world
       return res.json();
     },
     onSuccess: (data:any) => {
-      if (data?.jobId) { toast.message('Working on your Story Bible…'); watch(data.jobId); }
+      if (data?.jobId) { toast.message('Working on your Story Bible…'); watch(data.jobId, { requestedModel: textModel }); }
       else { qc.invalidateQueries(); router.refresh(); }
     },
     onError: (e:any) => toast.error(e.message),
@@ -76,18 +78,7 @@ export default function PreparationWorkspace({ novel, premise, characters, world
               <button onClick={()=>prep.mutate()} className="btn-primary w-full" disabled={prep.isPending || prepRunning}>
                 {(prep.isPending || prepRunning) ? <><Loader2 className="w-4 h-4 animate-spin" /> Preparing…</> : <><Wand2 className="w-4 h-4" /> Generate Story Bible</>}
               </button>
-              <div className="mt-4 pt-4 border-t border-border">
-                <ModelSelector
-                  task="text-generation"
-                  value={textModel}
-                  allowFallback={allowFallback}
-                  onChange={setTextModel}
-                  onAllowFallbackChange={setAllowFallback}
-                  disabled={prep.isPending || prepRunning}
-                  compact
-                />
-              </div>
-                      <p className="text-[11px] text-muted-foreground mt-3">You&apos;ll be able to edit and regenerate every section.</p>
+              <p className="text-[11px] text-muted-foreground mt-3">You&apos;ll be able to edit and regenerate every section.</p>
             </div>
           ) : (
             <>
@@ -108,11 +99,30 @@ export default function PreparationWorkspace({ novel, premise, characters, world
                   </div>
                 </button>
               ))}
-              <button onClick={()=>prep.mutate()} disabled={prep.isPending} className="w-full btn-outline mt-2">
-                <RefreshCw className={cn('w-4 h-4', prep.isPending && 'animate-spin')} /> Regenerate all
+              <button onClick={()=>prep.mutate()} disabled={prep.isPending || prepRunning} className="w-full btn-outline mt-2">
+                <RefreshCw className={cn('w-4 h-4', (prep.isPending || prepRunning) && 'animate-spin')} /> Regenerate all
               </button>
             </>
           )}
+          <div className="surface p-4">
+            <ModelSelector
+              task="text-generation"
+              value={textModel}
+              allowFallback={allowFallback}
+              onChange={setTextModel}
+              onAllowFallbackChange={setAllowFallback}
+              disabled={prep.isPending || prepRunning}
+              compact
+            />
+            <ModelIndicator
+              className="mt-3 pt-3 border-t border-border"
+              status={prep.isPending ? 'pending' : (prepJob?.status ?? 'idle')}
+              requestedModel={prep.isPending ? textModel : (prepJob?.requestedModel ?? textModel)}
+              actualModel={prep.isPending ? null : prepJob?.actualModel}
+              provider={prep.isPending ? null : prepJob?.provider}
+              fallbackUsed={!prep.isPending && (prepJob?.fallbackCount ?? 0) > 0}
+            />
+          </div>
         </div>
 
         <div className="space-y-5">

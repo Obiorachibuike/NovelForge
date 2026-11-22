@@ -27,6 +27,7 @@ import {
 } from '@/services/backups/service';
 import { createVersion } from '@/services/chapters/service';
 import { updatePremiseField } from '@/services/preparation/service';
+import { generateCovers } from '@/services/images/service';
 import { GET as getBackupRoute, POST as postNovelBackupRoute } from '@/app/api/novels/[id]/backup/route';
 import { POST as postRestoreRoute } from '@/app/api/novels/restore/route';
 
@@ -149,6 +150,26 @@ describe('novel backups, integrity validation & transactional restore', () => {
     expect(overwriteRes.status).toBe(200);
     const rowAfter = db().prepare('SELECT title FROM novels WHERE id = ?').get(novel.id) as any;
     expect(rowAfter.title).toBe('Chronicles of Glass');
+  });
+
+  it('preserves chapter and cover model provenance through a backup round trip', async () => {
+    const alice = seedUser();
+    const novel = seedNovel(alice.id);
+    seedOutline(novel.id, 1);
+    const chapterId = seedChapter(novel.id, { chapterNumber: 1 });
+    db().prepare('UPDATE chapters SET generationSource=?, modelRequested=?, modelUsed=?, generationProvider=?, generationFallbackCount=? WHERE id=?')
+      .run('huggingface', 'agnes-2.5-flash', 'Qwen/Qwen2.5-7B-Instruct', 'together', 1, chapterId);
+    const [cover] = await generateCovers(alice.id, novel.id, undefined, 1);
+    db().prepare('UPDATE image_assets SET provider=?, model=?, requestedModel=?, meta=? WHERE id=?')
+      .run('together', 'black-forest-labs/FLUX.1-schnell', 'auto', JSON.stringify({ modelFallbackUsed: true }), cover.imageId);
+
+    const bundle = await createNovelBackup(alice.id, novel.id);
+    const restored = await restoreNovelBackup(alice.id, bundle);
+    const chapter = db().prepare('SELECT generationSource, modelRequested, modelUsed, generationProvider, generationFallbackCount FROM chapters WHERE novelId=?').get(restored.novelId) as any;
+    const image = db().prepare('SELECT provider, model, requestedModel, meta FROM image_assets WHERE novelId=?').get(restored.novelId) as any;
+    expect(chapter).toMatchObject({ generationSource: 'huggingface', modelRequested: 'agnes-2.5-flash', modelUsed: 'Qwen/Qwen2.5-7B-Instruct', generationProvider: 'together', generationFallbackCount: 1 });
+    expect(image).toMatchObject({ provider: 'together', model: 'black-forest-labs/FLUX.1-schnell', requestedModel: 'auto' });
+    expect(JSON.parse(image.meta).modelFallbackUsed).toBe(true);
   });
 
   it('performs an online SQLite database file backup using SQLite backup API', async () => {

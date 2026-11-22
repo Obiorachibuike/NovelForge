@@ -19,6 +19,7 @@ import {
 import { cn } from '@/lib/utils/cn';
 import { useGeneration } from './GenerationContext';
 import { GenerationStatusBadge, generationStatusLabel } from './GenerationStatusBadge';
+import { ModelIndicator } from '@/components/ai/ModelIndicator';
 import type { GenerationView } from '@/lib/hooks/useGenerationStream';
 import { taskTypeLabel } from '@/lib/jobs/job-types';
 
@@ -76,7 +77,7 @@ export function GenerationDock() {
           )}
           aria-label={
             active
-              ? `${active} background chapter generation${active === 1 ? '' : 's'} in progress. Open the AI generation panel.`
+              ? `${active} background AI generation${active === 1 ? '' : 's'} in progress. Open the AI generation panel.`
               : 'Open the AI generation activity panel'
           }
         >
@@ -321,6 +322,18 @@ function JobRow({
           </button>
         </div>
       </div>
+
+      {job.taskType !== 'export' && (
+        <ModelIndicator
+          className="mt-2"
+          status={job.status}
+          requestedModel={job.requestedModel}
+          actualModel={job.actualModel}
+          provider={job.provider}
+          fallbackUsed={(job.fallbackCount ?? 0) > 0}
+          modelUsages={job.modelUsages}
+        />
+      )}
 
       {active && (
         <>

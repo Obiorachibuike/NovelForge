@@ -1,14 +1,20 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { freshDatabase, seedUser, seedNovel, seedOutline, seedChapter, db, jsonRequest, readJson } from '../helpers/db';
 import { __setFetchForTests } from '@/lib/ai/huggingface-client';
+import { __setFetchForTests as setAgnesFetch } from '@/lib/ai/agnes-client';
+import { __setAgnesSleepForTests } from '@/lib/ai/agnes-generation';
 import { __setRetrySleepForTests } from '@/lib/ai/retry-policy';
 import { resetCircuitBreakersForTests } from '@/lib/ai/circuit-breaker';
 import { resetVerificationCacheForTests } from '@/lib/ai/model-verification';
 import { patchModel, syncRegistry } from '@/lib/ai/model-registry';
-import { drainQueue, getJob } from '@/lib/queue';
+import { drainQueue, getJob, runJob, serializeJob } from '@/lib/queue';
+import { enqueueConsistencyCheck } from '@/services/consistency/service';
+import { getNavigation } from '@/services/chapters/service';
+import { listGenerationEvents } from '@/lib/jobs/events';
+import { getGenerationForUser, serializeGeneration } from '@/lib/jobs/generation-jobs';
 import {
-  BIG_PNG_BASE64, chatHandler, chatSuccess, imageHandler, imageSuccessBase64, jsonResponse, mockFetch,
-  useHuggingFaceBackend, type MockRouter,
+  BIG_PNG_BASE64, agnesChatSuccess, agnesHandler, chatHandler, chatSuccess, imageHandler, imageSuccessBase64, jsonResponse, mockFetch,
+  useAgnesBackend, useHuggingFaceBackend, type MockRouter,
 } from './helpers';
 
 const session = vi.hoisted(() => ({ userId: null as string | null }));
@@ -74,6 +80,8 @@ beforeEach(() => {
 
 afterEach(() => {
   __setFetchForTests(null);
+  setAgnesFetch(null);
+  __setAgnesSleepForTests(null);
   __setRetrySleepForTests(null);
   resetCircuitBreakersForTests();
   restoreEnv();
@@ -100,11 +108,13 @@ describe('authoring workflow on hosted inference', () => {
     const res = await prepareRoute(jsonRequest(`/api/novels/${novel.id}/prepare`, {}, { method: 'POST' }), { params: { id: novel.id } });
     expect(res.status).toBe(200);
     const { jobId } = await readJson(res);
+    expect(serializeJob((await getJob(jobId))!).requestedModel).toBe('auto');
     await drain();
 
     const job = await getJob(jobId);
     expect(job?.status).toBe('completed');
     expect(job?.actualModel).toBe('Qwen/Qwen2.5-7B-Instruct');
+    expect(serializeJob(job!)).toMatchObject({ requestedModel: 'auto', actualModel: 'Qwen/Qwen2.5-7B-Instruct', provider: 'together' });
 
     const bible = await readJson(await getStoryBibleRoute(jsonRequest(`/api/novels/${novel.id}/premise`), { params: { id: novel.id } }));
     expect(bible.premise.logline).toContain('cartographer');
@@ -114,13 +124,55 @@ describe('authoring workflow on hosted inference', () => {
     expect(rules.map(r => r.name)).toContain('Midnight rearrangement');
   });
 
+  it('records every model in a multi-chapter consistency check, including cross-provider fallback', async () => {
+    restoreEnv();
+    restoreEnv = useAgnesBackend();
+    __setAgnesSleepForTests(async () => {});
+    seedOutline(novel.id, 2);
+    seedChapter(novel.id, { chapterNumber: 1, status: 'generated', plainText: 'Sera crossed the bridge.' });
+    seedChapter(novel.id, { chapterNumber: 2, status: 'generated', plainText: 'The street moved at midnight.' });
+    let agnesCalls = 0;
+    let enterHf: () => void = () => {};
+    let releaseHf: () => void = () => {};
+    const entered = new Promise<void>(resolve => { enterHf = resolve; });
+    const gate = new Promise<void>(resolve => { releaseHf = resolve; });
+    fetchMock = mockFetch([
+      agnesHandler(() => ++agnesCalls === 1 ? agnesChatSuccess('[]') : jsonResponse({ error: 'provider overloaded' }, 503)),
+      chatHandler(async () => { enterHf(); await gate; return chatSuccess('[]', {}, 'together'); }),
+    ]);
+    setAgnesFetch(fetchMock as unknown as typeof fetch);
+    __setFetchForTests(fetchMock as unknown as typeof fetch);
+    const id = await enqueueConsistencyCheck(user.id, novel.id);
+    const running = runJob(id);
+    try {
+      await entered;
+      const progress = serializeJob((await getJob(id))!);
+      expect(progress.status).toBe('processing');
+      expect(progress.modelUsages).toEqual([{ actualModel: 'agnes-2.5-flash', provider: 'agnes-ai', fallbackUsed: false }]);
+      const progressEvent = listGenerationEvents(id).filter(e => e.type === 'generation_progress').at(-1)!;
+      expect(JSON.parse(progressEvent.payload!).modelUsages).toEqual(progress.modelUsages);
+    } finally {
+      releaseHf();
+    }
+    expect((await running).status).toBe('completed');
+    const completed = serializeJob((await getJob(id))!);
+    expect(completed.modelUsages).toEqual([
+      { actualModel: 'agnes-2.5-flash', provider: 'agnes-ai', fallbackUsed: false },
+      { actualModel: 'Qwen/Qwen2.5-7B-Instruct', provider: 'together', fallbackUsed: true },
+    ]);
+    const event = listGenerationEvents(id).find(e => e.type === 'generation_completed')!;
+    expect(JSON.parse(event.payload!).modelUsages).toEqual(completed.modelUsages);
+  });
+
   it('generates an outline from the story bible', async () => {
     fetchMock = mockFetch([chatHandler(() => chatSuccess(JSON.stringify(OUTLINE_PAYLOAD), {}, 'together'))]);
     __setFetchForTests(fetchMock as unknown as typeof fetch);
 
     const res = await outlineRoute(jsonRequest(`/api/novels/${novel.id}/outline`, {}, { method: 'POST' }), { params: { id: novel.id } });
     expect(res.status).toBe(200);
+    const { jobId } = await readJson(res);
     await drain();
+    expect(serializeJob((await getJob(jobId))!)).toMatchObject({ requestedModel: 'auto', actualModel: 'Qwen/Qwen2.5-7B-Instruct', provider: 'together' });
 
     const chapters = db().prepare('SELECT chapterNumber, title FROM chapter_outlines WHERE novelId=? ORDER BY chapterNumber').all(novel.id) as any[];
     expect(chapters).toHaveLength(3);
@@ -151,6 +203,11 @@ describe('authoring workflow on hosted inference', () => {
     expect(chapter.plainText).toContain('Sera crossed the bridge');
     expect(chapter.wordCount).toBeGreaterThan(0);
     expect(chapter.status).toBe('generated');
+    expect(chapter.modelRequested).toBe('auto');
+    expect(chapter.modelUsed).toBe('Qwen/Qwen2.5-7B-Instruct');
+    expect(serializeGeneration(getGenerationForUser(user.id, jobId)!)).toMatchObject({ requestedModel: 'auto', actualModel: chapter.modelUsed, provider: 'together' });
+    const event = db().prepare("SELECT payload FROM generation_events WHERE jobId=? AND type='generation_completed'").get(jobId) as any;
+    expect(JSON.parse(event.payload)).toMatchObject({ requestedModel: 'auto', actualModel: chapter.modelUsed, provider: 'together' });
 
     const usage = db().prepare('SELECT * FROM ai_usage WHERE taskType=? ORDER BY createdAt DESC LIMIT 1').get('chapter') as any;
     expect(usage.actualModel).toBe('Qwen/Qwen2.5-7B-Instruct');
@@ -201,8 +258,20 @@ describe('authoring workflow on hosted inference', () => {
     expect(job?.requestedModel).toBe('Qwen/Qwen2.5-7B-Instruct');
     expect(job?.actualModel).toBe('Qwen/Qwen2.5-14B-Instruct');
     expect(job?.fallbackCount).toBe(1);
-    const chapter = db().prepare('SELECT plainText FROM chapters WHERE novelId=?').get(novel.id) as any;
+    const serialized = serializeGeneration(getGenerationForUser(user.id, jobId)!);
+    expect(serialized).toMatchObject({ requestedModel: 'Qwen/Qwen2.5-7B-Instruct', actualModel: 'Qwen/Qwen2.5-14B-Instruct', fallbackCount: 1 });
+    const chapter = db().prepare('SELECT plainText, modelRequested, modelUsed, generationProvider, generationFallbackCount FROM chapters WHERE novelId=?').get(novel.id) as any;
     expect(chapter.plainText).toContain('lighthouse keeper');
+    expect(chapter.modelRequested).toBe(serialized.requestedModel);
+    expect(chapter.modelUsed).toBe(serialized.actualModel);
+    expect(chapter.generationProvider).toBe('together');
+    expect(chapter.generationFallbackCount).toBe(1);
+    // Later jobs or a restored backup must not erase the saved chapter's attribution.
+    db().prepare('DELETE FROM generation_jobs WHERE id=?').run(jobId);
+    expect((await getNavigation(novel.id))[0]).toMatchObject({
+      modelRequested: chapter.modelRequested, modelUsed: chapter.modelUsed,
+      generationProvider: 'together', generationFallbackCount: 1,
+    });
   });
 
   it('fails a job honestly when every model fails (no fabricated chapter)', async () => {
@@ -275,6 +344,22 @@ describe('authoring workflow on hosted inference', () => {
     expect(asset.bytes).toBeGreaterThan(1_000);
   });
 
+  it('honours disabled model fallback for an editor action', async () => {
+    patchModel('Qwen/Qwen2.5-14B-Instruct', { availabilityStatus: 'available', pricingStatus: 'free' });
+    fetchMock = mockFetch([chatHandler(body => body.model === 'Qwen/Qwen2.5-7B-Instruct'
+      ? jsonResponse({ error: 'Service overloaded' }, 503)
+      : chatSuccess('This should not be used.', {}, 'together'))]);
+    __setFetchForTests(fetchMock as unknown as typeof fetch);
+    const chapterId = seedChapter(novel.id, { chapterNumber: 1, status: 'generated' });
+    const res = await editorActionRoute(jsonRequest('/api/ai/editor-action', {
+      action: 'rewrite', chapterId, selection: 'A sentence.',
+      textModel: 'Qwen/Qwen2.5-7B-Instruct', allowFallback: false,
+    }, { method: 'POST' }));
+    expect(res.status).toBe(503);
+    expect(fetchMock.callsTo('/chat/completions')).toBe(1);
+    expect(fetchMock.calls[0].body.model).toBe('Qwen/Qwen2.5-7B-Instruct');
+  });
+
   it('serves the AI editor action through hosted inference', async () => {
     fetchMock = mockFetch([chatHandler(() => chatSuccess('The rewritten sentence reads cleanly.', {}, 'together'))]);
     __setFetchForTests(fetchMock as unknown as typeof fetch);
@@ -288,6 +373,7 @@ describe('authoring workflow on hosted inference', () => {
     expect(res.status).toBe(200);
     const body = await readJson(res);
     expect(String(body.text ?? body.result ?? '')).toContain('rewritten sentence');
+    expect(body).toMatchObject({ requestedModel: 'auto', actualModel: 'Qwen/Qwen2.5-7B-Instruct', provider: 'together', fallbackUsed: false });
   });
 
   it('keeps progress through a failed generation so the writer can retry', async () => {

@@ -54,12 +54,16 @@ export interface OrchestratedResult<T> {
 
 export interface OrchestrateOptions<T> {
   task: ModelTask;
-  /** 'auto' or a registered model id. */
+  /** 'auto' or a registered model id for this provider's selection. */
   requestedModelId?: string;
+  /** Preserve the original request when arriving from another provider. */
+  provenance?: { requestedModelId: string; fallbackUsed: boolean };
   allowFallback?: boolean;
   signal?: AbortSignal;
   requiredContextTokens?: number;
   requiredSize?: { width: number; height: number };
+  /** Restricts candidates to models supported by the calling provider. */
+  acceptsModel?: (model: ModelRow) => boolean;
   /** Runs one attempt. Must throw on failure. */
   run: (model: ModelRow, ctx: { signal?: AbortSignal; timeoutMs: number }) => Promise<T>;
   /** Validates the payload before it is accepted. */
@@ -69,6 +73,8 @@ export interface OrchestrateOptions<T> {
     usage?: { inputTokens?: number; outputTokens?: number };
     cost?: GenerationCost;
     provider?: string;
+    /** Exact model reported by the provider, when available. */
+    modelId?: string;
     imageWidth?: number;
     imageHeight?: number;
   };
@@ -81,6 +87,8 @@ export interface OrchestrateOptions<T> {
     taskType?: string;
   };
   retryPolicy?: RetryPolicy;
+  /** Once visible output has been emitted, another attempt must not append to it. */
+  shouldStop?: () => boolean;
 }
 
 /**
@@ -92,14 +100,16 @@ export interface OrchestrateOptions<T> {
 export async function orchestrateGeneration<T>(options: OrchestrateOptions<T>): Promise<OrchestratedResult<T>> {
   const policy = aiPolicy();
   const started = Date.now();
-  const requestedModelId = options.requestedModelId && options.requestedModelId !== 'auto' ? options.requestedModelId : 'auto';
+  const selectionModelId = options.requestedModelId && options.requestedModelId !== 'auto' ? options.requestedModelId : 'auto';
+  const requestedModelId = options.provenance?.requestedModelId || selectionModelId;
 
   const selection = selectModels({
     task: options.task,
-    modelId: requestedModelId,
+    modelId: selectionModelId,
     allowFallback: options.allowFallback,
     requiredContextTokens: options.requiredContextTokens,
     requiredSize: options.requiredSize,
+    acceptsModel: options.acceptsModel,
   });
 
   const trail: AttemptRecord[] = [];
@@ -128,13 +138,27 @@ export async function orchestrateGeneration<T>(options: OrchestrateOptions<T>): 
     const outcome = await runWithRetries(
       async () => {
         attempts++;
-        return await withDeadline(
-          options.run(model, { signal: options.signal, timeoutMs: policy.requestTimeoutMs }),
-          policy.requestTimeoutMs,
-          `${options.task} request (${model.id})`,
-        );
+        // A deadline can settle before the provider promise does. Abort this
+        // particular attempt so late chunks cannot leak into a later retry.
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        options.signal?.addEventListener('abort', abort, { once: true });
+        if (options.signal?.aborted) controller.abort();
+        try {
+          return await withDeadline(
+            options.run(model, { signal: controller.signal, timeoutMs: policy.requestTimeoutMs }),
+            policy.requestTimeoutMs,
+            `${options.task} request (${model.id})`,
+          );
+        } finally {
+          controller.abort();
+          options.signal?.removeEventListener('abort', abort);
+        }
       },
-      err => classifyAiError(err, { modelId: model.id, task: options.task }),
+      err => {
+        const info = classifyAiError(err, { modelId: model.id, task: options.task });
+        return options.shouldStop?.() ? { ...info, retryable: false } : info;
+      },
       {
         policy: options.retryPolicy ?? { maxAttempts: policy.maxRetriesPerModel + 1, baseDelayMs: 400, maxDelayMs: 4_000 },
         signal: options.signal,
@@ -154,13 +178,18 @@ export async function orchestrateGeneration<T>(options: OrchestrateOptions<T>): 
         recordModelFailure(model.id, { category, availability: info.availability, message: validation.reason, task: options.task });
         recordCircuitFailure(model.id, validation.reason);
         lastError = { ...info, category };
+        if (options.shouldStop?.()) break;
         continue;
       }
 
       const meta = options.extract?.(outcome.value as T);
+      const actualModelId = meta?.modelId || model.id;
       const latencyMs = Date.now() - modelStarted;
       const totalLatency = Date.now() - started;
-      const fallbackUsed = requestedModelId !== 'auto' ? model.id !== requestedModelId : trail.length > 0;
+      // A provider may return a versioned ID for the same requested model.
+      // Mark a fallback only when selection actually changed or an earlier
+      // candidate failed, not merely because the reported ID is different.
+      const fallbackUsed = options.provenance?.fallbackUsed === true || trail.length > 0 || (selectionModelId !== 'auto' && model.id !== selectionModelId);
 
       recordModelSuccess(model.id, { provider: meta?.provider, latencyMs, task: options.task });
       recordCircuitSuccess(model.id);
@@ -169,7 +198,7 @@ export async function orchestrateGeneration<T>(options: OrchestrateOptions<T>): 
       const cost =
         meta?.cost ??
         costFor({
-          model: model.id,
+          model: actualModelId,
           inputTokens: meta?.usage?.inputTokens,
           outputTokens: meta?.usage?.outputTokens,
         });
@@ -182,7 +211,7 @@ export async function orchestrateGeneration<T>(options: OrchestrateOptions<T>): 
         taskType: options.context?.taskType ?? options.task,
         task: options.task,
         requestedModel: requestedModelId,
-        actualModel: model.id,
+        actualModel: actualModelId,
         provider: meta?.provider ?? model.provider ?? null,
         attempts,
         fallbackCount: fallbackUsed ? 1 : 0,
@@ -198,7 +227,7 @@ export async function orchestrateGeneration<T>(options: OrchestrateOptions<T>): 
       if (options.context?.jobId) {
         recordJobProvenance(options.context.jobId, {
           requestedModel: requestedModelId,
-          actualModel: model.id,
+          actualModel: actualModelId,
           provider: meta?.provider ?? model.provider ?? null,
           fallbackCount: fallbackUsed ? 1 : 0,
           durationMs: totalLatency,
@@ -209,7 +238,7 @@ export async function orchestrateGeneration<T>(options: OrchestrateOptions<T>): 
         ok: true,
         value: outcome.value as T,
         requestedModelId,
-        actualModelId: model.id,
+        actualModelId,
         provider: meta?.provider ?? model.provider ?? undefined,
         fallbackUsed,
         attempts,
@@ -234,9 +263,9 @@ export async function orchestrateGeneration<T>(options: OrchestrateOptions<T>): 
     recordCircuitFailure(model.id, info.userMessage);
     lastError = info;
 
-    // A credentials problem applies to every model: stop immediately rather
-    // than burning the whole fallback budget on the same 401.
-    if (info.category === 'authentication_failed') break;
+    // Do not append a different attempt/model to already visible text. A
+    // credentials problem likewise applies to every model in this chain.
+    if (options.shouldStop?.() || info.category === 'authentication_failed') break;
   }
 
   const message = buildFailureMessage(options.task, lastError, trail, selection);

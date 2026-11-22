@@ -3,6 +3,8 @@ import { getDb } from '@/lib/db';
 import { HttpError } from '@/lib/api/http';
 import { cancelJob, deleteJob, retryJob } from '@/lib/queue';
 import { enqueueChapterGeneration } from '@/services/chapters/service';
+import { modelUsagesFromResult } from '@/lib/ai/model-provenance';
+import { isUniversalEngineJob } from '@/lib/ai/generation/generation-persistence';
 import {
   GenerationStatus,
   stageLabel,
@@ -45,6 +47,10 @@ export interface ListGenerationOptions {
   limit?: number;
   /** Restrict to one task/generation type. */
   taskType?: string;
+  /** Exclude unrelated queue jobs (for the AI activity panel). */
+  aiOnly?: boolean;
+  /** Authoring pages must not attribute a generic universal job to their saved artefact. */
+  legacyOnly?: boolean;
   /**
    * Include every generation type (universal jobs: titles, scenes, images,
    * rewrites, ...) instead of only chapters.
@@ -64,6 +70,16 @@ export function listGenerations(userId: string, options: ListGenerationOptions =
     }
   } else {
     clauses.push(`j.taskType = 'chapter'`);
+  }
+  // Queue payloads are written by JSON.stringify in enqueue/createJob, making
+  // the engine discriminator stable on both SQLite and PostgreSQL.
+  if (options.legacyOnly) {
+    clauses.push(`COALESCE(j.payload, '') NOT LIKE ?`);
+    args.push('%"engine":"universal"%');
+  }
+  if (options.aiOnly) {
+    clauses.push(`(j.taskType IN ('chapter','premise','outline','consistency','memory') OR COALESCE(j.payload, '') LIKE ?)`);
+    args.push('%"engine":"universal"%');
   }
   if (options.active) {
     clauses.push(`j.status IN ('queued','processing')`);
@@ -143,6 +159,7 @@ export function serializeGeneration(job: GenerationWithContext) {
     chapterTitle: job.chapterTitle ?? null,
     chapterNumber,
     taskType: job.taskType,
+    engine: isUniversalEngineJob(job) ? 'universal' as const : 'legacy' as const,
     status,
     /**
      * Chapter generation is stage-based: providers do not expose real
@@ -175,9 +192,23 @@ export function serializeGeneration(job: GenerationWithContext) {
         return null;
       }
     })(),
+    // Content sequence is stored with the text itself, not inferred from the
+    // event log; even a snapshot taken between a row update and event insert
+    // can then de-duplicate replay safely.
+    partialSequence: (() => {
+      try {
+        const parsed = job.result ? JSON.parse(job.result) : null;
+        return Number.isSafeInteger(parsed?.partialSequence) ? parsed.partialSequence : null;
+      } catch { return null; }
+    })(),
     requestedModel: job.requestedModel ?? null,
     actualModel: job.actualModel ?? null,
     provider: job.provider ?? null,
+    fallbackCount: job.fallbackCount ?? 0,
+    modelUsages: (() => {
+      try { return modelUsagesFromResult(job.result ? JSON.parse(job.result) : null) ?? null; }
+      catch { return null; }
+    })(),
     eventsUrl: `/api/generations/${job.id}/events`,
   };
 }

@@ -3,6 +3,8 @@ import { apiHandler, readJsonBody, HttpError } from '@/lib/api/http';
 import { enforceRateLimit } from '@/lib/security/rate-limit';
 import { enforceAiRateLimit } from '@/lib/ai/rate-limit';
 import { assertRegisteredModelOrAgnes } from '@/lib/ai/model-selection';
+import { modelUsagesFromResult } from '@/lib/ai/model-provenance';
+import { isUniversalEngineJob } from '@/lib/ai/generation/generation-persistence';
 import {
   createChapterGeneration,
   listGenerations,
@@ -179,6 +181,7 @@ export const GET = apiHandler(async (req: Request) => {
         chapterTitle: row.chapterTitle ?? null,
         chapterNumber,
         taskType: row.taskType,
+        engine: isUniversalEngineJob(row) ? 'universal' : 'legacy',
         status: publicStatus,
         progressPercentage: row.progressPercentage ?? null,
         indeterminate: row.taskType === 'chapter' && !['COMPLETED', 'FAILED', 'CANCELLED'].includes(publicStatus),
@@ -204,6 +207,11 @@ export const GET = apiHandler(async (req: Request) => {
         requestedModel: row.requestedModel ?? null,
         actualModel: row.actualModel ?? null,
         provider: row.provider ?? null,
+        fallbackCount: row.fallbackCount ?? 0,
+        modelUsages: (() => {
+          try { return modelUsagesFromResult(row.result ? JSON.parse(row.result) : null) ?? null; }
+          catch { return null; }
+        })(),
         eventsUrl: `/api/generations/${row.id}/events`,
         generationType: row.taskType,
       };
