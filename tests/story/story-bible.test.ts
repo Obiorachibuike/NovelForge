@@ -11,7 +11,7 @@ import { GET as getConsistency, POST as runConsistency, PATCH as resolveIssue } 
 import { retrieveMemories, listRecentMemories } from '@/services/memory/service';
 import { enqueueConsistencyCheck } from '@/services/consistency/service';
 import { enqueueMemoryExtraction, approveChapter } from '@/services/chapters/service';
-import { drainQueue, getJob } from '@/lib/queue';
+import { drainQueue, getJob, serializeJob } from '@/lib/queue';
 
 let user: { id: string; email: string; name: string };
 let novel: { id: string; userId: string };
@@ -144,6 +144,7 @@ describe('consistency engine', () => {
     expect(result.note).toMatch(/never modified automatically/i);
     // Demo mode is not a failure, so nothing should be marked unavailable.
     expect(result.aiUnavailable).toBe(0);
+    expect(serializeJob(job!)).toMatchObject({ requestedModel: 'auto', actualModel: null, provider: 'demo', modelUsages: [{ actualModel: null, provider: 'demo', fallbackUsed: false }] });
   });
 
   it('issues are listed and can be resolved or ignored by their owner', async () => {

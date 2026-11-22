@@ -101,6 +101,10 @@ const backupDataSchema = z.object({
     currentVersionId: z.string().nullable().optional(),
     revision: z.number().int().min(1).optional().default(1),
     generationSource: z.string().nullable().optional(),
+    modelRequested: z.string().nullable().optional(),
+    modelUsed: z.string().nullable().optional(),
+    generationProvider: z.string().nullable().optional(),
+    generationFallbackCount: z.number().int().min(0).nullable().optional(),
     generatedAt: z.string().nullable().optional(),
     createdAt: z.string().optional(),
     updatedAt: z.string().optional(),
@@ -498,8 +502,8 @@ export async function restoreNovelBackup(
         url: c.url || `/api/files/covers/${newCoverId}.svg`,
       };
       db.prepare(
-        `INSERT INTO image_assets (id,novelId,userId,kind,provider,storageKey,url,publicId,secureUrl,format,bytes,folder,width,height,prompt,isPrimary,meta,uploadedAt,createdAt,updatedAt)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO image_assets (id,novelId,userId,kind,provider,storageKey,url,publicId,secureUrl,format,bytes,folder,width,height,prompt,isPrimary,meta,uploadedAt,model,requestedModel,createdAt,updatedAt)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       ).run(
         newCoverId,
         targetNovelId,
@@ -519,6 +523,8 @@ export async function restoreNovelBackup(
         c.isPrimary ? 1 : 0,
         c.meta ?? null,
         c.uploadedAt ?? null,
+        c.model ?? null,
+        c.requestedModel ?? null,
         c.createdAt || now,
         now,
       );
@@ -665,8 +671,8 @@ export async function restoreNovelBackup(
       db.prepare(
         `INSERT INTO chapters (id,novelId,outlineId,chapterNumber,title,contentJson,generatedContentJson,contentHtml,plainText,
                                status,wordCount,pageCountEst,summary,importantEvents,currentVersionId,revision,
-                               generationSource,generatedAt,createdAt,updatedAt,approvedAt)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?)`,
+                               generationSource,modelRequested,modelUsed,generationProvider,generationFallbackCount,generatedAt,createdAt,updatedAt,approvedAt)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?)`,
       ).run(
         newChapterId,
         targetNovelId,
@@ -684,6 +690,10 @@ export async function restoreNovelBackup(
         ch.importantEvents ?? null,
         ch.revision ?? 1,
         ch.generationSource ?? null,
+        ch.modelRequested ?? null,
+        ch.modelUsed ?? null,
+        ch.generationProvider ?? null,
+        ch.generationFallbackCount ?? null,
         ch.generatedAt ?? null,
         ch.createdAt || now,
         now,

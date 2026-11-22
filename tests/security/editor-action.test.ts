@@ -36,6 +36,9 @@ describe('AI editor action', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.source).toBe('demo');
+    expect(body.provider).toBe('demo');
+    expect(body.requestedModel).toBe('auto');
+    expect(body.actualModel).toBeNull();
     expect(typeof body.text).toBe('string');
     expect(body.text.length).toBeGreaterThan(0);
     // Demo output must not be recorded as paid usage.

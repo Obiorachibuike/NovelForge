@@ -30,4 +30,19 @@ describe('live chapter stream', () => {
   it('reports provider errors instead of treating partial content as completed', async () => {
     await expect(readChatStream(response(['data: {"error":{"message":"failed"}}\n\n']), () => {}, 1000)).rejects.toThrow('provider');
   });
+
+  it('stops reading when the request is aborted after streaming begins', async () => {
+    const abort = new AbortController();
+    const snapshots: string[] = [];
+    const res = new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"Partial"}}]}\n\n'));
+      },
+    }));
+    await expect(readChatStream(res, text => {
+      snapshots.push(text);
+      if (text) abort.abort();
+    }, 1000, abort.signal)).rejects.toMatchObject({ name: 'AbortError' });
+    expect(snapshots).toEqual(['', 'Partial']);
+  });
 });

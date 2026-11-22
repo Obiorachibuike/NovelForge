@@ -1,6 +1,7 @@
 import { getDb } from '@/lib/db';
 import { nanoid } from 'nanoid';
 import { generateStructuredDetailed } from '@/lib/ai/text-generation';
+import { recordGenerationProvenance } from '@/lib/ai/generation/generation-persistence';
 import { premisePrompt } from '@/lib/ai/prompts';
 import { embed } from '@/lib/ai/embeddings';
 import { serialize } from '@/lib/ai/embeddings';
@@ -78,6 +79,7 @@ export async function runPremise({ id, novelId, userId, payload }: { id?: string
   if (meta.usedFallback) {
     throw new Error(`Premise generation failed: ${meta.fallbackReason || 'the AI provider did not return usable output'}. No changes were saved.`);
   }
+  if (id) recordGenerationProvenance(id, { ...meta, usedFallback: meta.modelFallbackUsed === true });
 
   const now = new Date().toISOString();
   const tx = db.transaction(() => {

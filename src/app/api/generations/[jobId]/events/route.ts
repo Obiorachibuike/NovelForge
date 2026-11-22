@@ -4,6 +4,7 @@ import {
   decodeEventCursor,
   formatHeartbeat,
   formatSseFrame,
+  latestManualRetrySequence,
   listGenerationEvents,
   parseEventPayload,
   type EventCursor,
@@ -121,7 +122,12 @@ export async function GET(req: Request, ctx: { params: { jobId: string } }) {
     const after = decodeEventCursor(lastEventId);
 
     const encoder = new TextEncoder();
-    let cursor: EventCursor | null = after;
+    const retrySequence = latestManualRetrySequence(generation.id);
+    // A retry retains its historical events for auditing, but replaying an old
+    // FAILED/CANCELLED event would immediately terminate this new stream.
+    let cursor: EventCursor | null = retrySequence && (after === null || after < retrySequence - 1)
+      ? retrySequence - 1
+      : after;
     let closed = false;
     let timer: ReturnType<typeof setInterval> | null = null;
     let heartbeatAt = Date.now();

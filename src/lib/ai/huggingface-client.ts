@@ -136,6 +136,7 @@ async function timedFetch(url: string, init: RequestInit & { timeoutMs?: number 
   const externalSignal = rest.signal as AbortSignal | undefined;
   const onAbort = () => controller.abort();
   externalSignal?.addEventListener?.('abort', onAbort);
+  if (externalSignal?.aborted) controller.abort();
   try {
     return await fetchImpl()(url, { ...rest, signal: controller.signal });
   } finally {
@@ -206,7 +207,7 @@ export async function hfChatCompletion(req: HfChatRequest): Promise<HfChatComple
   }
 
   const json = req.onText
-    ? await readChatStream(res, req.onText, req.timeoutMs ?? policy.requestTimeoutMs)
+    ? await readChatStream(res, req.onText, req.timeoutMs ?? policy.requestTimeoutMs, req.signal)
     : (await res.json().catch(() => ({}))) as any;
   const text: string = json?.choices?.[0]?.message?.content ?? '';
   const provider = res.headers.get('x-inference-provider') ?? json?.provider ?? undefined;

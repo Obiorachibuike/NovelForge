@@ -20,7 +20,7 @@ import {
   type ChunkSink,
 } from './generation-persistence';
 import { validateGenerationRequest } from './generation-validation';
-import { agnesConfigured, huggingFaceConfigured } from '@/lib/ai/config';
+import { agnesConfigured, aiPolicy, huggingFaceConfigured, isExplicitAgnesModel, isExplicitHuggingFaceModel } from '@/lib/ai/config';
 import { aiConfig } from '@/lib/ai/provider';
 import { generateImage } from '@/lib/ai/image-generation';
 import { generateStructuredDetailed, generateTextDetailed } from '@/lib/ai/text-generation';
@@ -48,7 +48,7 @@ import type { ChatMessage } from '@/types';
 
 /** A request is only ever executed when its provider chain is explicit. */
 export function resolveProviderChain(
-  request: Pick<GenerationRequest, 'provider' | 'metadata'>,
+  request: Pick<GenerationRequest, 'provider' | 'metadata'> & Partial<Pick<GenerationRequest, 'model'>>,
   env: { agnes: boolean; huggingface: boolean; openai: boolean } = {
     // AI_DEMO_MODE=true performs no paid calls anywhere, even with keys set.
     agnes: agnesConfigured() && !aiConfig.forcedDemo,
@@ -56,8 +56,14 @@ export function resolveProviderChain(
     openai: aiConfig.hasApiKey && !aiConfig.forcedDemo,
   },
 ): GenerationProvider[] {
-  const requested = isGenerationProvider(request.provider) ? request.provider : undefined;
-  const allowFallback = request.metadata?.allowFallback !== false;
+  // A named model chooses its provider unless the caller pinned one. Otherwise
+  // an explicit HF/OpenAI model could silently be sent to the Agnes default.
+  const modelProvider = !request.model || request.model === 'auto'
+    ? undefined
+    : isExplicitAgnesModel(request.model) ? 'agnes'
+      : isExplicitHuggingFaceModel(request.model) ? 'huggingface' : 'openai';
+  const requested = isGenerationProvider(request.provider) ? request.provider : modelProvider;
+  const allowFallback = request.metadata?.allowFallback !== false && aiPolicy().fallbackEnabled;
 
   // Priority: Agnes AI (primary) → Hugging Face (fallback) → OpenAI.
   const priority: GenerationProvider[] = ['agnes', 'huggingface', 'openai'];
@@ -76,11 +82,11 @@ export function resolveProviderChain(
   }
 
   const chain = priority.filter(provider => available[provider]);
-  return chain;
+  return allowFallback ? chain : chain.slice(0, 1);
 }
 
 function allowFallback(request: GenerationRequest): boolean {
-  return request.metadata?.allowFallback !== false;
+  return request.metadata?.allowFallback !== false && aiPolicy().fallbackEnabled;
 }
 
 function allowStubOutput(): boolean {
@@ -131,18 +137,18 @@ function normalizeHandlerResult(value: unknown): GenerationResult {
     if (typeof (value as { text?: unknown }).text === 'string') {
       return {
         text: (value as { text: string }).text,
-        meta: { source: 'agnes', model: 'unknown', usedFallback: false },
+        meta: { source: 'unknown', model: 'unknown', usedFallback: false },
       };
     }
     return {
       structuredData: value as Record<string, unknown>,
-      meta: { source: 'agnes', model: 'unknown', usedFallback: false },
+      meta: { source: 'unknown', model: 'unknown', usedFallback: false },
     };
   }
   if (typeof value === 'string') {
-    return { text: value, meta: { source: 'agnes', model: 'unknown', usedFallback: false } };
+    return { text: value, meta: { source: 'unknown', model: 'unknown', usedFallback: false } };
   }
-  return { meta: { source: 'agnes', model: 'unknown', usedFallback: false } };
+  return { meta: { source: 'unknown', model: 'unknown', usedFallback: false } };
 }
 
 export class UniversalGenerationService {
@@ -286,7 +292,7 @@ export class UniversalGenerationService {
     const label = GENERATION_TYPE_LABELS[request.generationType];
     context.setStage('CONNECTING_TO_AI_PROVIDER', { generationType: request.generationType });
 
-    const sink: ChunkSink | null = streamingRequested ? openChunkSink(jobId) : null;
+    const sink: ChunkSink | null = streamingRequested ? openChunkSink(jobId, { freshAttempt: true }) : null;
     let streaming = false;
     let announcedStreaming = false;
     let lastError: unknown;
@@ -332,9 +338,11 @@ export class UniversalGenerationService {
           taskType: request.customType ?? request.generationType,
           ...(context.signal ? { signal: context.signal } : {}),
           forceProvider: provider,
+          ...(index > 0 ? { provenance: { requestedModelId: request.model || 'auto', fallbackUsed: true } } : {}),
           // The engine owns the fallback chain, so the provider layer must not
           // silently substitute a stub.
           allowFallbackOnError: false,
+          allowModelFallback: allowFallback(request),
           ...(onText ? { onText } : {}),
         });
 
@@ -365,7 +373,7 @@ export class UniversalGenerationService {
             model: result.meta.model,
             actualModel: result.meta.actualModel ?? result.meta.model,
             provider: result.meta.provider ?? provider,
-            usedFallback: index > 0,
+            usedFallback: index > 0 || result.meta.modelFallbackUsed === true,
             ...(index > 0 && firstFailureReason ? { fallbackReason: firstFailureReason } : {}),
             attempts: result.meta.attempts ?? index + 1,
             latencyMs: result.meta.latencyMs,
@@ -412,47 +420,69 @@ export class UniversalGenerationService {
   ): Promise<GenerationResult> {
     context.setStage('CONNECTING_TO_AI_PROVIDER', { responseFormat: 'json' });
     const schema = z.record(z.unknown());
-    const outcome = await generateStructuredDetailed(schema, {
-      messages: buildMessages(request),
-      ...(request.model ? { model: request.model } : {}),
-      userId: request.userId,
-      novelId: request.projectId,
-      ...(request.targetId ? { chapterId: request.targetId } : {}),
-      jobId,
-      taskType: request.customType ?? request.generationType,
-      ...(context.signal ? { signal: context.signal } : {}),
-      fallback: {},
-      retries: 2,
-    });
+    const chain = resolveProviderChain(request);
+    // No configured provider can still produce an explicitly labelled demo in
+    // development. Otherwise, try exactly the same provider order as prose.
+    const providers: Array<GenerationProvider | undefined> = chain.length ? chain : [undefined];
+    let firstFailureReason: string | undefined;
 
-    if (outcome.meta.source === 'fallback' && !allowStubOutput()) {
-      throw Object.assign(
-        new Error('The provider did not return usable structured output. Please retry.'),
-        { code: 'structured_output_invalid' },
-      );
-    }
-    if (outcome.meta.source === 'demo' && !allowStubOutput()) {
-      throw Object.assign(
-        new Error('No AI provider is configured for structured generation.'),
-        { retryable: false, code: 'provider_not_configured' },
-      );
-    }
+    for (let index = 0; index < providers.length; index++) {
+      if (context.isCancelled() || context.signal.aborted) {
+        throw Object.assign(new Error('Generation was cancelled.'), { retryable: false, code: 'cancelled' });
+      }
+      const outcome = await generateStructuredDetailed(schema, {
+        messages: buildMessages(request),
+        ...(request.model ? { model: request.model } : {}),
+        userId: request.userId,
+        novelId: request.projectId,
+        ...(request.targetId ? { chapterId: request.targetId } : {}),
+        jobId,
+        taskType: request.customType ?? request.generationType,
+        ...(context.signal ? { signal: context.signal } : {}),
+        ...(providers[index] ? { forceProvider: providers[index] } : {}),
+        ...(index > 0 ? { provenance: { requestedModelId: request.model || 'auto', fallbackUsed: true } } : {}),
+        fallback: {},
+        allowModelFallback: allowFallback(request),
+        retries: 2,
+      });
 
-    context.setStage('SAVING_RESULT', { responseFormat: 'json' });
-    context.setProgress(100);
-    return {
-      structuredData: outcome.data as Record<string, unknown>,
-      meta: {
-        source: outcome.meta.source,
-        model: outcome.meta.model,
-        actualModel: outcome.meta.actualModel ?? outcome.meta.model,
-        provider: outcome.meta.provider,
-        usedFallback: outcome.meta.usedFallback,
-        ...(outcome.meta.fallbackReason ? { fallbackReason: outcome.meta.fallbackReason } : {}),
-        attempts: outcome.meta.attempts,
-        latencyMs: outcome.meta.latencyMs,
-      },
-    };
+      if (outcome.meta.source === 'fallback') {
+        firstFailureReason ||= outcome.meta.fallbackReason;
+        if (allowFallback(request) && index + 1 < providers.length) {
+          context.setStage('CONNECTING_TO_AI_PROVIDER', { responseFormat: 'json', retryProvider: providers[index + 1] });
+          continue;
+        }
+        if (!allowStubOutput()) {
+          throw Object.assign(
+            new Error('The provider did not return usable structured output. Please retry.'),
+            { code: 'structured_output_invalid' },
+          );
+        }
+      }
+      if (outcome.meta.source === 'demo' && !allowStubOutput()) {
+        throw Object.assign(
+          new Error('No AI provider is configured for structured generation.'),
+          { retryable: false, code: 'provider_not_configured' },
+        );
+      }
+
+      context.setStage('SAVING_RESULT', { responseFormat: 'json' });
+      context.setProgress(100);
+      return {
+        structuredData: outcome.data as Record<string, unknown>,
+        meta: {
+          source: outcome.meta.source,
+          model: outcome.meta.model,
+          actualModel: outcome.meta.actualModel ?? outcome.meta.model,
+          provider: outcome.meta.provider,
+          usedFallback: outcome.meta.usedFallback || outcome.meta.modelFallbackUsed === true || index > 0,
+          ...((outcome.meta.fallbackReason || firstFailureReason) ? { fallbackReason: outcome.meta.fallbackReason || firstFailureReason } : {}),
+          attempts: outcome.meta.attempts,
+          latencyMs: outcome.meta.latencyMs,
+        },
+      };
+    }
+    throw new Error('No AI provider could serve this generation.');
   }
 
   /**
@@ -512,7 +542,7 @@ export class UniversalGenerationService {
           output.height || height,
           request.prompt,
           0,
-          JSON.stringify({ generationType: request.generationType, jobId }),
+          JSON.stringify({ generationType: request.generationType, jobId, modelFallbackUsed: output.fallbackUsed === true }),
           ext,
           output.image.length,
           output.actualModelId ?? null,
@@ -536,7 +566,9 @@ export class UniversalGenerationService {
         mimeType: output.mimeType,
       },
       meta: {
-        source: output.provider?.includes('hugging') ? 'huggingface' : 'agnes',
+        // HF's router reports upstream providers such as together or fal-ai,
+        // not necessarily a string containing "huggingface".
+        source: output.provider === 'agnes-ai' ? 'agnes' : 'huggingface',
         model: output.actualModelId ?? request.model ?? 'auto',
         actualModel: output.actualModelId,
         provider: output.provider,

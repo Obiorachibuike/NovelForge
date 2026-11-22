@@ -43,13 +43,19 @@ export const POST = apiHandler(async (req: Request) => {
     // Interactive editing must never substitute fabricated prose for a real
     // failure — the author is told and can retry.
     allowFallbackOnError: false,
+    allowModelFallback: body.allowFallback,
     ...(textModel !== 'auto' ? { model: textModel } : {}),
   });
 
   return Response.json({
     text: result.text.trim(),
     source: result.meta.source,
+    // Preserve the existing `model` field for API clients, and distinguish a
+    // requested model from real output (demo text has no actual model).
     model: result.meta.actualModel ?? result.meta.model,
+    requestedModel: textModel,
+    actualModel: result.meta.source === 'demo' || result.meta.source === 'fallback' ? null : (result.meta.actualModel ?? result.meta.model),
+    provider: result.meta.source === 'demo' || result.meta.source === 'fallback' ? result.meta.source : (result.meta.provider ?? result.meta.source),
     fallbackUsed: result.meta.modelFallbackUsed ?? false,
   });
 });

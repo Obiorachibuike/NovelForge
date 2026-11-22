@@ -1,6 +1,7 @@
 import { getDb } from '@/lib/db';
 import { nanoid } from 'nanoid';
 import { generateTextDetailed, generateStructuredDetailed } from '@/lib/ai/text-generation';
+import { recordGenerationProvenance } from '@/lib/ai/generation/generation-persistence';
 import { aiBackend } from '@/lib/ai/config';
 import { aiConfig } from '@/lib/ai/provider';
 import { chapterPrompt, chapterSummaryPrompt } from '@/lib/ai/prompts';
@@ -351,6 +352,12 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
   const pages = Math.max(1, Math.round(words / wordsPerPage));
 
   const now = new Date().toISOString();
+  const modelRequested = textModel || 'auto';
+  const modelUsed = generated.meta.source === 'demo'
+    ? null : (generated.meta.actualModel ?? generated.meta.model);
+  const generationProvider = generated.meta.source === 'demo'
+    ? generated.meta.source : (generated.meta.provider ?? generated.meta.source);
+  const generationFallbackCount = generated.meta.usedFallback || generated.meta.modelFallbackUsed ? 1 : 0;
   let chapterId = existing?.id as string | undefined;
   setStage?.(GenerationStage.SAVING_CHAPTER);
   const tx = db.transaction(() => {
@@ -368,19 +375,23 @@ export async function runChapterGeneration({ id: jobId, novelId, userId, payload
       const nextRevision = ((existing?.revision as number) || 1) + 1;
       db.prepare(
         `UPDATE chapters SET title=?, contentJson=?, generatedContentJson=?, contentHtml=?, plainText=?, wordCount=?, pageCountEst=?,
-                             status='generated', generationStatus='COMPLETED', generationSource=?, generatedAt=?, lastJobId=?, revision=?, summary=NULL, updatedAt=? WHERE id=?`
-      ).run(outline.title, serializedDoc, serializedDoc, html, text, words, pages, generated.meta.source, now, jobId || null, nextRevision, now, chapterId);
+                             status='generated', generationStatus='COMPLETED', generationSource=?, modelRequested=?, modelUsed=?, generationProvider=?, generationFallbackCount=?, generatedAt=?, lastJobId=?, revision=?, summary=NULL, updatedAt=? WHERE id=?`
+      ).run(outline.title, serializedDoc, serializedDoc, html, text, words, pages, generated.meta.source, modelRequested, modelUsed, generationProvider, generationFallbackCount, now, jobId || null, nextRevision, now, chapterId);
     } else {
       chapterId = nanoid();
       db.prepare(
-        `INSERT INTO chapters (id,novelId,outlineId,chapterNumber,title,contentJson,generatedContentJson,contentHtml,plainText,status,wordCount,pageCountEst,generationSource,generatedAt,lastJobId,revision,generationStatus,createdAt,updatedAt)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,'COMPLETED',?,?)`
+        `INSERT INTO chapters (id,novelId,outlineId,chapterNumber,title,contentJson,generatedContentJson,contentHtml,plainText,status,wordCount,pageCountEst,generationSource,modelRequested,modelUsed,generationProvider,generationFallbackCount,generatedAt,lastJobId,revision,generationStatus,createdAt,updatedAt)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,'COMPLETED',?,?)`
       ).run(chapterId, novelId, outline.id, chapterNumber, outline.title,
-        serializedDoc, serializedDoc, html, text, 'generated', words, pages, generated.meta.source, now, jobId || null, now, now);
+        serializedDoc, serializedDoc, html, text, 'generated', words, pages, generated.meta.source, modelRequested, modelUsed, generationProvider, generationFallbackCount, now, jobId || null, now, now);
     }
 
     if (jobId) {
       db.prepare('UPDATE generation_jobs SET chapterId=? WHERE id=?').run(chapterId, jobId);
+      recordGenerationProvenance(jobId, {
+        ...generated.meta,
+        usedFallback: generated.meta.usedFallback || generated.meta.modelFallbackUsed === true,
+      });
     }
 
     const nextVersion = (db.prepare(`SELECT COALESCE(MAX(versionNum),0)+1 AS next FROM chapter_versions WHERE chapterId=?`)
@@ -442,7 +453,7 @@ type SummaryResult = z.infer<typeof summaryShape>;
  * writes them to story memory. Runs as the `memory` job so it is retried and
  * observable. It never edits the manuscript: the author's prose is untouched.
  */
-async function runMemoryExtraction({ novelId, userId, payload }: any) {
+async function runMemoryExtraction({ id, novelId, userId, payload }: any) {
   const db = getDb();
   const chapterId: string = payload.chapterId;
   const chapter = db.prepare('SELECT * FROM chapters WHERE id=? AND novelId=?').get(chapterId, novelId) as any;
@@ -459,7 +470,9 @@ async function runMemoryExtraction({ novelId, userId, payload }: any) {
   const { data: result, meta } = await generateStructuredDetailed(summaryShape, {
     messages: [{ role: 'system', content: prompt.system }, { role: 'user', content: prompt.user }],
     temperature: 0.2, userId, novelId: novel.id, taskType: 'memory', fallback,
+    ...(id ? { jobId: id } : {}),
   });
+  if (id) recordGenerationProvenance(id, { ...meta, usedFallback: meta.usedFallback || meta.modelFallbackUsed === true });
 
   const now = new Date().toISOString();
   const tx = db.transaction(() => {
@@ -774,7 +787,7 @@ export async function listChapters(novelId: string) {
 export async function getNavigation(novelId: string): Promise<ChapterNav[]> {
   const db = getDb();
   const outlines = db.prepare(`SELECT chapterNumber, title, summary, targetWords, estimatedPages FROM chapter_outlines WHERE novelId=? ORDER BY chapterNumber`).all(novelId) as any[];
-  const chapters = db.prepare(`SELECT id, chapterNumber, title, status, wordCount, pageCountEst, generationSource, generationStatus FROM chapters WHERE novelId=? ORDER BY chapterNumber`).all(novelId) as any[];
+  const chapters = db.prepare(`SELECT id, chapterNumber, title, status, wordCount, pageCountEst, generationSource, modelRequested, modelUsed, generationProvider, generationFallbackCount, generationStatus FROM chapters WHERE novelId=? ORDER BY chapterNumber`).all(novelId) as any[];
   return computeNavigation(outlines, chapters);
 }
 

@@ -9,7 +9,7 @@
  */
 import 'server-only';
 import { z, type ZodType, type ZodTypeDef } from 'zod';
-import { aiPolicy } from './config';
+import { aiPolicy, isExplicitAgnesModel } from './config';
 import { orchestrateGeneration } from './fallback-orchestrator';
 import { hfChatCompletion, type HfChatCompletionResult } from './huggingface-client';
 import { deduplicateParagraphs, extractJsonObject, validateTextOutput } from './output-validation';
@@ -28,6 +28,8 @@ export interface HfTextInput {
   taskType: string;
   signal?: AbortSignal;
   allowFallback?: boolean;
+  /** The original request when this provider is reached as a fallback. */
+  provenance?: { requestedModelId: string; fallbackUsed: boolean };
   /** Drop repeated paragraphs models emit when given long context. */
   deduplicate?: boolean;
 }
@@ -68,11 +70,14 @@ export async function generateTextHuggingFace(input: HfTextInput): Promise<HfTex
   const policy = aiPolicy();
   const { systemPrompt, prompt } = splitMessages(input.messages);
   const requiredContextTokens = estimatePromptTokens(input.messages) + (input.maxTokens ?? 2_048) + 512;
+  let emittedText = false;
 
   const result = await orchestrateGeneration<HfChatCompletionResult>({
     task: 'text-generation',
     requestedModelId: input.model && input.model !== 'auto' ? input.model : 'auto',
     allowFallback: input.allowFallback,
+    provenance: input.provenance,
+    acceptsModel: model => !isExplicitAgnesModel(model.id),
     signal: input.signal,
 
     requiredContextTokens,
@@ -83,20 +88,28 @@ export async function generateTextHuggingFace(input: HfTextInput): Promise<HfTex
       jobId: input.jobId ?? null,
       taskType: input.taskType,
     },
-    run: model => hfChatCompletion({
+    shouldStop: () => emittedText,
+    run: (model, attempt) => hfChatCompletion({
       modelId: model.id,
       systemPrompt,
       prompt,
       maxNewTokens: input.maxTokens ?? 2_048,
       temperature: input.temperature ?? 0.8,
-      signal: input.signal,
-      onText: input.onText,
+      signal: attempt.signal,
+      timeoutMs: attempt.timeoutMs,
+      onText: input.onText ? text => {
+        // An expired attempt can still finish in the background; never let
+        // its output mix with the currently active attempt.
+        if (attempt.signal?.aborted) return;
+        if (text) emittedText = true;
+        input.onText?.(text);
+      } : undefined,
     }),
     validate: value => {
       const check = validateTextOutput(value.text, { minChars: 1, rejectPromptEcho: true, prompt });
       return { ok: check.ok, reason: check.reason, category: check.category };
     },
-    extract: value => ({ provider: value.provider, usage: value.usage }),
+    extract: value => ({ provider: value.provider, modelId: value.model, usage: value.usage }),
   });
 
   const raw = result.value?.text ?? '';
@@ -139,12 +152,15 @@ export async function generateStructuredHuggingFace<T>(input: HfStructuredInput<
   const result = await orchestrateGeneration<{
     data: T;
     raw: string;
+    model: string;
     provider?: string;
     usage?: { inputTokens?: number; outputTokens?: number };
   }>({
     task: 'text-generation',
     requestedModelId: input.model && input.model !== 'auto' ? input.model : 'auto',
     allowFallback: input.allowFallback,
+    provenance: input.provenance,
+    acceptsModel: model => !isExplicitAgnesModel(model.id),
     signal: input.signal,
     requiredContextTokens,
     context: {
@@ -154,8 +170,9 @@ export async function generateStructuredHuggingFace<T>(input: HfStructuredInput<
       jobId: input.jobId ?? null,
       taskType: input.taskType,
     },
-    run: async model => {
+    run: async (model, attempt) => {
       let raw = '';
+      let actualModel = model.id;
       let provider: string | undefined;
       let usage: { inputTokens?: number; outputTokens?: number } | undefined;
       try {
@@ -166,9 +183,11 @@ export async function generateStructuredHuggingFace<T>(input: HfStructuredInput<
           maxNewTokens: input.maxTokens ?? 4_096,
           temperature: input.temperature ?? 0.4,
           responseFormat: 'json_object',
-          signal: input.signal,
+          signal: attempt.signal,
+          timeoutMs: attempt.timeoutMs,
         });
         raw = completion.text;
+        actualModel = completion.model;
         provider = completion.provider;
         usage = completion.usage;
       } catch (err) {
@@ -181,9 +200,11 @@ export async function generateStructuredHuggingFace<T>(input: HfStructuredInput<
           prompt,
           maxNewTokens: input.maxTokens ?? 4_096,
           temperature: input.temperature ?? 0.4,
-          signal: input.signal,
+          signal: attempt.signal,
+          timeoutMs: attempt.timeoutMs,
         });
         raw = completion.text;
+        actualModel = completion.model;
         provider = completion.provider;
         usage = completion.usage;
       }
@@ -201,7 +222,7 @@ export async function generateStructuredHuggingFace<T>(input: HfStructuredInput<
         (err as any).status = 502;
         throw err;
       }
-      return { data: parsed as T, raw, provider, usage };
+      return { data: parsed as T, raw, model: actualModel, provider, usage };
     },
     validate: value => {
       const parsed = input.schema.safeParse(value.data);
@@ -213,7 +234,7 @@ export async function generateStructuredHuggingFace<T>(input: HfStructuredInput<
         reason: `Schema validation failed: ${first ? `${first.path.join('.') || 'root'}: ${first.message}` : 'unknown'}`,
       };
     },
-    extract: value => ({ provider: value.provider, usage: value.usage }),
+    extract: value => ({ provider: value.provider, modelId: value.model, usage: value.usage }),
   });
 
   return {

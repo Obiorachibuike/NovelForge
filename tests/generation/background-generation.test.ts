@@ -21,6 +21,7 @@ import {
   getJob,
   cancelJob,
   retryJob,
+  recoverStaleJobs,
   registerHandler,
   serializeJob,
 } from '@/lib/queue';
@@ -126,6 +127,34 @@ describe('background generation lifecycle', () => {
     const notifications = listNotifications(user.id);
     expect(notifications.some(n => n.kind === 'generation_started')).toBe(true);
     expect(notifications.some(n => n.kind === 'generation_completed')).toBe(true);
+  });
+
+  it('clears attempt-specific model data on automatic retry without losing partial text', async () => {
+    registerHandler('chapter', async ({ id }) => {
+      db().prepare('UPDATE generation_jobs SET actualModel=?, provider=?, fallbackCount=?, result=? WHERE id=?')
+        .run('first-model', 'together', 1, JSON.stringify({ partialText: 'Keep this draft', modelUsages: [{ actualModel: 'first-model', provider: 'together' }] }), id);
+      throw new Error('Network timeout');
+    });
+    const id = await chapterJob({ maxAttempts: 2 });
+    expect((await runJob(id)).status).toBe('queued');
+    const job = (await getJob(id))!;
+    expect(job).toMatchObject({ requestedModel: 'auto', actualModel: null, provider: null, fallbackCount: 0 });
+    expect(JSON.parse(job.result!)).toEqual({ partialText: 'Keep this draft' });
+    const queued = listGenerationEvents(id).at(-1)!;
+    expect(queued.type).toBe('generation_queued');
+    expect(JSON.parse(queued.payload!)).toMatchObject({ requestedModel: 'auto', actualModel: null, provider: null, fallbackCount: 0, modelUsages: null });
+  });
+
+  it('clears stale model provenance when recovering an interrupted worker', async () => {
+    const id = await chapterJob();
+    db().prepare(`UPDATE generation_jobs SET status='processing', claimedAt=?, lastHeartbeatAt=?, actualModel=?, provider=?, fallbackCount=1, result=? WHERE id=?`)
+      .run('2000-01-01T00:00:00.000Z', '2000-01-01T00:00:00.000Z', 'old-model', 'together', JSON.stringify({ partialText: 'Preserved', modelUsages: [{ actualModel: 'old-model' }] }), id);
+    await recoverStaleJobs({ staleMs: 1000 });
+    const job = (await getJob(id))!;
+    expect(job).toMatchObject({ status: 'queued', requestedModel: 'auto', actualModel: null, provider: null, fallbackCount: 0 });
+    expect(JSON.parse(job.result!)).toEqual({ partialText: 'Preserved' });
+    const event = listGenerationEvents(id).at(-1)!;
+    expect(JSON.parse(event.payload!)).toMatchObject({ recovered: true, actualModel: null, provider: null, modelUsages: null });
   });
 
   it('prevents duplicate active jobs for the same chapter', async () => {

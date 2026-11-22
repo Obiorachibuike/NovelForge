@@ -17,6 +17,7 @@ import {
 } from '@/lib/jobs/queues';
 import { safePublishGenerationEvent } from '@/lib/jobs/events';
 import { safeNotifyGenerationEvent } from '@/lib/jobs/notifications';
+import { modelUsagesFromResult } from '@/lib/ai/model-provenance';
 import { sendChapterGeneration } from '@/lib/jobs/boss';
 import 'server-only';
 
@@ -28,6 +29,7 @@ import 'server-only';
 // finalises a job, so the two engines can never fight over a row.
 import { UniversalGenerationService } from '@/lib/ai/generation/generation-service';
 import {
+  clearAttemptModelUsages,
   completeGenerationJob,
   failGenerationJob,
   generationRequestFromJobRow,
@@ -151,6 +153,12 @@ export interface JobHandlerContext {
 type JobHandler = (job: JobHandlerContext) => Promise<unknown>;
 
 const handlers = new Map<string, JobHandler>();
+const LEGACY_AI_TASKS = new Set(['chapter', 'premise', 'outline', 'consistency', 'memory']);
+
+/** Authoring jobs and universal generations share the activity stream. */
+function isAiGenerationJob(job: Pick<JobRecord, 'taskType' | 'payload'>): boolean {
+  return LEGACY_AI_TASKS.has(job.taskType) || isUniversalEngineJob(job);
+}
 
 export function registerHandler(taskType: string, handler: JobHandler) {
   handlers.set(taskType, handler);
@@ -221,6 +229,17 @@ function emitLifecycle(
     notify?: boolean;
   } = {},
 ) {
+  // Carry fresh provenance on terminal events and reset it on re-queues: an
+  // already-open SSE stream does not receive a new snapshot between attempts.
+  let provenance: Record<string, unknown> = {};
+  if ([GenerationEventType.QUEUED, GenerationEventType.COMPLETED, GenerationEventType.FAILED, GenerationEventType.CANCELLED].includes(type as any)) {
+    try {
+      const fresh = getDb().prepare('SELECT requestedModel, actualModel, provider, fallbackCount, result FROM generation_jobs WHERE id=?').get(job.id) as JobRecord | undefined;
+      if (fresh) provenance = jobModelProvenance(fresh);
+    } catch (err) {
+      console.warn('[queue] could not read generation provenance', job.id, err);
+    }
+  }
   safePublishGenerationEvent({
     jobId: job.id,
     userId: job.userId,
@@ -242,6 +261,7 @@ function emitLifecycle(
     data: {
       ...(extra.stage ? { stage: extra.stage, stageLabel: stageLabel(extra.stage) } : {}),
       ...(extra.message ? { message: extra.message } : {}),
+      ...provenance,
       ...(extra.data ?? {}),
     },
   });
@@ -286,7 +306,15 @@ export async function enqueue(task: EnqueueOptions): Promise<string> {
       scheduledAt: task.delayMs ? new Date(Date.now() + task.delayMs).toISOString() : now,
       priority: task.priority ?? 0,
       provider: typeof task.payload?.provider === 'string' ? (task.payload.provider as string) : null,
-      model: typeof task.payload?.model === 'string' ? (task.payload.model as string) : null,
+      // Legacy authoring jobs call this field textModel; universal jobs use
+      // model. Record the request before dispatch, not the eventual fallback.
+      model: typeof task.payload?.model === 'string'
+        ? task.payload.model
+        : typeof task.payload?.textModel === 'string'
+          ? task.payload.textModel
+          : task.payload?.engine === 'universal' || LEGACY_AI_TASKS.has(task.type)
+            ? 'auto'
+            : null,
     });
   } catch (err) {
     // Partial unique index violation: another request enqueued the same work
@@ -301,15 +329,14 @@ export async function enqueue(task: EnqueueOptions): Promise<string> {
   }
 
   const inserted = db.prepare('SELECT * FROM generation_jobs WHERE id=?').get(id) as JobRecord;
-  const universal = isUniversalEngineJob(inserted);
   if (task.type === 'chapter') {
     updateChapterGenerationStatus(task.chapterId, 'QUEUED');
   }
-  if (task.type === 'chapter' || universal) {
+  if (isAiGenerationJob(inserted)) {
     emitLifecycle(inserted, GenerationEventType.QUEUED, {
       data: {
         chapterNumber: (task.payload as any)?.chapterNumber ?? null,
-        ...(universal ? { generationType: task.type } : {}),
+        ...(task.type !== 'chapter' ? { generationType: task.type } : {}),
       },
     });
   }
@@ -414,8 +441,8 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
   // their existing services and are never rerouted.
   const universal = isUniversalEngineJob(job);
   const tracked = job.taskType === 'chapter';
-  /** Whether a stage transition should also become a durable SSE event. */
-  const publishesProgress = tracked || universal;
+  /** Authoring and universal AI work both appear in the activity panel. */
+  const publishesProgress = isAiGenerationJob(job);
 
   const handler = universal ? makeUniversalJobHandler(job) : handlers.get(job.taskType);
   if (!handler) {
@@ -424,6 +451,8 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
     if (tracked) {
       updateChapterGenerationStatus(job.chapterId, 'FAILED');
       emitLifecycle(job, GenerationEventType.FAILED, { message, notify: true });
+    } else if (publishesProgress) {
+      emitLifecycle(job, GenerationEventType.FAILED, { message, data: { generationType: job.taskType } });
     }
     return { id, status: 'failed', reason: 'no handler' };
   }
@@ -504,7 +533,7 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
       stage: GenerationStage.PREPARING_CHAPTER,
       notify: true,
     });
-  } else if (universal) {
+  } else if (publishesProgress) {
     emitLifecycle(job, GenerationEventType.STARTED, {
       stage: GenerationStage.STARTING,
       data: { generationType: job.taskType },
@@ -563,7 +592,7 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
           chapterNumber: (result as any)?.chapterNumber ?? (job.payload ? JSON.parse(job.payload).chapterNumber : null),
         },
       });
-    } else if (universal) {
+    } else if (publishesProgress) {
       emitLifecycle(job, GenerationEventType.COMPLETED, {
         stage: GenerationStage.COMPLETED,
         data: {
@@ -599,7 +628,7 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
           notify: true,
           data: { errorCode: classified.code, retryable: classified.retryable },
         });
-      } else if (universal && failed) {
+      } else if (publishesProgress && failed) {
         emitLifecycle(job, GenerationEventType.FAILED, {
           message: classified.message,
           data: {
@@ -624,7 +653,7 @@ export async function runJob(id: string, workerId = `${process.pid}`): Promise<J
         message: classified.message,
         data: { retryAt: new Date(Date.now() + backoffMs).toISOString(), attempt: attempts },
       });
-    } else if (universal && requeued) {
+    } else if (publishesProgress && requeued) {
       emitLifecycle(job, GenerationEventType.QUEUED, {
         message: classified.message,
         data: {
@@ -653,23 +682,25 @@ export async function recoverStaleJobs({ limit = 20, staleMs }: { limit?: number
   const cutoff = new Date(Date.now() - threshold).toISOString();
 
   const stale = db.prepare(
-    `SELECT id,userId,novelId,chapterId,taskType,attempts FROM generation_jobs
+    `SELECT id,userId,novelId,chapterId,taskType,attempts,payload,result FROM generation_jobs
       WHERE status='processing'
         AND (COALESCE(lastHeartbeatAt, claimedAt) IS NULL OR COALESCE(lastHeartbeatAt, claimedAt) < ?)`
-  ).all(cutoff) as Pick<JobRecord, 'id' | 'userId' | 'novelId' | 'chapterId' | 'taskType' | 'attempts'>[];
+  ).all(cutoff) as Pick<JobRecord, 'id' | 'userId' | 'novelId' | 'chapterId' | 'taskType' | 'attempts' | 'payload' | 'result'>[];
 
   for (const job of stale) {
-    db.prepare(
+    const recovered = db.prepare(
       `UPDATE generation_jobs
           SET status='queued', claimedAt=NULL, claimedBy=NULL, scheduledAt=?, updatedAt=?,
               error=COALESCE(error, 'Recovered from an interrupted worker'),
-              currentStage=NULL, progressPercentage=NULL
+              currentStage=NULL, progressPercentage=NULL, actualModel=NULL, provider=NULL,
+              fallbackCount=0, durationMs=NULL, result=?
         WHERE id=? AND status='processing'`
-    ).run(nowIso(), nowIso(), job.id);
+    ).run(nowIso(), nowIso(), clearAttemptModelUsages(job.result), job.id);
+    if (recovered.changes === 0) continue;
     if (job.taskType === 'chapter') {
       updateChapterGenerationStatus(job.chapterId, 'QUEUED');
     }
-    if (job.taskType === 'chapter' || isUniversalEngineJob(job as JobRecord)) {
+    if (isAiGenerationJob(job)) {
       emitLifecycle(job as JobRecord, GenerationEventType.QUEUED, {
         message: 'Worker restart detected — generation re-queued.',
         data: { recovered: true },
@@ -757,7 +788,7 @@ export function cancelJob(id: string): boolean {
       notify: true,
       message: 'Generation cancelled. Existing chapter content was preserved.',
     });
-  } else if (isUniversalEngineJob(job)) {
+  } else if (isAiGenerationJob(job)) {
     emitLifecycle(job, GenerationEventType.CANCELLED, {
       message: 'Generation cancelled.',
       data: { generationType: job.taskType },
@@ -826,9 +857,10 @@ export async function retryJob(id: string, options: { priority?: number } = {}):
     `UPDATE generation_jobs
         SET status='queued', attempts=0, error=NULL, errorCode=NULL, retryable=1,
             scheduledAt=?, completedAt=NULL, claimedAt=NULL, claimedBy=NULL, progress=0,
-            progressPercentage=NULL, currentStage=NULL, cancelRequestedAt=NULL, updatedAt=?
+            progressPercentage=NULL, currentStage=NULL, cancelRequestedAt=NULL, updatedAt=?,
+            actualModel=NULL, provider=NULL, fallbackCount=0, durationMs=NULL, result=?
       WHERE id=? AND status IN ('failed','cancelled')`
-  ).run(now, now, id);
+  ).run(now, now, clearAttemptModelUsages(job.result), id);
   if (res.changes === 0) return false;
 
   if (job.taskType === 'chapter') {
@@ -836,13 +868,27 @@ export async function retryJob(id: string, options: { priority?: number } = {}):
     emitLifecycle({ ...job, attempts: 0 }, GenerationEventType.QUEUED, {
       data: { manualRetry: true },
     });
-  } else if (isUniversalEngineJob(job)) {
+  } else if (isAiGenerationJob(job)) {
     emitLifecycle({ ...job, attempts: 0 }, GenerationEventType.QUEUED, {
       data: { manualRetry: true, generationType: job.taskType },
     });
   }
   await dispatch(id, { priority: options.priority ?? job.priority ?? 0 });
   return true;
+}
+
+/** Safe, reusable provenance for polling and terminal events. */
+function jobModelProvenance(job: Pick<JobRecord, 'requestedModel' | 'actualModel' | 'provider' | 'fallbackCount' | 'result'>) {
+  const result = safeJson(job.result) as { partialText?: unknown; partialSequence?: unknown } | null;
+  return {
+    requestedModel: job.requestedModel ?? null,
+    actualModel: job.actualModel ?? null,
+    provider: job.provider ?? null,
+    fallbackCount: job.fallbackCount ?? 0,
+    modelUsages: modelUsagesFromResult(result) ?? null,
+    partialText: typeof result?.partialText === 'string' ? result.partialText.slice(-6000) : null,
+    partialSequence: Number.isSafeInteger(result?.partialSequence) ? result?.partialSequence as number : null,
+  };
 }
 
 /** Public shape of a job for API responses (no raw payload/result passthrough). */
@@ -865,6 +911,7 @@ export function serializeJob(job: JobRecord) {
     errorCode: job.errorCode ?? null,
     retryable: job.retryable === undefined || job.retryable === null ? true : Boolean(job.retryable),
     result: safeJson(job.result),
+    ...jobModelProvenance(job),
     startedAt: job.startedAt,
     completedAt: job.completedAt,
     createdAt: job.createdAt,

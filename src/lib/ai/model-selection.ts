@@ -62,6 +62,8 @@ export interface SelectOptions {
   /** Desired image size for image models. */
   requiredSize?: { width: number; height: number };
   policy?: AiPolicyConfig;
+  /** Exclude models the calling provider cannot serve. */
+  acceptsModel?: (model: ModelRow) => boolean;
   /** Hard cap on candidates (bounding the fallback budget). */
   limit?: number;
 }
@@ -174,6 +176,10 @@ export function selectModels(options: SelectOptions): SelectionResult {
   const skipped: Array<{ modelId: string; reason: string }> = [];
 
   for (const model of rows) {
+    if (options.acceptsModel && !options.acceptsModel(model)) {
+      skipped.push({ modelId: model.id, reason: 'The selected provider cannot serve this model.' });
+      continue;
+    }
     if (!model.enabled) {
       skipped.push({ modelId: model.id, reason: model.disabledReason || 'Disabled by an administrator.' });
       continue;
@@ -217,6 +223,7 @@ export function selectModels(options: SelectOptions): SelectionResult {
     return a.model.id.localeCompare(b.model.id);
   });
 
+  const fallbackEnabled = options.allowFallback !== false && policy.fallbackEnabled;
   let ordered = candidates;
   if (requestedModelId !== 'auto') {
     const index = ordered.findIndex(c => c.model.id === requestedModelId);
@@ -226,14 +233,15 @@ export function selectModels(options: SelectOptions): SelectionResult {
         modelId: requestedModelId,
         reason: requested ? 'The requested model is not eligible under the current policy.' : 'The requested model is not registered.',
       });
+      // A disabled fallback must never silently select an unrelated model.
+      if (!fallbackEnabled) ordered = [];
     } else {
       const [requested] = ordered.splice(index, 1);
       ordered = [requested, ...ordered];
     }
   }
 
-  const fallbackEnabled = options.allowFallback !== false && policy.fallbackEnabled;
-  const limit = options.limit ?? (fallbackEnabled ? policy.maxFallbackAttempts : 1);
+  const limit = fallbackEnabled ? (options.limit ?? policy.maxFallbackAttempts) : 1;
   const finalCandidates = ordered.slice(0, Math.max(1, limit));
 
   return {

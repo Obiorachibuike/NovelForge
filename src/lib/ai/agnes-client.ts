@@ -75,6 +75,7 @@ async function timedFetch(url: string, init: RequestInit & { timeoutMs?: number 
   const externalSignal = rest.signal as AbortSignal | undefined;
   const onAbort = () => controller.abort();
   externalSignal?.addEventListener?.('abort', onAbort);
+  if (externalSignal?.aborted) controller.abort();
   try {
     return await fetchImpl()(url, { ...rest, signal: controller.signal });
   } finally {
@@ -174,7 +175,7 @@ export async function agnesChatCompletion(req: AgnesChatRequest): Promise<AgnesC
   }
 
   const json = req.onText
-    ? await readChatStream(res, req.onText, req.timeoutMs ?? policy.requestTimeoutMs)
+    ? await readChatStream(res, req.onText, req.timeoutMs ?? policy.requestTimeoutMs, req.signal)
     : (await res.json().catch(() => ({}))) as any;
   // A 200 response may still carry an error object (some gateways do).
   if (json?.error) {

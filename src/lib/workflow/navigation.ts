@@ -21,6 +21,10 @@ export interface ChapterLike {
   wordCount?: number | null;
   pageCountEst?: number | null;
   generationSource?: string | null;
+  modelRequested?: string | null;
+  modelUsed?: string | null;
+  generationProvider?: string | null;
+  generationFallbackCount?: number | null;
   /** Background generation lifecycle (NOT_STARTED/QUEUED/PROCESSING/COMPLETED/FAILED/CANCELLED). */
   generationStatus?: string | null;
 }
@@ -38,6 +42,10 @@ export interface ChapterNav {
   wordCount: number;
   pageCountEst: number;
   generationSource: string | null;
+  modelRequested: string | null;
+  modelUsed: string | null;
+  generationProvider: string | null;
+  generationFallbackCount: number | null;
   /**
    * Background generation status for this chapter, derived from the persisted
    * chapter row. `NOT_STARTED` is used when no generation has ever run.
@@ -72,6 +80,10 @@ export function computeNavigation(outlines: OutlineLike[], chapters: ChapterLike
       wordCount: chapter?.wordCount ?? 0,
       pageCountEst: chapter?.pageCountEst ?? 0,
       generationSource: chapter?.generationSource ?? null,
+      modelRequested: chapter?.modelRequested ?? null,
+      modelUsed: chapter?.modelUsed ?? null,
+      generationProvider: chapter?.generationProvider ?? null,
+      generationFallbackCount: chapter?.generationFallbackCount ?? null,
       generationStatus: resolveGenerationStatus(chapter),
     };
   });

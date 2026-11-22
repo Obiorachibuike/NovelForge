@@ -2,6 +2,7 @@ import { getDb } from '@/lib/db';
 import { saveFile, storageProviderName } from '@/lib/storage';
 import { saveCandidateCoverPreview } from '@/services/covers/cloudinary-cover-service';
 import { getOpenAI, aiConfig, recordImageUsage } from '@/lib/ai/provider';
+import { aiPolicy } from '@/lib/ai/config';
 import { hostedBackendActive } from '@/lib/ai/text-generation';
 import { generateImage } from '@/lib/ai/image-generation';
 import { HttpError } from '@/lib/api/http';
@@ -91,6 +92,7 @@ export async function generateCovers(
           provider: generated.provider || (isAgnes ? 'agnes-ai' : 'huggingface'),
           format: ext, bytes: generated.image.length,
           model: generated.actualModelId, requestedModel: generated.requestedModelId,
+          modelFallbackUsed: generated.fallbackUsed,
         });
         results.push({
           imageId: id, url: stored.url,
@@ -120,6 +122,11 @@ export async function generateCovers(
 
     const client = getOpenAI();
     if (client) {
+      const requestedModel = options.imageModel || 'auto';
+      const modelFallbackUsed = requestedModel !== 'auto' && requestedModel !== aiConfig.imageModel;
+      if (modelFallbackUsed && (options.allowFallback === false || !aiPolicy().fallbackEnabled)) {
+        throw new HttpError(503, 'The selected image model is not available from the configured provider. Enable fallback or choose Automatic.', 'provider_model_mismatch');
+      }
       let buf: Buffer;
       try {
         const resp = await client.images.generate({
@@ -136,9 +143,10 @@ export async function generateCovers(
             userId, novelId, url: stored.url, key: stored.key,
             width: 1024, height: 1792, prompt, provider: 'openai',
             format: 'png', bytes: buf.length,
+            model: aiConfig.imageModel, requestedModel, modelFallbackUsed,
           });
           recordImageUsage({ userId, novelId, model: aiConfig.imageModel, images: 1, source: 'openai' });
-          results.push({ imageId: id, url: stored.url, provider: 'openai', source: 'openai' });
+          results.push({ imageId: id, url: stored.url, provider: 'openai', source: 'openai', actualModel: aiConfig.imageModel, requestedModel, modelFallbackUsed });
           continue;
         }
       } catch (err) {
@@ -201,16 +209,16 @@ export function buildNovelCoverPrompt(db: any, novel: any): string {
   return prompt;
 }
 
-function saveImageRecord(db: any, { userId, novelId, url, key, width, height, prompt, provider, format, bytes, model, requestedModel }: {
+function saveImageRecord(db: any, { userId, novelId, url, key, width, height, prompt, provider, format, bytes, model, requestedModel, modelFallbackUsed }: {
   userId: string; novelId: string; url: string; key: string; width: number; height: number; prompt: string; provider: string; format?: string; bytes?: number;
-  model?: string | null; requestedModel?: string | null;
+  model?: string | null; requestedModel?: string | null; modelFallbackUsed?: boolean;
 }) {
   const id = nanoid();
   const now = new Date().toISOString();
   db.prepare(
     `INSERT INTO image_assets (id,novelId,userId,kind,provider,storageKey,url,width,height,prompt,isPrimary,meta,format,bytes,model,requestedModel,createdAt,updatedAt)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-  ).run(id, novelId, userId, 'cover', provider, key, url, width, height, prompt, 0, null, format || null, bytes ?? null, model ?? null, requestedModel ?? null, now, now);
+  ).run(id, novelId, userId, 'cover', provider, key, url, width, height, prompt, 0, modelFallbackUsed ? JSON.stringify({ modelFallbackUsed: true }) : null, format || null, bytes ?? null, model ?? null, requestedModel ?? null, now, now);
   return id;
 }
 

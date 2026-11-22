@@ -566,6 +566,16 @@ export const migrations: Migration[] = [
       `CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(userId, isRead, createdAt)`,
     ],
   },
+  {
+    id: '0014_chapter_model_provenance',
+    description: 'Persist the actual provider and fallback status with generated chapters.',
+    statements: [
+      // Nullable values distinguish older chapters (unknown) from a confirmed
+      // generation without model fallback.
+      `ALTER TABLE chapters ADD COLUMN generationProvider TEXT`,
+      `ALTER TABLE chapters ADD COLUMN generationFallbackCount INTEGER`,
+    ],
+  },
 
 ];
 

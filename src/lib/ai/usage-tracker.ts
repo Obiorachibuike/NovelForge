@@ -124,13 +124,13 @@ export function recordJobProvenance(
     const db = getDb();
     db.prepare(
       `UPDATE generation_jobs
-          SET requestedModel=COALESCE(?, requestedModel),
+          SET requestedModel=COALESCE(requestedModel, ?),
               actualModel=COALESCE(?, actualModel),
               provider=COALESCE(?, provider),
               fallbackCount=?,
               durationMs=COALESCE(?, durationMs),
               updatedAt=?
-        WHERE id=?`,
+        WHERE id=? AND status='processing'`,
     ).run(
       provenance.requestedModel ?? null,
       provenance.actualModel ?? null,

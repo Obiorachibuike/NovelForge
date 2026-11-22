@@ -211,7 +211,8 @@ export interface ChapterRow {
   contentJson:string; generatedContentJson?:string|null; contentHtml:string|null; plainText:string|null;
   status:string; wordCount:number; pageCountEst:number; summary:string|null; importantEvents:string|null;
   currentVersionId:string|null; revision?:number; lastJobId?:string|null;
-  generationSource?:string|null; generatedAt?:string|null;
+  generationSource?:string|null; modelRequested?:string|null; modelUsed?:string|null; generatedAt?:string|null;
+  generationProvider?:string|null; generationFallbackCount?:number|null;
   createdAt:string; updatedAt:string; approvedAt:string|null;
 }
 export interface ChapterVersionRow {
